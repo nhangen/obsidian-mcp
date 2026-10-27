@@ -1,6 +1,6 @@
 {
   "name": "@claude-obsidian/mcp-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "license": "MIT",
   "description": "Obsidian MCP server over stdio and authenticated Streamable HTTP.",
@@ -8,6 +8,7 @@
   "main": "dist/stdio.mjs",
   "files": [
     "dist/",
+    "npm-shrinkwrap.json",
     "monitor.mjs",
     "contract.json",
     "README.md",
