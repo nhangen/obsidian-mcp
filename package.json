@@ -1,0 +1,41 @@
+{
+  "name": "@claude-obsidian/mcp-server",
+  "version": "0.2.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Obsidian MCP server over stdio and authenticated Streamable HTTP.",
+  "type": "module",
+  "main": "dist/stdio.mjs",
+  "files": [
+    "dist/",
+    "monitor.mjs",
+    "contract.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "claude-obsidian-mcp": "dist/stdio.mjs",
+    "claude-obsidian-mcp-http": "dist/http.mjs"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
+    "release:bundle": "node scripts/release.mjs",
+    "monitor": "node monitor.mjs",
+    "start": "node dist/stdio.mjs",
+    "start:http": "node dist/http.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "typescript": "5.9.2"
+  }
+}
