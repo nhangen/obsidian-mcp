@@ -21,6 +21,9 @@ including the pinned bridge, lifecycle installer, optional isolated Codex captur
 and an explicit Claude plugin attachment API. The public runtime requires no
 private llm-tools harness. Attachment preserves existing host settings and does
 not activate writers; the plugin separately owns migration and admission gates.
+Attached Claude commit capture uses canonical MCP arguments directly, with bounded
+Pre-hook preparation and immutable retries. It needs no Bash stdin helper grant;
+existing MCP tool authorization and recovery checks still apply.
 
 From a trusted checkout, with Python 3.11+ and Node.js 22+:
 

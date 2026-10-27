@@ -359,6 +359,22 @@ write retains its exact request/key and requires inspection plus the existing
 persisted. A failed host tool cannot establish a successful commit event.
 Claude commit rewrites omit an `allow` permission decision, so the rewritten
 command still goes through the host's configured permission flow.
+For attached Claude, pending-commit guidance supplies canonical
+`obsidian_daily_append` arguments with three context placeholders. Replace those
+bullets with factual context and call MCP directly; no Bash `prepare` command or
+stdin helper permission is needed. The Pre hook validates the complete arguments,
+revalidates the recorded Git event with a three-second producer budget, and
+persists the immutable request and call identity before the write. The producer
+budget leaves time for cleanup within the plugin dispatcher's eight-second limit.
+The Branch line, target, section, full hash and idempotency key must match the
+recorded plan; extra fields, including `init_content`, are rejected. Context uses
+the existing limits: 1-8 single-line bullets, at most 4096 UTF-8 bytes each and
+32768 bytes total. Literal placeholder bullets are rejected. Subsequent guidance
+repeats the exact prepared arguments, including after branch or remote changes.
+Only a paired, strictly validated successful receipt settles the commit.
+Normal MCP tool authorization still applies; the observer emits no permission
+allow override. Existing denial and recovery policies remain in force. Isolated
+Codex capture retains its CLI `prepare` workflow and producer timeout.
 Manual MCP writes with unrelated keys are observed without blocking or settling
 automatic capture; matching automatic keys still require exact arguments.
 Stop requests at most one continuation per occurrence, then reports unresolved
@@ -371,7 +387,8 @@ writer handoff, release, or cross-host acceptance.
 To additionally exercise the current plugin dispatcher and ownership barrier,
 set `OBSIDIAN_MCP_TEST_PLUGIN_ROOT` to a public plugin checkout when running
 `tests/obsidian-mcp-native.test.py`. The optional pair fixture installs the trusted
-packed client, attaches a temporary Git project, hands ownership to MCP, observes
-a simulated successful receipt through plugin hooks, verifies drain, and hands
+packed client, attaches a temporary Git project, hands ownership to MCP, executes
+a fixture Git commit, observes simulated session and direct commit MCP receipts
+through plugin hooks without CLI preparation, verifies drain, and hands
 ownership to disabled. All state stays in temporary directories; no real server,
 provider, user configuration or running writer is involved.

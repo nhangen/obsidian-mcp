@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import re
+import runpy
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -155,6 +157,13 @@ class NativeCaptureFixture(unittest.TestCase):
             timeout=30,
         )
 
+    def load_native(self):
+        script = self.bundle / "bin/obsidian-mcp-native"
+        module = types.ModuleType("native_under_test")
+        module.__file__ = str(script)
+        exec(compile(script.read_text(), str(script), "exec"), module.__dict__)
+        return module
+
     def prepare(self, path, commit, payload=None):
         return self.cli(
             "prepare",
@@ -205,6 +214,26 @@ class NativeCaptureFixture(unittest.TestCase):
 
 
 class NativeCaptureTest(NativeCaptureFixture):
+    def test_codex_direct_append_still_requires_cli_preparation(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        path, state, commit = self.pending_commit()
+        consumer = runpy.run_path(str(self.bundle / "bin/obsidian-mcp-capture-commit"))
+        _, arguments = consumer["capture_arguments"](
+            state["commits"][commit]["metadata"], ["A fact"]
+        )
+        before = path.read_bytes()
+        self.assertEqual(
+            self.hook(
+                "PreToolUse",
+                tool_name="mcp__obsidian_write__obsidian_daily_append",
+                tool_input=arguments,
+            ),
+            {},
+        )
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotIn("native_arguments", json.loads(before)["commits"][commit])
+
     def assert_transient_history_retained(self, staged):
         self.git(
             "-c",
@@ -1202,13 +1231,6 @@ class NativeCaptureTest(NativeCaptureFixture):
             json.loads(stale_owner.stdout), {"status": "skipped", "path": None}
         )
 
-    def load_native(self):
-        script = self.bundle / "bin/obsidian-mcp-native"
-        module = types.ModuleType("native_under_test")
-        module.__file__ = str(script)
-        exec(compile(script.read_text(), str(script), "exec"), module.__dict__)
-        return module
-
     def sibling_commit_event(self):
         started = self.cli(
             "hook",
@@ -1938,6 +1960,320 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.hook("UserPromptSubmit", prompt="Implement the change")
         return next(iter(self.state_paths()))
 
+    def commit_arguments(self, path, items=None, *, output=None):
+        if output is None:
+            output = self.hook("SessionStart", source="resume")
+        guidance = output["hookSpecificOutput"]["additionalContext"]
+        encoded = next(
+            line.removeprefix("Commit capture arguments: ")
+            for line in guidance.split("\n")
+            if line.startswith("Commit capture arguments: ")
+        )
+        arguments = json.loads(encoded)
+        self.assertNotIn("pipe JSON", guidance)
+        if items is not None:
+            branch = arguments["content"].split("\n")[0]
+            arguments["content"] = "\n".join([branch, *("- " + x for x in items)])
+        return arguments
+
+    def commit_event(self, arguments, call="direct-commit-write"):
+        return dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id=call,
+            tool_input=arguments,
+        )
+
+    def commit_receipt(self, arguments):
+        return dict(
+            status="committed",
+            request_id="direct-fixture",
+            idempotency_key=arguments["idempotency_key"],
+            path=arguments["target_path"],
+            affected_paths=[arguments["target_path"]],
+            warnings=[],
+            recovery={"required": False, "action": ""},
+            error_code=None,
+            retryable=False,
+        )
+
+    def test_direct_commit_prepares_and_settles_without_shell_prepare(self):
+        path = self.start()
+        _, state, commit = self.pending_commit()
+        items = ["Implemented fixture change", "Verified Git effects", "Kept MCP scope"]
+        arguments = self.commit_arguments(path, items)
+        metadata = state["commits"][commit]["metadata"]
+        self.assertEqual(arguments["skip_if_hash"], metadata["hash"])
+        self.assertEqual(
+            arguments["section"], f"## {metadata['time']} - {metadata['hash']}"
+        )
+        self.assertEqual(
+            arguments["target_path"],
+            f"Projects/Development/local/project/{metadata['date']}.md",
+        )
+        expected_key = hashlib.sha256(
+            ("local/project\0" + metadata["hash"]).encode()
+        ).hexdigest()
+        self.assertEqual(arguments["idempotency_key"], "commit-capture:" + expected_key)
+        event = self.commit_event(arguments)
+        self.assertEqual(self.hook("PreToolUse", **event), {})
+        pending = json.loads(path.read_text())["commits"][commit]
+        self.assertEqual(pending["native_arguments"], arguments)
+        self.assertEqual(pending["request"], {"context": items})
+        self.assertEqual(pending["in_flight"], event["tool_use_id"])
+        self.assertEqual(pending["status"], "pending")
+        before = path.read_bytes()
+        self.assertEqual(self.hook("PreToolUse", **event), {})
+        self.assertEqual(path.read_bytes(), before)
+        self.hook(
+            "PostToolUse",
+            **event,
+            tool_response=json.dumps(self.commit_receipt(arguments)),
+        )
+        self.assertEqual(
+            json.loads(path.read_text())["commits"][commit]["status"], "committed"
+        )
+        self.save(path)
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
+
+    def test_direct_commit_rejects_noncanonical_arguments_without_preparing(self):
+        path = self.start()
+        _, _, commit = self.pending_commit()
+        arguments = self.commit_arguments(
+            path, ["First fact", "Second fact", "Third fact"]
+        )
+        branch = arguments["content"].split("\n")[0]
+        changes = [
+            {"target_path": "Other/forged.md"},
+            {"skip_if_hash": arguments["skip_if_hash"][:8]},
+            {"section": "## forged"},
+            {"init_content": "forged frontmatter"},
+            {"date": "2026-01-01"},
+            {"request_id": "extra-field"},
+            {"content": '- Branch: "forged"\n- A fact'},
+            {"content": branch + "\nnot a bullet"},
+            {"content": branch + "\n- "},
+            {"content": branch + "\n- fact\n"},
+            {"content": branch + "\n- fact\r"},
+            {"content": branch + "\n- fact\tmore"},
+            {"content": branch + "\n- fact\x7f"},
+            {"content": branch + "\n- \ud800"},
+            {"content": branch + "\n- " + "é" * 2049},
+            {"content": branch + "\n- fact" * 9},
+            {"content": None},
+            {"content": self.commit_arguments(path)["content"]},
+        ]
+        before = path.read_bytes()
+        for change in changes:
+            with self.subTest(
+                fields=list(change), content=repr(change.get("content"))[:80]
+            ):
+                denied = self.hook(
+                    "PreToolUse", **self.commit_event(dict(arguments, **change))
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                self.assertEqual(path.read_bytes(), before)
+        self.assertNotIn(
+            "native_arguments", json.loads(path.read_text())["commits"][commit]
+        )
+        manual = dict(arguments, idempotency_key="manual-other-key")
+        self.assertEqual(self.hook("PreToolUse", **self.commit_event(manual)), {})
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_direct_commit_post_cannot_prepare_or_settle_without_matching_pre(self):
+        path = self.start()
+        _, _, commit = self.pending_commit()
+        arguments = self.commit_arguments(path, ["A fact"])
+        event = self.commit_event(arguments)
+        before = path.read_bytes()
+        self.hook("PostToolUse", **event, tool_response=self.commit_receipt(arguments))
+        self.assertEqual(path.read_bytes(), before)
+        self.hook("PreToolUse", **event)
+        prepared = path.read_bytes()
+        self.hook(
+            "PostToolUse",
+            **self.commit_event(arguments, "orphan"),
+            tool_response=self.commit_receipt(arguments),
+        )
+        self.assertEqual(path.read_bytes(), prepared)
+        self.assertEqual(
+            json.loads(path.read_text())["commits"][commit]["status"], "pending"
+        )
+
+    def test_direct_commit_retry_preserves_arguments_and_requires_recovery_review(self):
+        path = self.start()
+        _, _, commit = self.pending_commit()
+        arguments = self.commit_arguments(path, ["Original fact"])
+        event = self.commit_event(arguments)
+        self.hook("PreToolUse", **event)
+        self.git("branch", "-m", "renamed-after-preparation")
+        self.git("remote", "add", "origin", "git@github.com:changed/identity.git")
+        self.assertEqual(self.commit_arguments(path), arguments)
+        for alternate in (
+            dict(arguments, content=arguments["content"] + "\n- Changed"),
+            arguments,
+        ):
+            denied = self.hook(
+                "PreToolUse", **self.commit_event(alternate, "overlapping")
+            )
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.hook("PostToolUseFailure", **event, error="fixture failure")
+        before = path.read_bytes()
+        self.assertEqual(self.commit_arguments(path), arguments)
+        denied = self.hook("PreToolUse", **self.commit_event(arguments, "unreviewed"))
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(path.read_bytes(), before)
+        pending = json.loads(before)["commits"][commit]
+        retry = self.cli(
+            "retry",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--commit",
+            commit,
+            "--payload-sha256",
+            pending["payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["arguments"], arguments)
+        event = self.commit_event(arguments, "reviewed")
+        self.assertEqual(self.hook("PreToolUse", **event), {})
+        self.hook("PostToolUse", **event, tool_response=self.commit_receipt(arguments))
+        self.assertEqual(
+            json.loads(path.read_text())["commits"][commit]["status"], "committed"
+        )
+
+    def test_direct_commit_revalidates_head_before_preparation(self):
+        path = self.start()
+        self.pending_commit()
+        arguments = self.commit_arguments(path, ["A fact"])
+        self.git(
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "external",
+        )
+        before = path.read_bytes()
+        denied = self.hook("PreToolUse", **self.commit_event(arguments))
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "COMMIT_EVENT_REJECTED",
+            denied["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_direct_commit_accepts_existing_context_byte_and_item_limits(self):
+        path = self.start()
+        _, _, commit = self.pending_commit()
+        items = ["é" * 2046 + "\u2028x"] + ["x" * 4096] * 7
+        arguments = self.commit_arguments(path, items)
+        self.assertEqual(self.hook("PreToolUse", **self.commit_event(arguments)), {})
+        self.assertEqual(
+            json.loads(path.read_text())["commits"][commit]["request"],
+            {"context": items},
+        )
+
+    def test_direct_commit_ambiguous_identity_denies_without_preparation(self):
+        path = self.start()
+        _, state, commit = self.pending_commit()
+        arguments = self.commit_arguments(path, ["A fact"])
+        state["commits"]["0" * 64] = dict(state["commits"][commit])
+        path.write_text(json.dumps(state))
+        before = path.read_bytes()
+        denied = self.hook("PreToolUse", **self.commit_event(arguments))
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "COMMIT_EVENT_AMBIGUOUS",
+            denied["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_direct_commit_persistence_failure_denies_before_write(self):
+        path = self.start()
+        self.pending_commit()
+        arguments = self.commit_arguments(path, ["A fact"])
+        native = self.load_native()
+        home, profile = native.load_profile(self.home)
+        before = path.read_bytes()
+        with mock.patch.object(
+            native, "atomic_write", side_effect=OSError("fixture failure")
+        ):
+            denied = native.hook(
+                home, profile, self.event("PreToolUse", **self.commit_event(arguments))
+            )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.hook("PreToolUse", **self.commit_event(arguments)), {})
+
+    def test_direct_commit_guidance_preserves_tool_like_metadata_and_context(self):
+        path = self.start()
+        branch = "codex/mcp__obsidian_write__obsidian_keeper_save"
+        self.git("branch", "-m", branch)
+        self.pending_commit()
+        arguments = self.commit_arguments(
+            path, ["Used mcp__obsidian_write__obsidian_daily_append literally"]
+        )
+        self.assertEqual(
+            arguments["content"].split("\n")[0], "- Branch: " + json.dumps(branch)
+        )
+        self.assertEqual(self.hook("PreToolUse", **self.commit_event(arguments)), {})
+        self.assertEqual(self.commit_arguments(path), arguments)
+
+    def test_direct_commit_producer_timeout_denies_without_preparing(self):
+        path = self.start()
+        self.pending_commit()
+        arguments = self.commit_arguments(path, ["A fact"])
+        native = self.load_native()
+        home, profile = native.load_profile(self.home)
+        consumer = runpy.run_path(str(self.bundle / "bin/obsidian-mcp-capture-commit"))
+        run_path = native.runpy.run_path
+        processes = []
+
+        def load_runtime(script):
+            return (
+                consumer
+                if Path(script).name == "obsidian-mcp-capture-commit"
+                else run_path(script)
+            )
+
+        def stalled_producer(*args, **kwargs):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs
+            )
+            processes.append(process)
+            return process
+
+        isolated_subprocess = types.SimpleNamespace(**vars(subprocess))
+        isolated_subprocess.Popen = stalled_producer
+        consumer["run_producer"].__globals__["subprocess"] = isolated_subprocess
+        before = path.read_bytes()
+        started = time.monotonic()
+        try:
+            with mock.patch.object(native.runpy, "run_path", side_effect=load_runtime):
+                denied = native.hook(
+                    home,
+                    profile,
+                    self.event("PreToolUse", **self.commit_event(arguments)),
+                )
+            self.assertLess(time.monotonic() - started, 7)
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(len(processes), 1)
+            self.assertIsNotNone(processes[0].poll())
+            self.assertEqual(path.read_bytes(), before)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+        self.assertEqual(self.hook("PreToolUse", **self.commit_event(arguments)), {})
+
     def test_subdirectory_prompt_and_commit_preserve_relative_pathspec(self):
         child = self.project / "src"
         child.mkdir()
@@ -2582,6 +2918,33 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             {},
         )
         self.assertEqual(json.loads(path.read_text())["disposition"], "saved")
+        commit_call = dict(
+            tool_name="Bash",
+            tool_use_id="paired-commit",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = dispatch("PreToolUse", **commit_call)
+        (self.project / "file.txt").write_text("paired change\n")
+        self.git("add", "file.txt")
+        executed = self.execute_rewritten(rewritten)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        guidance = dispatch("PostToolUse", **commit_call, tool_response=executed.stdout)
+        commit_args = self.commit_arguments(
+            path,
+            ["Paired fixture commit", "Verified dispatcher", "Kept immutable request"],
+            output=guidance,
+        )
+        commit_write = self.commit_event(commit_args, "paired-commit-write")
+        self.assertEqual(dispatch("PreToolUse", **commit_write), {})
+        (pending,) = json.loads(path.read_text())["commits"].values()
+        self.assertEqual(pending["native_arguments"], commit_args)
+        dispatch(
+            "PostToolUse",
+            **commit_write,
+            tool_response=self.commit_receipt(commit_args),
+        )
+        (pending,) = json.loads(path.read_text())["commits"].values()
+        self.assertEqual(pending["status"], "committed")
         self.assertEqual(dispatch("Stop", stop_hook_active=False), {})
         self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
         descriptor = self.home / "capture-profile.json"

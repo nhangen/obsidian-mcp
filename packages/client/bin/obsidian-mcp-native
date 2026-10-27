@@ -30,6 +30,12 @@ HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
 MAX_PENDING = 16
+CLAUDE_PRODUCER_TIMEOUT = 3.0
+COMMIT_CONTEXT_TEMPLATE = (
+    "<replace with the goal and implemented change>",
+    "<replace with investigation findings and decisions>",
+    "<replace with verification and remaining work>",
+)
 ACTIVE = "active.json"
 OWNED = ("config.toml", "hooks.json", "AGENTS.md")
 CLAUDE_TOOLS = {
@@ -976,12 +982,39 @@ def observe_session(state, event):
     return {}
 
 
-def capture_guidance(home, state):
+def capture_guidance(home, state, host="codex"):
     key = state["session"]
     plan = state["session_save"]
     commands = []
+    tool_prefix = (
+        "mcp__obsidian-write__" if host == "claude-plugin" else "mcp__obsidian_write__"
+    )
     for event_id, pending in state["commits"].items():
         if pending["status"] == "pending":
+            if host == "claude-plugin":
+                arguments = pending.get("native_arguments")
+                if arguments is None:
+                    consumer = runpy.run_path(
+                        str(BUNDLE / "bin/obsidian-mcp-capture-commit")
+                    )
+                    _, arguments = consumer["capture_arguments"](
+                        pending["metadata"], COMMIT_CONTEXT_TEMPLATE
+                    )
+                    instruction = (
+                        "Replace the three placeholder bullets with 3-8 concise factual context bullets. "
+                        "Preserve the Branch line and every other argument exactly. "
+                    )
+                else:
+                    instruction = "Preserve these prepared arguments exactly. "
+                commands.append(
+                    f"Capture the pending commit through {tool_prefix}obsidian_daily_append before another commit. "
+                    + instruction
+                    + "Call MCP directly; no shell preparation is needed. Inspect the result; do not claim capture on failure. "
+                    "An in-flight or recovery outcome requires inspection before retry.\n"
+                    "Commit capture arguments: "
+                    + json.dumps(arguments, ensure_ascii=False)
+                )
+                continue
             command = shlex.join(
                 [
                     state["python"],
@@ -1000,7 +1033,7 @@ def capture_guidance(home, state):
             )
     if state["disposition"] == "pending":
         commands.append(
-            "Save meaningful session work through mcp__obsidian_write__obsidian_keeper_save using "
+            f"Save meaningful session work through {tool_prefix}obsidian_keeper_save using "
             + json.dumps(
                 {
                     k: plan[v]
@@ -1150,15 +1183,6 @@ def claude_output(value, name):
         for key, item in value.items():
             if key == "hookEventName":
                 output[key] = name
-            elif key in (
-                "additionalContext",
-                "reason",
-                "permissionDecisionReason",
-                "systemMessage",
-            ) and isinstance(item, str):
-                for alias, internal in CLAUDE_TOOLS.items():
-                    item = item.replace(internal, alias)
-                output[key] = item
             else:
                 output[key] = claude_output(item, name)
         if output.get("permissionDecision") == "allow" and "updatedInput" in output:
@@ -1232,7 +1256,7 @@ def engine_hook(home, profile, event):
                 return context(
                     name,
                     "Obsidian persisted capture state retained.\n"
-                    + capture_guidance(home, state),
+                    + capture_guidance(home, state, profile["host"]),
                 )
         turn = identifier(event.get("turn_id"))
         if name == "UserPromptSubmit":
@@ -1278,12 +1302,12 @@ def engine_hook(home, profile, event):
                     if profile["host"] == "claude-plugin"
                     else "This isolated profile owns capture through MCP only.\n"
                 )
-                + capture_guidance(home, state),
+                + capture_guidance(home, state, profile["host"]),
             )
         if state is None:
             raise NativeError("PROMPT_EVENT_REQUIRED")
         if name == "Stop":
-            guidance = capture_guidance(home, state)
+            guidance = capture_guidance(home, state, profile["host"])
             if not guidance:
                 return {}
             if event.get("stop_hook_active") is not False or state.get(
@@ -1305,7 +1329,9 @@ def engine_hook(home, profile, event):
                 atomic_write(path, encode(state))
                 return result
         if event.get("tool_name") == "mcp__obsidian_write__obsidian_daily_append":
-            result = observe_commit(state, event)
+            result = observe_commit(
+                state, event, attached=profile["host"] == "claude-plugin"
+            )
             if result is not None:
                 atomic_write(path, encode(state))
                 note = settle_gate(home, session, state)
@@ -1380,7 +1406,7 @@ def engine_hook(home, profile, event):
                 )
             return context(
                 name,
-                capture_guidance(home, state)
+                capture_guidance(home, state, profile["host"])
                 + persist_with_gate(home, session, state, path),
             )
         try:
@@ -1432,7 +1458,7 @@ def engine_hook(home, profile, event):
                         "hookEventName": name,
                         "permissionDecision": "deny",
                         "permissionDecisionReason": "Capture or resolve the pending commit before creating another commit.\n"
-                        + capture_guidance(home, state),
+                        + capture_guidance(home, state, profile["host"]),
                     }
                 }
             other = active_request(home)
@@ -1484,9 +1510,7 @@ def engine_hook(home, profile, event):
         )
 
 
-def prepare_commit(home, args):
-    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
-    payload = input_json()
+def prepare_pending(pending, payload, consumer, *, producer_timeout=None):
     items = payload.get("context")
     if (
         set(payload) != {"context"}
@@ -1502,37 +1526,50 @@ def prepare_commit(home, args):
         or sum(len(item.encode()) for item in items) > consumer["CONTEXT_LIMIT"]
     ):
         raise NativeError("CONTEXT_INVALID")
+    payload_digest = digest(encode(payload))
+    if pending.get("payload_digest", payload_digest) != payload_digest:
+        raise NativeError("COMMIT_PAYLOAD_CHANGED")
+    if pending["status"] != "pending":
+        return {"status": "skipped", "path": pending.get("path")}
+    if pending.get("in_flight") or pending.get("recovery"):
+        raise NativeError("COMMIT_RECOVERY_REQUIRED")
+    try:
+        consumer["run_producer"](
+            BUNDLE,
+            pending["event"],
+            sys.executable,
+            timeout=(
+                consumer["PRODUCER_TIMEOUT"]
+                if producer_timeout is None
+                else producer_timeout
+            ),
+        )
+    except consumer["CaptureError"]:
+        raise NativeError("COMMIT_EVENT_REJECTED; commit must still be HEAD") from None
+    if "native_arguments" in pending:
+        return {
+            "tool": "obsidian_daily_append",
+            "arguments": pending["native_arguments"],
+        }
+    target, arguments = consumer["capture_arguments"](pending["metadata"], items)
+    pending.update(
+        request=payload,
+        payload_digest=payload_digest,
+        native_arguments=arguments,
+        path=target,
+    )
+    return {"tool": "obsidian_daily_append", "arguments": arguments}
+
+
+def prepare_commit(home, args):
+    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+    payload = input_json()
     with state_lock(home, args.session) as (state, path):
         if state is None or args.commit not in state["commits"]:
             raise NativeError("COMMIT_EVENT_UNAVAILABLE")
-        pending = state["commits"][args.commit]
-        payload_digest = digest(encode(payload))
-        if pending.get("payload_digest", payload_digest) != payload_digest:
-            raise NativeError("COMMIT_PAYLOAD_CHANGED")
-        if pending["status"] != "pending":
-            return {"status": "skipped", "path": pending.get("path")}
-        if pending.get("in_flight") or pending.get("recovery"):
-            raise NativeError("COMMIT_RECOVERY_REQUIRED")
-        try:
-            consumer["run_producer"](BUNDLE, pending["event"], sys.executable)
-        except consumer["CaptureError"]:
-            raise NativeError(
-                "COMMIT_EVENT_REJECTED; commit must still be HEAD"
-            ) from None
-        if "native_arguments" in pending:
-            return {
-                "tool": "obsidian_daily_append",
-                "arguments": pending["native_arguments"],
-            }
-        target, arguments = consumer["capture_arguments"](pending["metadata"], items)
-        pending.update(
-            request=payload,
-            payload_digest=payload_digest,
-            native_arguments=arguments,
-            path=target,
-        )
+        result = prepare_pending(state["commits"][args.commit], payload, consumer)
         atomic_write(path, encode(state))
-    return {"tool": "obsidian_daily_append", "arguments": arguments}
+    return result
 
 
 def execute_commit(home, profile, args):
@@ -1614,21 +1651,51 @@ def normalized_result(event):
     )
 
 
-def observe_commit(state, event):
+def observe_commit(state, event, *, attached=False):
     arguments = event.get("tool_input", {})
-    matches = [
-        p
-        for p in state["commits"].values()
-        if p.get("native_arguments", {}).get("idempotency_key")
-        == arguments.get("idempotency_key")
-        and arguments.get("idempotency_key")
-    ]
+    consumer = (
+        runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+        if attached
+        else None
+    )
+    matches = []
+    for pending in state["commits"].values():
+        planned = pending.get("native_arguments", {})
+        if attached and "native_arguments" not in pending:
+            _, planned = consumer["capture_arguments"](pending["metadata"], [])
+        if arguments.get("idempotency_key") and arguments[
+            "idempotency_key"
+        ] == planned.get("idempotency_key"):
+            matches.append(pending)
     if len(matches) != 1:
+        if matches and attached and event["hook_event_name"] == "PreToolUse":
+            raise NativeError("COMMIT_EVENT_AMBIGUOUS")
         return None
     pending = matches[0]
     name = event["hook_event_name"]
     call = identifier(event.get("tool_use_id"))
     if name == "PreToolUse":
+        if attached and "native_arguments" not in pending:
+            content = arguments.get("content")
+            if not isinstance(content, str):
+                raise NativeError("CONTEXT_INVALID")
+            lines = content.split("\n")
+            if not all(line.startswith("- ") for line in lines):
+                raise NativeError("CONTEXT_INVALID")
+            items = [line[2:] for line in lines[1:]]
+            if any(item in COMMIT_CONTEXT_TEMPLATE for item in items):
+                raise NativeError("CONTEXT_INVALID")
+            _, expected = consumer["capture_arguments"](pending["metadata"], items)
+            if arguments != expected:
+                raise NativeError("COMMIT_PAYLOAD_CHANGED")
+            result = prepare_pending(
+                pending,
+                {"context": items},
+                consumer,
+                producer_timeout=CLAUDE_PRODUCER_TIMEOUT,
+            )
+            if "arguments" not in result:
+                raise NativeError("COMMIT_EVENT_UNAVAILABLE")
         reason = None
         if arguments != pending["native_arguments"]:
             reason = "COMMIT_PAYLOAD_CHANGED"
@@ -1655,7 +1722,9 @@ def observe_commit(state, event):
             name,
             "Commit receipt did not match the prepared native call; capture remains unresolved.",
         )
-    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+    consumer = consumer or runpy.run_path(
+        str(BUNDLE / "bin/obsidian-mcp-capture-commit")
+    )
     contract = json.loads((BUNDLE / "contract.json").read_bytes())
     errors = frozenset(contract["tools"]["obsidian_daily_append"]["errors"])
     try:
