@@ -1,0 +1,63 @@
+name: Portable client checks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    paths:
+      - 'packages/client/**'
+      - 'scripts/pack-obsidian-mcp-client.py'
+      - 'tests/obsidian-mcp-*'
+      - 'integrations/**'
+      - 'contract.json'
+      - '.github/workflows/client.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.9.0
+      - name: Verify Python prerequisite
+        run: python3 -c 'import sys; assert sys.version_info >= (3, 11)'
+      - name: Audit bridge dependency lock
+        run: |
+          mkdir "$RUNNER_TEMP/bridge-dependency-audit"
+          cp packages/client/vendor/mcp-remote-read/build-package.json "$RUNNER_TEMP/bridge-dependency-audit/package.json"
+          cp packages/client/vendor/mcp-remote-read/build-package-lock.json "$RUNNER_TEMP/bridge-dependency-audit/package-lock.json"
+          python3 -c 'import os, runpy; from pathlib import Path; build = runpy.run_path("packages/client/vendor/mcp-remote-read/build.py"); build["audit_dependencies"](Path(os.environ["RUNNER_TEMP"]) / "bridge-dependency-audit", dict(os.environ))'
+      - name: Run portable client fixture suites
+        run: |
+          python3 tests/obsidian-mcp-bridge-build.test.py
+          for suite in client client-lifecycle commit-event capture-commit native; do
+            bash "tests/obsidian-mcp-${suite}.test.sh"
+          done
+      - name: Pack immutable client artifact
+        run: |
+          python3 scripts/pack-obsidian-mcp-client.py --output "$RUNNER_TEMP/obsidian-mcp-client"
+          tar -czf "$RUNNER_TEMP/obsidian-mcp-client.tgz" -C "$RUNNER_TEMP" obsidian-mcp-client
+          cp "$RUNNER_TEMP/obsidian-mcp-client/release.json" "$RUNNER_TEMP/obsidian-mcp-client.release.json"
+          cp "$RUNNER_TEMP/obsidian-mcp-client/bin/obsidian-mcp-client-install" "$RUNNER_TEMP/obsidian-mcp-client-install"
+          cd "$RUNNER_TEMP"
+          sha256sum obsidian-mcp-client.tgz obsidian-mcp-client.release.json obsidian-mcp-client-install > obsidian-mcp-client.sha256
+      - name: Retain bundle with POSIX modes and external trust metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: portable-client-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/obsidian-mcp-client.tgz
+            ${{ runner.temp }}/obsidian-mcp-client.release.json
+            ${{ runner.temp }}/obsidian-mcp-client-install
+            ${{ runner.temp }}/obsidian-mcp-client.sha256
+          if-no-files-found: error
