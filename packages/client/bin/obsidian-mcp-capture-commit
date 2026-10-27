@@ -292,7 +292,7 @@ def kill_group(process):
     wait_group(process, 1.0)
 
 
-def bounded_exchange(process, payload):
+def bounded_exchange(process, payload, timeout=PRODUCER_TIMEOUT):
     selector = selectors.DefaultSelector()
     stdin = process.stdin
     stdout = process.stdout
@@ -302,7 +302,7 @@ def bounded_exchange(process, payload):
     selector.register(stdout, selectors.EVENT_READ, "stdout")
     offset = 0
     output = bytearray()
-    deadline = time.monotonic() + PRODUCER_TIMEOUT
+    deadline = time.monotonic() + timeout
     stdin_open = True
     stdout_open = True
     try:
@@ -363,7 +363,7 @@ def bounded_exchange(process, payload):
     return bytes(output)
 
 
-def run_producer(bundle, event, python_executable=None):
+def run_producer(bundle, event, python_executable=None, *, timeout=PRODUCER_TIMEOUT):
     try:
         process = subprocess.Popen(
             ([python_executable] if python_executable else [])
@@ -376,7 +376,7 @@ def run_producer(bundle, event, python_executable=None):
     except (OSError, ValueError):
         raise CaptureError("EVENT_REJECTED") from None
     encoded = json.dumps(event, separators=(",", ":")).encode() + b"\n"
-    stdout = bounded_exchange(process, encoded)
+    stdout = bounded_exchange(process, encoded, timeout)
     if process.returncode != 0:
         raise CaptureError("EVENT_REJECTED")
     try:
