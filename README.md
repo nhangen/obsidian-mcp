@@ -13,6 +13,32 @@ prepares the first standalone release without reusing the imported `0.2.0` versi
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
+## Portable clients
+
+The standalone server release is [mcp-v0.2.1](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.1).
+The public portable client source is in [`packages/client`](packages/client/README.md),
+including the pinned bridge, lifecycle installer and optional isolated native
+capture integration. Neither requires the private llm-tools harness or a plugin.
+
+From a trusted checkout, with Python 3.11+ and Node.js 22+:
+
+```bash
+python3 scripts/pack-obsidian-mcp-client.py --output /absolute/new/client-bundle
+python3 /absolute/new/client-bundle/bin/obsidian-mcp-client-install \
+  --bundle /absolute/new/client-bundle --release-sha256 <trusted-printed-digest>
+```
+
+The packer requires an output outside the repository and prints the release
+inventory digest. Use the installer and digest from the trusted checkout or CI
+artifact, not from an unauthenticated bundle. Host setup guides are under
+[`integrations/codex`](integrations/codex/README.md),
+[`integrations/claude`](integrations/claude/README.md) and
+[`integrations/opencode`](integrations/opencode/README.md). Setup is explicit;
+installation does not change credentials, hooks, host settings or writer ownership.
+Automatic-capture host acceptance and client-release publication remain tracked in
+[issue #2](https://github.com/nhangen/obsidian-mcp/issues/2). Fixture tests are not
+evidence that an installed host delivered its hooks or persisted a real session.
+
 ## Build and configure
 
 Use Node.js 20 or newer (CI pins 24.9.0), npm, Bash, Git, and standard Unix
