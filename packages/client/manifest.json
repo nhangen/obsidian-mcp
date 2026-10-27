@@ -7,6 +7,13 @@
     "activation": "new-isolated-profile-only",
     "defaultActivated": false
   },
+  "pluginCapture": {
+    "launcher": "bin/obsidian-mcp-native",
+    "host": "claude-plugin",
+    "apiVersion": 1,
+    "activation": "external-plugin-ownership-only",
+    "defaultActivated": false
+  },
   "mcpRemotePackage": "mcp-remote@0.14.3",
   "readBridge": {
     "package": "mcp-remote@0.14.3",

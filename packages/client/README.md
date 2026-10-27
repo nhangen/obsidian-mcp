@@ -269,3 +269,109 @@ vault content and running sessions are never changed. Restart or close a running
 profile before disabling it; an already-running host has loaded its hook settings.
 General profile upgrade/migration and an all-host writer handoff remain separate
 acceptance gates. The existing managed client installer still owns bundle lifecycle.
+
+## Attached Claude plugin capture API
+
+The public runtime also supports an explicit `claude-plugin` host mode. This is
+source support for an optional plugin dispatcher, not installation, hook
+registration, writer activation, or a completed migration. Existing Codex creation
+and isolation remain unchanged. No second transport or provider process is added.
+
+Before using this API, verify the public release using the installer instructions
+above. The dispatcher must require a successful capabilities response with
+`apiVersion: 1` and `claude-plugin` in `hosts`; an older release or any nonzero exit
+is unsupported, with no local writer fallback:
+
+```sh
+python3 <verified-bundle>/bin/obsidian-mcp-native capabilities \
+  --release-sha256 <trusted-release-json-sha256>
+python3 <verified-bundle>/bin/obsidian-mcp-native attach --host claude-plugin \
+  --home /absolute/new-private-project-profile --project /absolute/git-root \
+  --folder Projects/Development/example/project --daily-folder Journal \
+  --release-sha256 <trusted-release-json-sha256>
+```
+
+`attach` requires a nonexistent profile path beneath an existing canonical parent.
+It creates a 0700 directory, a 0600 `capture-profile.json`, and a 0700
+`capture-state` directory. The descriptor contains `host: "claude-plugin"`,
+`active: true`, canonical project and bundle paths, the pinned release digest,
+creator Python, session folder and daily folder. It accepts projects with existing
+host settings and instructions, and writes none of those files. `--daily-folder`
+defaults to `Daily`; both folders must be normalized vault-relative directories.
+The supplied daily folder must match the server configuration: receipts naming a
+different daily path remain unresolved rather than relaxing verification.
+Every profile load verifies the same release bytes and installed trust record as
+the isolated runtime. A profile remains pinned to its immutable release even if
+the installer's `current` pointer later changes.
+
+Dispatcher commands (JSON stdout, nonzero exit on invalid profile/state):
+
+| Command | Contract |
+| --- | --- |
+| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `host`, `project`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active` and `apiVersion`. Does not require a session ID. |
+| `hook --home <profile>` | Reads the full Claude hook JSON from stdin; emits host hook JSON. The dispatcher performs no turn normalization. |
+| `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, and `active_request`. Emits no saved body or transcript. |
+
+The plugin must close its ownership/admission barrier **before** draining and keep
+it closed through owner or profile remapping. Drain is an observation, not a
+writer lease. It acquires the gate and every discovered session lock without
+waiting, refuses contention, corrupt state, missing active-owner state, unknown
+state files and more than 256 sessions, and never repairs or deletes evidence.
+`quiescent: true` requires no active request, pending session disposition,
+in-flight/recovery state, snapshots, pending/uncaptured commits or unresolved
+snapshot-resolution evidence. A nonzero exit is never permission to hand off.
+`takeover` and `resolve-snapshot` retain uncaptured evidence and cannot substitute
+for lossless draining. `disable` and `run` are unsupported for attached profiles;
+the plugin owns writer admission and rollback separately. No registration or
+ownership change is performed by any of these API calls.
+
+Register `UserPromptSubmit`, `SessionStart` (including resume), `Stop`,
+`StopFailure`, and paired `PreToolUse`, `PostToolUse`, `PostToolUseFailure` handlers.
+Tool matchers must cover `Bash` and the exact names
+`mcp__obsidian-write__obsidian_keeper_save` and
+`mcp__obsidian-write__obsidian_daily_append`. Pass the original payload unchanged.
+The runtime follows the [official Claude hook schemas](https://code.claude.com/docs/en/hooks):
+prompt events supply no turn ID; tool failures supply `error`/`is_interrupt`
+rather than a successful receipt. Configure host-level hook failures to refuse
+execution where supported; a missing executable or unverified profile cannot
+establish capture ownership merely by printing instructions.
+
+Prompt occurrence identity hashes the session, canonical transcript identity,
+file identity, byte watermark, bounded tail digest and prompt digest. Duplicate
+deliveries at the same boundary reuse the turn; the same text at a later boundary
+gets a new turn. Missing first-prompt transcript files use an empty watermark.
+Resume reuses persisted state without inventing a turn or replaying history.
+Changed transcript identity, orphan tool/Stop events and unresolved previous
+turns refuse advancement. A changed boundary cannot prove a late delivery was a
+duplicate, so unresolved work blocks a new occurrence. State stores hashes, not
+prompt text, transcript paths or raw transcript copies. Subagent events are
+explicitly unsupported and cannot be attributed to the main session.
+
+Session/commit planning, Git execution, canonical commit targets and receipt
+validation use the shared engine. Bash commits retain the isolated mode's bounded
+single-command syntax. Repository subdirectories retain their execution directory
+and relative pathspecs while metadata is attributed to the canonical Git root;
+nested foreign repositories are refused. MCP result objects, JSON-encoded bare
+receipts emitted by Claude, JSON-encoded wrappers and content-block arrays are
+normalized into the same strict receipt validator. A matching failed
+write retains its exact request/key and requires inspection plus the existing
+`retry --verification authoritative-path-inspected` flow. Raw error text is not
+persisted. A failed host tool cannot establish a successful commit event.
+Claude commit rewrites omit an `allow` permission decision, so the rewritten
+command still goes through the host's configured permission flow.
+Manual MCP writes with unrelated keys are observed without blocking or settling
+automatic capture; matching automatic keys still require exact arguments.
+Stop requests at most one continuation per occurrence, then reports unresolved
+work. StopFailure retains state and never requests more provider work.
+
+Fixture tests exercise the packed/installed CLI with temporary Git repositories,
+Claude event fixtures and simulated MCP receipts. They do not establish installed
+Claude execution, real provider usage/billing, live server recovery, plugin
+writer handoff, release, or cross-host acceptance.
+To additionally exercise the current plugin dispatcher and ownership barrier,
+set `OBSIDIAN_MCP_TEST_PLUGIN_ROOT` to a public plugin checkout when running
+`tests/obsidian-mcp-native.test.py`. The optional pair fixture installs the trusted
+packed client, attaches a temporary Git project, hands ownership to MCP, observes
+a simulated successful receipt through plugin hooks, verifies drain, and hands
+ownership to disabled. All state stays in temporary directories; no real server,
+provider, user configuration or running writer is involved.
