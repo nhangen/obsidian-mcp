@@ -42,7 +42,7 @@ jobs:
         with:
           node-version: 24.9.0
           cache: npm
-          cache-dependency-path: npm-shrinkwrap.json
+          cache-dependency-path: package-lock.json
 
       - name: Record source commit
         id: source

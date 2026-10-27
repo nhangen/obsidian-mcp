@@ -160,10 +160,13 @@ test("packed tarball installs its locked runtime dependencies with npm ci", { ti
   const tarball = join(fixture, (await readdir(fixture)).find((name) => name.endsWith(".tgz")));
   await run("tar", ["-xzf", tarball, "-C", fixture], { cwd: fixture });
   const installedRoot = join(fixture, "package");
-  const lock = JSON.parse(await readFile(join(installedRoot, "npm-shrinkwrap.json"), "utf8"));
+  const lockPath = join(installedRoot, "dist", "runtime-lock.json");
+  const lock = JSON.parse(await readFile(lockPath, "utf8"));
+  assert.deepEqual(lock, JSON.parse(await readFile(join(packageRoot, "package-lock.json"), "utf8")));
   const manifest = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8"));
   assert.equal(lock.version, manifest.version);
   assert.deepEqual(lock.packages[""].dependencies, manifest.dependencies);
+  await copyFile(lockPath, join(installedRoot, "package-lock.json"));
   await run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: installedRoot });
   for (const [path, entry] of Object.entries(lock.packages)) {
     if (path === "" || entry.dev) continue;
@@ -989,7 +992,7 @@ test("extracted package builds, tests, and runs without sibling plugin or repo",
 
   const rootFiles = [
     "package.json",
-    "npm-shrinkwrap.json",
+    "package-lock.json",
     "tsconfig.json",
     "contract.json",
     "monitor.mjs",

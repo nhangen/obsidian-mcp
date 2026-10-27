@@ -274,14 +274,22 @@ because this source tree was extracted.
 
 An npm tarball contains a `package/` directory, not an immediately runnable
 release root. Extract it into a new versioned directory, enter its `package/`
-subdirectory, and run `npm ci --omit=dev --ignore-scripts` to install runtime
-dependencies before starting `node dist/http.mjs`. Build dependencies are not
+subdirectory, then install the frozen runtime dependencies:
+
+```bash
+cp dist/runtime-lock.json package-lock.json
+npm ci --omit=dev --ignore-scripts
+node dist/http.mjs
+```
+
+Set the required server environment before starting. Build dependencies are not
 needed for the prebuilt tarball. Point service working directories and the
-`current` symlink to that installed `package/` directory. The source uses
-`npm-shrinkwrap.json` as its sole dependency lockfile; npm includes it in the
-tarball so both source builds and production installs use the locked dependency
-versions and integrity hashes. Dependency downloads still require npm registry
-access. Do not cut over a live service before
+`current` symlink to that installed `package/` directory. The build copies the
+canonical source `package-lock.json` to `dist/runtime-lock.json` because npm
+omits root package-lock files from tarballs. Restoring that copy supports both
+npm 11 and npm 12 without depending on shrinkwrap support. Source builds and
+production installs use the same dependency versions and integrity hashes.
+Dependency downloads still require npm registry access. Do not cut over a live service before
 verifying the artifact checksum, contract, configuration and handshake.
 
 ## Self-Host Deployment and Service Management
