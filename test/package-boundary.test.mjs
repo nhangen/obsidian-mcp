@@ -119,6 +119,7 @@ async function initialize(child, output, id = 1) {
   assert.equal(response.id, id);
   assert.equal(response.result?.protocolVersion, "2025-11-25");
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  return response;
 }
 
 async function close(child, output) {
@@ -151,6 +152,97 @@ function assertMcpOutput(output) {
   }
   assert.equal(output.stderr, "");
 }
+
+test("packed tarball installs its locked runtime dependencies with npm ci", { timeout: 60_000 }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-locked-install-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  await run("npm", ["pack", "--silent", "--ignore-scripts", "--pack-destination", fixture], { cwd: packageRoot });
+  const tarball = join(fixture, (await readdir(fixture)).find((name) => name.endsWith(".tgz")));
+  await run("tar", ["-xzf", tarball, "-C", fixture], { cwd: fixture });
+  const installedRoot = join(fixture, "package");
+  const lockPath = join(installedRoot, "dist", "runtime-lock.json");
+  const lock = JSON.parse(await readFile(lockPath, "utf8"));
+  assert.deepEqual(lock, JSON.parse(await readFile(join(packageRoot, "package-lock.json"), "utf8")));
+  const manifest = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8"));
+  assert.equal(lock.version, manifest.version);
+  assert.deepEqual(lock.packages[""].dependencies, manifest.dependencies);
+  await copyFile(lockPath, join(installedRoot, "package-lock.json"));
+  await run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: installedRoot });
+  for (const [path, entry] of Object.entries(lock.packages)) {
+    if (path === "" || entry.dev) continue;
+    const dependency = JSON.parse(await readFile(join(installedRoot, path, "package.json"), "utf8"));
+    assert.equal(dependency.version, entry.version, path);
+  }
+  await assert.rejects(stat(join(installedRoot, "node_modules", "typescript")), { code: "ENOENT" });
+  const vault = join(fixture, "vault");
+  const config = join(fixture, "obsidian.local.md");
+  await mkdir(vault);
+  await writeFile(config, `---\nvault_path: ${vault}\ndaily_path: Daily/\n---\n`);
+  const child = spawn(process.execPath, [join(installedRoot, "dist", "stdio.mjs")], {
+    cwd: fixture,
+    env: { ...process.env, OBSIDIAN_LOCAL_MD: config, MCP_STDIO_PROFILE: "read" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const output = collectOutput(child);
+  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
+  const initialized = await initialize(child, output);
+  assert.equal(initialized.result.serverInfo.version, manifest.version);
+  await close(child, output);
+  assertMcpOutput(output);
+
+  const http = spawn(process.execPath, [join(installedRoot, "dist", "http.mjs")], {
+    cwd: fixture,
+    env: {
+      ...process.env, OBSIDIAN_LOCAL_MD: config,
+      MCP_HTTP_BIND: "127.0.0.1", MCP_HTTP_PORT: "0",
+      MCP_HTTP_JWT_SECRET: httpSecret, MCP_HTTP_JWT_ISSUER: httpIssuer,
+      MCP_HTTP_JWT_AUDIENCE: httpAudience, MCP_HTTP_ALLOWED_HOSTS: "127.0.0.1",
+      MCP_HTTP_ALLOWED_ORIGINS: "https://allowed.example",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const stopped = new Promise((resolveStop) => http.once("close", resolveStop));
+  t.after(async () => { if (http.exitCode === null) http.kill("SIGTERM"); await stopped; });
+  const url = await new Promise((resolveReady, rejectReady) => {
+    let stderr = "";
+    http.stderr.setEncoding("utf8");
+    http.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      const match = stderr.match(/mcp-http-listening (http:\/\/127\.0\.0\.1:\d+)/);
+      if (match) resolveReady(`${match[1]}/mcp`);
+    });
+    http.once("error", rejectReady);
+    http.once("close", () => rejectReady(new Error(`HTTP exited before ready: ${stderr}`)));
+  });
+  const headers = {
+    Accept: "application/json, text/event-stream", "Content-Type": "application/json",
+    Authorization: `Bearer ${httpToken()}`, Origin: "https://allowed.example",
+  };
+  const response = await fetch(url, {
+    method: "POST", headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+      protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "locked-install", version: "1" },
+    } }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).result.serverInfo.version, manifest.version);
+  const session = response.headers.get("mcp-session-id");
+  assert.ok(session);
+  const write = await fetch(url, {
+    method: "POST",
+    headers: { ...headers, "Mcp-Session-Id": session, "MCP-Protocol-Version": "2025-11-25" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "obsidian_daily_append", arguments: {
+        date: "2026-10-27", content: "Locked runtime installation", idempotency_key: "locked-install",
+      },
+    } }),
+  });
+  assert.equal(write.status, 200);
+  assert.equal((await write.json()).result.structuredContent.status, "committed");
+  assert.match(await readFile(join(vault, "Daily", "2026-10-27.md"), "utf8"), /Locked runtime installation/);
+  http.kill("SIGTERM");
+  await stopped;
+});
 
 test("packed package exposes a built stdio launcher that works outside the install directory", async (t) => {
   const packageManifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));

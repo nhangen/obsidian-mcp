@@ -34,4 +34,5 @@ for (const relativePath of helpers) {
 
 await chmod(join(outputRoot, "stdio.mjs"), 0o755);
 await chmod(join(outputRoot, "http.mjs"), 0o755);
+await copyFile(join(packageRoot, "package-lock.json"), join(outputRoot, "runtime-lock.json"));
 await writeFile(join(outputRoot, "version.mjs"), `export const packageVersion = ${JSON.stringify(packageManifest.version)};\n`);

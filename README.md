@@ -8,7 +8,8 @@ needs filesystem access to the vault; remote clients do not.
 This initial extraction imports only the tracked `packages/mcp-server` tree from
 [`nhangen/claude-obsidian-plugin` at `76df3151104e37f409589fcda7ff3da65cc8c0d8`](https://github.com/nhangen/claude-obsidian-plugin/tree/76df3151104e37f409589fcda7ff3da65cc8c0d8/packages/mcp-server),
 with fresh repository history and the original MIT notice. It preserves the
-legacy package identity, launcher names, version `0.2.0`, and protocol contract.
+legacy package identity, launcher names, and protocol contract. Version `0.2.1`
+prepares the first standalone release without reusing the imported `0.2.0` version.
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
@@ -273,12 +274,22 @@ because this source tree was extracted.
 
 An npm tarball contains a `package/` directory, not an immediately runnable
 release root. Extract it into a new versioned directory, enter its `package/`
-subdirectory, and run `npm install --omit=dev --ignore-scripts` to install runtime
-dependencies before starting `node dist/http.mjs`. Build dependencies are not
+subdirectory, then install the frozen runtime dependencies:
+
+```bash
+cp dist/runtime-lock.json package-lock.json
+npm ci --omit=dev --ignore-scripts
+node dist/http.mjs
+```
+
+Set the required server environment before starting. Build dependencies are not
 needed for the prebuilt tarball. Point service working directories and the
-`current` symlink to that installed `package/` directory. The source lockfile is
-not included in the npm tarball; installing runtime dependencies is distinct
-from reproducing the locked source build. Do not cut over a live service before
+`current` symlink to that installed `package/` directory. The build copies the
+canonical source `package-lock.json` to `dist/runtime-lock.json` because npm
+omits root package-lock files from tarballs. Restoring that copy supports both
+npm 11 and npm 12 without depending on shrinkwrap support. Source builds and
+production installs use the same dependency versions and integrity hashes.
+Dependency downloads still require npm registry access. Do not cut over a live service before
 verifying the artifact checksum, contract, configuration and handshake.
 
 ## Self-Host Deployment and Service Management
