@@ -3380,44 +3380,77 @@ class DirectoryCaptureTest(NativeCaptureFixture):
         self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
         self.assertFalse(self.git_log.exists())
 
-    def test_directory_commit_commands_and_cli_operations_refuse_before_state_or_git(
+    def test_directory_shell_events_pass_unchanged_without_commit_capture_or_git(self):
+        self.forbid_git()
+        self.assertEqual(self.configure().returncode, 0)
+        self.hook("UserPromptSubmit", prompt="Review directory shell activity")
+        before = self.profile_snapshot()
+        for name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            for command in (
+                "git log --grep commit",
+                "grep commit git",
+                'printf "%s\\n" git commit',
+                "git commit -m fixture",
+                "rtk git -C nested commit -m fixture",
+                "env git commit -m fixture",
+                "command git commit -m fixture",
+                'bash -lc "git commit -m fixture"',
+                "git commit; printf done",
+                "python3 -c 'print(\"git commit\")'",
+                "printf 'unterminated",
+            ):
+                with self.subTest(event=name, command=command):
+                    result = self.cli(
+                        "hook",
+                        "--home",
+                        str(self.home),
+                        payload=self.event(
+                            name,
+                            tool_name="Bash",
+                            tool_use_id="shell-command",
+                            tool_input={"command": command},
+                            tool_response="ignored",
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {})
+                    self.assertEqual(self.profile_snapshot(), before)
+        state = json.loads(next(iter(self.state_paths())).read_text())
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+        self.assertNotIn("metadata", state)
+        self.assertFalse(self.git_log.exists())
+
+    def test_directory_commit_capture_cli_and_mcp_refuse_before_state_or_git(
         self,
     ):
         self.forbid_git()
         self.assertEqual(self.configure().returncode, 0)
         before = self.profile_snapshot()
         for name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
-            for command in (
-                "git commit -m fixture",
-                "rtk git -C nested commit -m fixture",
+            for tool in (
+                "mcp__obsidian-write__obsidian_daily_append",
+                "mcp__obsidian_write__obsidian_daily_append",
             ):
-                with self.subTest(event=name, command=command):
-                    result = self.hook(
-                        name,
-                        tool_name="Bash",
-                        tool_use_id="commit-request",
-                        tool_input={"command": command},
-                        tool_response="ignored",
-                    )
-                    self.assertIn("DIRECTORY_SESSION_ONLY", json.dumps(result))
-                    if name == "PreToolUse":
-                        self.assertEqual(
-                            result["hookSpecificOutput"]["permissionDecision"], "deny"
+                for arguments in (
+                    dict(skip_if_hash="a" * 40),
+                    dict(idempotency_key="commit-capture:forged"),
+                ):
+                    with self.subTest(event=name, tool=tool, arguments=arguments):
+                        result = self.hook(
+                            name,
+                            tool_name=tool,
+                            tool_use_id="commit-append",
+                            tool_input=arguments,
+                            tool_response="ignored",
                         )
-                    self.assertEqual(self.profile_snapshot(), before)
-        for arguments in (
-            dict(skip_if_hash="a" * 40),
-            dict(idempotency_key="commit-capture:forged"),
-        ):
-            result = self.hook(
-                "PreToolUse",
-                tool_name="mcp__obsidian-write__obsidian_daily_append",
-                tool_use_id="commit-append",
-                tool_input=arguments,
-            )
-            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
-            self.assertIn("DIRECTORY_SESSION_ONLY", json.dumps(result))
-            self.assertEqual(self.profile_snapshot(), before)
+                        self.assertIn("DIRECTORY_SESSION_ONLY", json.dumps(result))
+                        if name == "PreToolUse":
+                            self.assertEqual(
+                                result["hookSpecificOutput"]["permissionDecision"],
+                                "deny",
+                            )
+                        self.assertEqual(self.profile_snapshot(), before)
         for operation, options in (
             ("execute-commit", ["--snapshot", "a" * 64]),
             ("prepare", ["--commit", "b" * 64]),

@@ -331,11 +331,14 @@ fail closed. `create --project-mode directory` refuses before creating an isolat
 Codex profile.
 
 Directory profiles are session-only even when a nested directory contains Git.
-Git commit Bash events, native commit preparation/execution/recovery operations,
-and commit-targeted append events refuse before creating snapshots or commit gates.
-They never reconstruct metadata or acknowledge a commit. Ordinary tools and manual
-appends with unrelated keys do not settle automatic capture. Use a separately
-attached Git profile for commit capture; the integrating plugin must choose the
+All shell commands run normally under the host's permissions, including direct,
+wrapped, or opaque commit commands; the capture runtime does not parse or rewrite
+them, create commit snapshots/gates, reconstruct metadata, or acknowledge a commit.
+Directory mode is not a shell sandbox. Explicit native commit capture operations
+and commit-targeted append events still refuse before creating capture state.
+Ordinary tools and manual appends with unrelated keys do not settle automatic
+capture. Use a separately attached Git profile for commit capture; the integrating
+plugin must choose the
 most specific explicit canonical root and reject duplicate registrations. An
 unmapped workspace must be attached explicitly, with no local keeper fallback.
 

@@ -132,9 +132,11 @@ for the complete command and immutable release requirements.
 Directory profiles save sessions without probing Git or changing workspace files.
 Only the registered root and its contained working directories are eligible;
 sibling paths and escaping symlinks fail closed. A nested Git repository remains
-session-only under that directory profile. Commit events and native commit
-operations refuse before creating capture state. A separately attached, more
-specific Git profile is required for commit capture. Git is the default mode,
+session-only under that directory profile. Shell commands run normally under host
+permissions, without automatic commit capture, metadata, snapshots, or rewrites;
+directory mode is not a shell sandbox. Explicit native commit capture operations
+and commit-targeted MCP appends refuse before creating capture state. A separately
+attached, more specific Git profile is required for commit capture. Git is the default mode,
 including for older descriptors without `projectMode`; malformed modes refuse.
 
 The plugin must reject duplicate canonical registrations, select the most specific

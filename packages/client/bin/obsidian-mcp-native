@@ -1610,27 +1610,19 @@ def prepare_pending(pending, payload, consumer, *, producer_timeout=None):
 
 
 def directory_session_event(event):
-    tool = event.get("tool_name")
-    arguments = event.get("tool_input", {})
-    if not isinstance(arguments, dict):
-        raise NativeError("TOOL_EVENT_INVALID")
-    if tool == "Bash":
-        command = arguments.get("command")
-        words = shlex.split(command) if isinstance(command, str) else []
-        if ("commit" in words and any(Path(word).name == "git" for word in words)) or (
-            "execute-commit" in words
-            and any(Path(word).name == "obsidian-mcp-native" for word in words)
-        ):
-            raise NativeError("DIRECTORY_SESSION_ONLY")
-    elif tool in (
+    if event.get("tool_name") not in (
         "mcp__obsidian-write__obsidian_daily_append",
         "mcp__obsidian_write__obsidian_daily_append",
     ):
-        key = arguments.get("idempotency_key")
-        if arguments.get("skip_if_hash") is not None or (
-            isinstance(key, str) and key.startswith("commit-capture:")
-        ):
-            raise NativeError("DIRECTORY_SESSION_ONLY")
+        return
+    arguments = event.get("tool_input", {})
+    if not isinstance(arguments, dict):
+        raise NativeError("TOOL_EVENT_INVALID")
+    key = arguments.get("idempotency_key")
+    if arguments.get("skip_if_hash") is not None or (
+        isinstance(key, str) and key.startswith("commit-capture:")
+    ):
+        raise NativeError("DIRECTORY_SESSION_ONLY")
 
 
 def prepare_commit(home, profile, args):
