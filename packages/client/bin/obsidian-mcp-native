@@ -138,10 +138,28 @@ def atomic_write(path, value):
             os.unlink(temporary)
 
 
-def project_root(project):
+def project_mode(profile):
+    mode = profile.get("projectMode", "git")
+    if not isinstance(mode, str) or mode not in ("git", "directory"):
+        raise NativeError("PROJECT_MODE_INVALID")
+    if mode == "directory" and profile.get("host") != "claude-plugin":
+        raise NativeError("PROJECT_MODE_HOST_UNSUPPORTED")
+    return mode
+
+
+def require_git_profile(profile):
+    if project_mode(profile) != "git":
+        raise NativeError("DIRECTORY_SESSION_ONLY")
+
+
+def project_root(project, mode="git"):
+    if not isinstance(mode, str) or mode not in ("git", "directory"):
+        raise NativeError("PROJECT_MODE_INVALID")
+    if mode == "directory" and not Path(project).is_absolute():
+        raise NativeError("PROJECT_ROOT_REQUIRED")
     root = Path(project).resolve(strict=True)
-    if not root.is_dir() or git(root, "rev-parse", "--show-toplevel").strip() != str(
-        root
+    if not root.is_dir() or (
+        mode == "git" and git(root, "rev-parse", "--show-toplevel").strip() != str(root)
     ):
         raise NativeError("PROJECT_ROOT_REQUIRED")
     return root
@@ -212,7 +230,8 @@ def attach_profile(args):
     if args.host != "claude-plugin":
         raise NativeError("ATTACH_HOST_REQUIRED")
     metadata = trusted_bundle(args.release_sha256)
-    project = project_root(args.project)
+    mode = project_mode(dict(host=args.host, projectMode=args.project_mode))
+    project = project_root(args.project, mode)
     folder = relative_folder(args.folder)
     daily = relative_folder(args.daily_folder)
     home = Path(args.home).absolute()
@@ -231,6 +250,7 @@ def attach_profile(args):
         releaseSha256=args.release_sha256,
         releaseId=metadata["releaseId"],
         project=str(project),
+        projectMode=mode,
         folder=folder,
         dailyFolder=daily,
         files={},
@@ -254,6 +274,7 @@ def capabilities(expected):
     return dict(
         apiVersion=1,
         hosts=["codex", "claude-plugin"],
+        projectModes={"claude-plugin": ["git", "directory"], "codex": ["git"]},
         release_id=metadata["releaseId"],
         operations=[
             "attach",
@@ -272,6 +293,7 @@ def capabilities(expected):
 
 
 def create_profile(args):
+    require_git_profile(dict(host="codex", projectMode=args.project_mode))
     metadata = trusted_bundle(args.release_sha256)
     project = clean_project(args.project)
     home = Path(args.home).absolute()
@@ -402,6 +424,7 @@ def load_profile(home):
         )
     ):
         raise NativeError("PROFILE_INACTIVE_OR_INVALID")
+    mode = project_mode(profile)
     python = Path(profile.get("python", ""))
     if (
         not python.is_absolute()
@@ -414,7 +437,7 @@ def load_profile(home):
     if profile["host"] == "claude-plugin":
         relative_folder(profile["folder"])
         relative_folder(profile["dailyFolder"])
-        if str(project_root(profile["project"])) != profile["project"]:
+        if str(project_root(profile["project"], mode)) != profile["project"]:
             raise NativeError("PROFILE_PROJECT_INVALID")
         metadata = trusted_bundle(profile["releaseSha256"])
         if metadata["releaseId"] != profile.get("releaseId"):
@@ -1201,7 +1224,14 @@ def hook(home, profile, event):
     name = event.get("hook_event_name")
     try:
         return claude_output(engine_hook(home, profile, event), name)
-    except (NativeError, OSError, ValueError, KeyError, TypeError) as error:
+    except (
+        NativeError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as error:
         code = (
             str(error)
             if isinstance(error, NativeError)
@@ -1231,7 +1261,20 @@ def engine_hook(home, profile, event):
     name = event.get("hook_event_name")
     session = digest(identifier(event.get("session_id")).encode())
     cwd = event.get("cwd", "")
-    if profile["host"] == "claude-plugin":
+    mode = project_mode(profile)
+    if mode == "directory":
+        try:
+            if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
+                raise NativeError("PROJECT_MISMATCH")
+            directory = Path(cwd).resolve(strict=True)
+            if not directory.is_dir() or not directory.is_relative_to(
+                Path(profile["project"])
+            ):
+                raise NativeError("PROJECT_MISMATCH")
+        except (OSError, RuntimeError):
+            raise NativeError("PROJECT_MISMATCH") from None
+        directory_session_event(event)
+    elif profile["host"] == "claude-plugin":
         if (
             not isinstance(cwd, str)
             or not cwd
@@ -1328,7 +1371,10 @@ def engine_hook(home, profile, event):
             if result is not None:
                 atomic_write(path, encode(state))
                 return result
-        if event.get("tool_name") == "mcp__obsidian_write__obsidian_daily_append":
+        if (
+            mode == "git"
+            and event.get("tool_name") == "mcp__obsidian_write__obsidian_daily_append"
+        ):
             result = observe_commit(
                 state, event, attached=profile["host"] == "claude-plugin"
             )
@@ -1344,6 +1390,8 @@ def engine_hook(home, profile, event):
                 if "additionalContext" in output:
                     output["additionalContext"] += "\n" + note
                 return result
+        if mode == "directory":
+            return {}
         if (
             name not in ("PreToolUse", "PostToolUse")
             or event.get("tool_name") != "Bash"
@@ -1561,7 +1609,32 @@ def prepare_pending(pending, payload, consumer, *, producer_timeout=None):
     return {"tool": "obsidian_daily_append", "arguments": arguments}
 
 
-def prepare_commit(home, args):
+def directory_session_event(event):
+    tool = event.get("tool_name")
+    arguments = event.get("tool_input", {})
+    if not isinstance(arguments, dict):
+        raise NativeError("TOOL_EVENT_INVALID")
+    if tool == "Bash":
+        command = arguments.get("command")
+        words = shlex.split(command) if isinstance(command, str) else []
+        if ("commit" in words and any(Path(word).name == "git" for word in words)) or (
+            "execute-commit" in words
+            and any(Path(word).name == "obsidian-mcp-native" for word in words)
+        ):
+            raise NativeError("DIRECTORY_SESSION_ONLY")
+    elif tool in (
+        "mcp__obsidian-write__obsidian_daily_append",
+        "mcp__obsidian_write__obsidian_daily_append",
+    ):
+        key = arguments.get("idempotency_key")
+        if arguments.get("skip_if_hash") is not None or (
+            isinstance(key, str) and key.startswith("commit-capture:")
+        ):
+            raise NativeError("DIRECTORY_SESSION_ONLY")
+
+
+def prepare_commit(home, profile, args):
+    require_git_profile(profile)
     consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
     payload = input_json()
     with state_lock(home, args.session) as (state, path):
@@ -1573,6 +1646,7 @@ def prepare_commit(home, args):
 
 
 def execute_commit(home, profile, args):
+    require_git_profile(profile)
     with state_lock(home, args.session) as (state, path):
         if state is None or args.snapshot not in state["snapshots"]:
             raise NativeError("SNAPSHOT_UNAVAILABLE")
@@ -1746,7 +1820,9 @@ def observe_commit(state, event, *, attached=False):
     return {}
 
 
-def review_retry(home, args):
+def review_retry(home, profile, args):
+    if args.commit is not None:
+        require_git_profile(profile)
     if args.verification != "authoritative-path-inspected":
         raise NativeError("AUTHORITATIVE_VERIFICATION_REQUIRED")
     with state_lock(home, args.session) as (state, path):
@@ -1784,6 +1860,7 @@ def review_retry(home, args):
 
 
 def takeover(home, profile, args):
+    require_git_profile(profile)
     if args.verification != "command-stopped-and-history-inspected":
         raise NativeError("INTERRUPTED_VERIFICATION_REQUIRED")
     if args.session is not None and HEX.fullmatch(args.session) is None:
@@ -1874,6 +1951,7 @@ def main():
     parser.add_argument("--home")
     parser.add_argument("--host", choices=("codex", "claude-plugin"))
     parser.add_argument("--project")
+    parser.add_argument("--project-mode", choices=("git", "directory"), default="git")
     parser.add_argument("--folder")
     parser.add_argument("--daily-folder", default="Daily")
     parser.add_argument("--release-sha256")
@@ -1912,6 +1990,14 @@ def main():
         if not args.home:
             raise NativeError("HOME_REQUIRED")
         home, profile = load_profile(args.home)
+        mode = project_mode(profile)
+        if mode == "directory" and (
+            args.operation
+            in ("execute-commit", "prepare", "takeover", "resolve-snapshot")
+            or args.commit is not None
+            or args.snapshot is not None
+        ):
+            raise NativeError("DIRECTORY_SESSION_ONLY")
         if extra and args.operation != "run":
             raise NativeError("ARGUMENTS_INVALID")
         if args.operation == "profile-status":
@@ -1921,6 +2007,7 @@ def main():
                 host=profile["host"],
                 home=str(home),
                 project=profile["project"],
+                projectMode=mode,
                 folder=profile["folder"],
                 daily_folder=profile.get("dailyFolder", "Daily"),
                 release_id=profile["releaseId"],
@@ -1937,9 +2024,9 @@ def main():
             result = hook(home, profile, input_json())
         elif args.operation in ("prepare", "retry"):
             result = (
-                prepare_commit(home, args)
+                prepare_commit(home, profile, args)
                 if args.operation == "prepare"
-                else review_retry(home, args)
+                else review_retry(home, profile, args)
             )
         elif args.operation == "skip":
             with state_lock(home, args.session) as (state, path):
@@ -2070,7 +2157,14 @@ if __name__ == "__main__":
     except NativeError as error:
         print("obsidian-mcp-native: " + str(error), file=sys.stderr)
         raise SystemExit(64)
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ):
         print(
             "obsidian-mcp-native: operation refused or capture unresolved; inspect profile, event and recovery state",
             file=sys.stderr,
