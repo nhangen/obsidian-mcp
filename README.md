@@ -24,6 +24,10 @@ not activate writers; the plugin separately owns migration and admission gates.
 Attached Claude commit capture uses canonical MCP arguments directly, with bounded
 Pre-hook preparation and immutable retries. It needs no Bash stdin helper grant;
 existing MCP tool authorization and recovery checks still apply.
+Explicit attached Claude profiles can opt into `--project-mode directory` for
+session-only non-Git workspaces. Git remains the default and is required for
+commit capture. See the [directory-profile boundary](packages/client/README.md#explicit-directory-session-profiles);
+this source support does not establish a released client or whole-host acceptance.
 
 From a trusted checkout, with Python 3.11+ and Node.js 22+:
 

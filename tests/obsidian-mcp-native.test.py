@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class NativeCaptureFixture(unittest.TestCase):
     expected_rewrite_decision = "allow"
+    initialize_git = True
 
     @classmethod
     def setUpClass(cls):
@@ -60,7 +61,8 @@ class NativeCaptureFixture(unittest.TestCase):
             GIT_COMMITTER_NAME="Fixture",
             GIT_COMMITTER_EMAIL="fixture@example.invalid",
         )
-        self.git("init", "-b", "native-fixture")
+        if self.initialize_git:
+            self.git("init", "-b", "native-fixture")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -95,6 +97,7 @@ class NativeCaptureFixture(unittest.TestCase):
             "Projects/Development/fixture/native",
             "--release-sha256",
             extra.get("digest", self.digest),
+            *(["--project-mode", extra["mode"]] if "mode" in extra else []),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -1941,6 +1944,7 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             extra.get("daily", "Journal"),
             "--release-sha256",
             extra.get("digest", self.digest),
+            *(["--project-mode", extra["mode"]] if "mode" in extra else []),
         )
 
     def event(self, name, **extra):
@@ -2446,6 +2450,10 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("claude-plugin", json.loads(result.stdout)["hosts"])
         self.assertEqual(json.loads(result.stdout)["apiVersion"], 1)
+        self.assertEqual(
+            json.loads(result.stdout)["projectModes"],
+            {"claude-plugin": ["git", "directory"], "codex": ["git"]},
+        )
         original = (self.project / ".claude/settings.json").read_bytes()
         result = self.configure(digest="0" * 64)
         self.assertEqual(result.returncode, 64)
@@ -2495,6 +2503,28 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.assertEqual(next_state["disposition"], "pending")
         self.assertNotIn("Implement the change", path.read_text())
         self.assertNotIn(str(self.transcript), path.read_text())
+
+    def test_legacy_descriptor_without_project_mode_keeps_git_validation(self):
+        self.assertEqual(self.configure().returncode, 0)
+        path = self.home / "capture-profile.json"
+        profile = json.loads(path.read_text())
+        profile.pop("projectMode", None)
+        path.write_text(json.dumps(profile))
+        result = self.cli("profile-status", "--home", str(self.home))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["projectMode"], "git")
+        nested = self.project / "nested"
+        nested.mkdir()
+        subprocess.run(
+            ["git", "-C", str(nested), "init"],
+            env=self.environment,
+            check=True,
+            capture_output=True,
+        )
+        result = self.hook("UserPromptSubmit", cwd=str(nested), prompt="Nested work")
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("PROJECT_MISMATCH", result["reason"])
+        self.assertFalse(self.state_paths())
 
     def test_failed_write_is_unresolved_and_retry_retains_exact_payload(self):
         path = self.start()
@@ -3106,6 +3136,391 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         invalid = self.cli("profile-status", "--home", str(self.home))
         self.assertEqual(invalid.returncode, 64)
         self.assertNotIn("Traceback", invalid.stderr)
+
+
+class DirectoryCaptureTest(NativeCaptureFixture):
+    initialize_git = False
+    session_arguments = ClaudePluginCaptureTest.session_arguments
+    save = ClaudePluginCaptureTest.save
+    drain = ClaudePluginCaptureTest.drain
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.directory / "conversation.jsonl"
+        self.transcript.write_text('{"type":"system","uuid":"start"}\n')
+        self.cwd = self.project
+        self.session = "directory-session"
+        self.git_log = self.directory / "unexpected-git"
+
+    def configure(self, **extra):
+        extra.setdefault("mode", "directory")
+        return ClaudePluginCaptureTest.configure(self, **extra)
+
+    def event(self, name, **extra):
+        extra.setdefault("cwd", str(self.cwd))
+        extra.setdefault("session_id", self.session)
+        return ClaudePluginCaptureTest.event(self, name, **extra)
+
+    def forbid_git(self):
+        directory = self.directory / "no-git"
+        directory.mkdir()
+        binary = directory / "git"
+        binary.write_text(
+            '#!/bin/sh\nprintf attempted > "$FORBIDDEN_GIT_LOG"\nexit 97\n'
+        )
+        binary.chmod(0o700)
+        self.environment.update(
+            PATH=str(directory) + os.pathsep + self.environment["PATH"],
+            FORBIDDEN_GIT_LOG=str(self.git_log),
+        )
+
+    def profile_snapshot(self):
+        return {
+            str(path.relative_to(self.home)): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in self.home.rglob("*")
+        }
+
+    def test_directory_session_and_nested_git_are_session_only_without_git_calls(self):
+        subdirectory = self.project / "notes"
+        nested = self.project / "repository"
+        subdirectory.mkdir()
+        nested.mkdir()
+        subprocess.run(
+            ["git", "-C", str(nested), "init"],
+            env=self.environment,
+            check=True,
+            capture_output=True,
+        )
+        original = {
+            str(path.relative_to(self.project)): path.read_bytes()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.forbid_git()
+        attached = self.configure()
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        profile = json.loads((self.home / "capture-profile.json").read_text())
+        self.assertEqual(profile["projectMode"], "directory")
+        self.assertEqual(profile["project"], str(self.project))
+        status = self.cli("profile-status", "--home", str(self.home))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["projectMode"], "directory")
+        for index, cwd in enumerate((self.project, subdirectory, nested)):
+            with self.subTest(cwd=cwd):
+                self.cwd, self.session = cwd, "directory-" + str(index)
+                self.hook("SessionStart", source="startup")
+                self.hook(
+                    "UserPromptSubmit", prompt="Capture meaningful directory work"
+                )
+                path = (
+                    self.home
+                    / "capture-state"
+                    / (self.session_key(self.session) + ".json")
+                )
+                self.assertTrue(path.is_file())
+                self.assertEqual(
+                    self.hook(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_use_id="read-only",
+                        tool_input={"command": "git status"},
+                    ),
+                    {},
+                )
+                self.hook(
+                    "PostToolUseFailure",
+                    tool_name="Bash",
+                    tool_use_id="read-only",
+                    tool_input={"command": "git status"},
+                    error="not a checkout",
+                )
+                self.assertEqual(
+                    self.hook("Stop", stop_hook_active=False)["decision"], "block"
+                )
+                self.save(path, bare=True)
+                self.hook("SessionStart", source="resume")
+                self.hook("StopFailure")
+                self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+                state = json.loads(path.read_text())
+                self.assertEqual(state["disposition"], "saved")
+                self.assertEqual(state["commits"], {})
+                self.assertEqual(state["snapshots"], {})
+                self.assertNotIn("metadata", state)
+        self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
+        self.assertFalse(self.git_log.exists())
+        self.assertFalse((self.project / ".git").exists())
+        self.assertEqual(
+            {
+                str(path.relative_to(self.project)): path.read_bytes()
+                for path in self.project.rglob("*")
+                if path.is_file()
+            },
+            original,
+        )
+
+    def test_directory_cwd_rejects_sibling_prefix_and_symlink_escape_before_state(self):
+        outside = self.directory / "project-sibling"
+        outside.mkdir()
+        escape = self.project / "escape"
+        escape.symlink_to(outside, target_is_directory=True)
+        loop = self.project / "loop"
+        loop.symlink_to(loop, target_is_directory=True)
+        self.forbid_git()
+        self.assertEqual(self.configure().returncode, 0)
+        before = self.profile_snapshot()
+        for cwd in (outside, escape, loop, self.project / "missing", Path("relative")):
+            with self.subTest(cwd=cwd):
+                result = self.hook(
+                    "UserPromptSubmit", cwd=str(cwd), prompt="Outside work"
+                )
+                self.assertEqual(result["decision"], "block")
+                self.assertIn("PROJECT_MISMATCH", result["reason"])
+                self.assertEqual(self.profile_snapshot(), before)
+        refusal = self.hook(
+            "PreToolUse",
+            cwd=str(loop),
+            tool_name="Bash",
+            tool_input={"command": "printf fixture"},
+        )
+        self.assertEqual(refusal["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("PROJECT_MISMATCH", json.dumps(refusal))
+        self.assertEqual(self.profile_snapshot(), before)
+        self.assertFalse(self.git_log.exists())
+
+    def test_looped_project_and_profile_paths_refuse_without_traceback_or_state(self):
+        loop = self.project / "loop"
+        loop.symlink_to(loop, target_is_directory=True)
+        self.forbid_git()
+        project = self.project
+        self.project = loop
+        refused = self.configure()
+        self.assertEqual(refused.returncode, 64, refused.stderr)
+        self.assertNotIn("Traceback", refused.stderr)
+        self.assertFalse(self.home.exists())
+        self.project = project
+        self.assertEqual(self.configure().returncode, 0)
+        descriptor = self.home / "capture-profile.json"
+        profile = json.loads(descriptor.read_text())
+        descriptor.write_text(json.dumps(dict(profile, project=str(loop))))
+        before = self.profile_snapshot()
+        for operation in ("profile-status", "hook", "drain-status"):
+            with self.subTest(operation=operation):
+                result = self.cli(
+                    operation,
+                    "--home",
+                    str(self.home),
+                    payload=self.event("UserPromptSubmit", prompt="Must refuse"),
+                )
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.profile_snapshot(), before)
+        result = self.cli("profile-status", "--home", str(loop / "profile"))
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.profile_snapshot(), before)
+        descriptor.write_text(json.dumps(profile))
+        self.hook("SessionStart", source="startup")
+        before = self.profile_snapshot()
+        result = self.hook(
+            "UserPromptSubmit",
+            transcript_path=str(loop / "transcript.jsonl"),
+            prompt="Must refuse looped transcript",
+        )
+        self.assertEqual(result["decision"], "block")
+        self.assertEqual(self.profile_snapshot(), before)
+        self.assertEqual(self.state_paths(), [])
+        self.assertFalse(self.git_log.exists())
+
+    def test_directory_partial_session_requires_review_and_reuses_the_original_request(
+        self,
+    ):
+        self.forbid_git()
+        self.assertEqual(self.configure().returncode, 0)
+        self.hook("UserPromptSubmit", prompt="Retain failed session work")
+        path = next(iter(self.state_paths()))
+        self.save(
+            path,
+            status="partial",
+            receipt_changes={
+                "recovery": {"required": True, "action": "inspect"},
+                "error_code": "PARTIAL",
+                "retryable": True,
+            },
+        )
+        state = json.loads(path.read_text())
+        self.assertEqual(state["disposition"], "pending")
+        self.assertTrue(state["session_recovery"])
+        self.assertFalse(json.loads(self.drain().stdout)["quiescent"])
+        original = state["session_request"]
+        changed = dict(original, body="Changed payload")
+        refusal = self.hook(
+            "PreToolUse",
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="changed",
+            tool_input=changed,
+        )
+        self.assertEqual(refusal["hookSpecificOutput"]["permissionDecision"], "deny")
+        retry = self.cli(
+            "retry",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--payload-sha256",
+            state["session_payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout), original)
+        self.save(path, call="reviewed-retry")
+        self.assertEqual(json.loads(path.read_text())["session_request"], original)
+        self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
+        self.assertFalse(self.git_log.exists())
+
+    def test_directory_shell_events_pass_unchanged_without_commit_capture_or_git(self):
+        self.forbid_git()
+        self.assertEqual(self.configure().returncode, 0)
+        self.hook("UserPromptSubmit", prompt="Review directory shell activity")
+        before = self.profile_snapshot()
+        for name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            for command in (
+                "git log --grep commit",
+                "grep commit git",
+                'printf "%s\\n" git commit',
+                "git commit -m fixture",
+                "rtk git -C nested commit -m fixture",
+                "env git commit -m fixture",
+                "command git commit -m fixture",
+                'bash -lc "git commit -m fixture"',
+                "git commit; printf done",
+                "python3 -c 'print(\"git commit\")'",
+                "printf 'unterminated",
+            ):
+                with self.subTest(event=name, command=command):
+                    result = self.cli(
+                        "hook",
+                        "--home",
+                        str(self.home),
+                        payload=self.event(
+                            name,
+                            tool_name="Bash",
+                            tool_use_id="shell-command",
+                            tool_input={"command": command},
+                            tool_response="ignored",
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {})
+                    self.assertEqual(self.profile_snapshot(), before)
+        state = json.loads(next(iter(self.state_paths())).read_text())
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+        self.assertNotIn("metadata", state)
+        self.assertFalse(self.git_log.exists())
+
+    def test_directory_commit_capture_cli_and_mcp_refuse_before_state_or_git(
+        self,
+    ):
+        self.forbid_git()
+        self.assertEqual(self.configure().returncode, 0)
+        before = self.profile_snapshot()
+        for name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            for tool in (
+                "mcp__obsidian-write__obsidian_daily_append",
+                "mcp__obsidian_write__obsidian_daily_append",
+            ):
+                for arguments in (
+                    dict(skip_if_hash="a" * 40),
+                    dict(idempotency_key="commit-capture:forged"),
+                ):
+                    with self.subTest(event=name, tool=tool, arguments=arguments):
+                        result = self.hook(
+                            name,
+                            tool_name=tool,
+                            tool_use_id="commit-append",
+                            tool_input=arguments,
+                            tool_response="ignored",
+                        )
+                        self.assertIn("DIRECTORY_SESSION_ONLY", json.dumps(result))
+                        if name == "PreToolUse":
+                            self.assertEqual(
+                                result["hookSpecificOutput"]["permissionDecision"],
+                                "deny",
+                            )
+                        self.assertEqual(self.profile_snapshot(), before)
+        for operation, options in (
+            ("execute-commit", ["--snapshot", "a" * 64]),
+            ("prepare", ["--commit", "b" * 64]),
+            ("retry", ["--commit", "b" * 64]),
+            ("resolve-snapshot", ["--snapshot", "a" * 64]),
+            ("takeover", []),
+        ):
+            with self.subTest(operation=operation):
+                result = self.cli(
+                    operation,
+                    "--home",
+                    str(self.home),
+                    "--session",
+                    "c" * 64,
+                    *options,
+                    payload={"context": ["must not be processed"]},
+                )
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("DIRECTORY_SESSION_ONLY", result.stderr)
+                self.assertEqual(self.profile_snapshot(), before)
+        self.assertFalse(self.git_log.exists())
+
+    def test_malformed_modes_fail_closed_at_attach_and_load_without_git(self):
+        self.forbid_git()
+        for mode in ("", "Directory", "unknown"):
+            with self.subTest(mode=mode):
+                result = self.configure(mode=mode)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertFalse(self.home.exists())
+        self.assertEqual(self.configure().returncode, 0)
+        path = self.home / "capture-profile.json"
+        original = json.loads(path.read_text())
+        for mode in (None, False, 1, [], {}, "", "unknown"):
+            with self.subTest(mode=mode):
+                path.write_text(json.dumps(dict(original, projectMode=mode)))
+                before = self.profile_snapshot()
+                for operation in ("profile-status", "hook", "drain-status"):
+                    result = self.cli(
+                        operation,
+                        "--home",
+                        str(self.home),
+                        payload=self.event("UserPromptSubmit", prompt="Invalid mode"),
+                    )
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn("PROJECT_MODE_INVALID", result.stderr)
+                    self.assertEqual(self.profile_snapshot(), before)
+        self.assertFalse(self.git_log.exists())
+
+    def test_directory_mode_is_explicit_and_codex_create_refuses_before_changes(self):
+        self.forbid_git()
+        created = self.cli(
+            "create",
+            "--home",
+            str(self.home),
+            "--project",
+            str(self.project),
+            "--folder",
+            "Projects/Fixture",
+            "--release-sha256",
+            self.digest,
+            "--project-mode",
+            "directory",
+        )
+        self.assertEqual(created.returncode, 64, created.stderr)
+        self.assertIn("PROJECT_MODE_HOST_UNSUPPORTED", created.stderr)
+        self.assertFalse(self.home.exists())
+        self.assertFalse(self.git_log.exists())
+        default = ClaudePluginCaptureTest.configure(self)
+        self.assertEqual(default.returncode, 64, default.stderr)
+        self.assertFalse(self.home.exists())
 
 
 if __name__ == "__main__":

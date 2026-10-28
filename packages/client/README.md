@@ -280,7 +280,10 @@ and isolation remain unchanged. No second transport or provider process is added
 Before using this API, verify the public release using the installer instructions
 above. The dispatcher must require a successful capabilities response with
 `apiVersion: 1` and `claude-plugin` in `hosts`; an older release or any nonzero exit
-is unsupported, with no local writer fallback:
+is unsupported, with no local writer fallback. Directory attachment additionally
+requires `projectModes["claude-plugin"]` to contain `"directory"`. The additive
+capability map is `{"claude-plugin":["git","directory"],"codex":["git"]}`;
+it does not advertise non-Git Codex native profiles:
 
 ```sh
 python3 <verified-bundle>/bin/obsidian-mcp-native capabilities \
@@ -304,11 +307,51 @@ Every profile load verifies the same release bytes and installed trust record as
 the isolated runtime. A profile remains pinned to its immutable release even if
 the installer's `current` pointer later changes.
 
+### Explicit directory session profiles
+
+`attach --project-mode git` remains the default. Descriptors without `projectMode`
+retain Git validation. An explicit `--project-mode directory` attaches an existing
+absolute directory for Claude session capture without initializing Git or changing
+workspace files:
+
+```sh
+python3 <verified-bundle>/bin/obsidian-mcp-native attach --host claude-plugin \
+  --home /absolute/new-directory-profile --project /absolute/workspace \
+  --project-mode directory --folder Projects/Research/workspace \
+  --daily-folder Daily --release-sha256 <trusted-release-json-sha256>
+```
+
+The descriptor persists `projectMode: "directory"` and the canonical directory
+identity. Hook working directories must exist within that root by path components;
+sibling prefixes and symlinks escaping the root refuse capture. Ordinary session
+events, session receipts, recovery review, and drain perform no Git operation.
+Session idempotency, exact receipt/backlink validation, unresolved-write retention,
+and bounded Stop continuation are unchanged. Unknown, empty, or non-string modes
+fail closed. `create --project-mode directory` refuses before creating an isolated
+Codex profile.
+
+Directory profiles are session-only even when a nested directory contains Git.
+All shell commands run normally under the host's permissions, including direct,
+wrapped, or opaque commit commands; the capture runtime does not parse or rewrite
+them, create commit snapshots/gates, reconstruct metadata, or acknowledge a commit.
+Directory mode is not a shell sandbox. Explicit native commit capture operations
+and commit-targeted append events still refuse before creating capture state.
+Ordinary tools and manual appends with unrelated keys do not settle automatic
+capture. Use a separately attached Git profile for commit capture; the integrating
+plugin must choose the
+most specific explicit canonical root and reject duplicate registrations. An
+unmapped workspace must be attached explicitly, with no local keeper fallback.
+
+Install and verify the supporting release, check its mode capabilities, and attach
+a fresh profile before the plugin's separately managed ownership handoff. Existing
+profiles retain their immutable release pins; editing an old descriptor does not
+upgrade its runtime. Source fixtures do not establish installed-host acceptance.
+
 Dispatcher commands (JSON stdout, nonzero exit on invalid profile/state):
 
 | Command | Contract |
 | --- | --- |
-| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `host`, `project`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active` and `apiVersion`. Does not require a session ID. |
+| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `host`, `project`, `projectMode`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active` and `apiVersion`. Does not require a session ID. |
 | `hook --home <profile>` | Reads the full Claude hook JSON from stdin; emits host hook JSON. The dispatcher performs no turn normalization. |
 | `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, and `active_request`. Emits no saved body or transcript. |
 
@@ -348,7 +391,7 @@ prompt text, transcript paths or raw transcript copies. Subagent events are
 explicitly unsupported and cannot be attributed to the main session.
 
 Session/commit planning, Git execution, canonical commit targets and receipt
-validation use the shared engine. Bash commits retain the isolated mode's bounded
+validation use the shared engine. In Git profiles, Bash commits retain the isolated mode's bounded
 single-command syntax. Repository subdirectories retain their execution directory
 and relative pathspecs while metadata is attributed to the canonical Git root;
 nested foreign repositories are refused. MCP result objects, JSON-encoded bare

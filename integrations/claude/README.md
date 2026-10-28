@@ -120,6 +120,37 @@ This rule permits `obsidian_keeper_save` and `obsidian_daily_append` under the a
 - In standalone client mode, Claude Code uses the MCP tools listed above directly or through the provided `integrations/claude/skills/obsidian-mcp/SKILL.md` skill.
 - Automatic hook-based capture requires either the Claude plugin hooks or an explicit host execution event; silent fallback or guessed git histories are forbidden.
 
+## Explicit non-Git session capture
+
+The optional plugin can attach a canonical directory using the public native
+runtime's `attach --host claude-plugin --project-mode directory` operation.
+First verify the installed release and require `apiVersion: 1`, `claude-plugin`
+in `hosts`, and `directory` in `projectModes["claude-plugin"]` from `capabilities`.
+See the [attached-profile contract](../../packages/client/README.md#explicit-directory-session-profiles)
+for the complete command and immutable release requirements.
+
+Directory profiles save sessions without probing Git or changing workspace files.
+Only the registered root and its contained working directories are eligible;
+sibling paths and escaping symlinks fail closed. A nested Git repository remains
+session-only under that directory profile. Shell commands run normally under host
+permissions, without automatic commit capture, metadata, snapshots, or rewrites;
+directory mode is not a shell sandbox. Explicit native commit capture operations
+and commit-targeted MCP appends refuse before creating capture state. A separately
+attached, more specific Git profile is required for commit capture. Git is the default mode,
+including for older descriptors without `projectMode`; malformed modes refuse.
+
+The plugin must reject duplicate canonical registrations, select the most specific
+explicit root, and attach new or unmapped workspaces deliberately. Install/verify
+the supporting release and attach a fresh pinned profile before the separate global
+writer handoff. No operation here authorizes changing credentials, initializing a
+repository, or falling back to a local vault writer. Session receipt, idempotency,
+recovery, and scoped MCP authorization remain unchanged. This does not add native
+non-Git Codex coverage or complete whole-host acceptance. Public issues
+[#8](https://github.com/nhangen/obsidian-mcp/issues/8),
+[#2](https://github.com/nhangen/obsidian-mcp/issues/2), and
+[plugin #254](https://github.com/nhangen/claude-obsidian-plugin/issues/254)
+retain their release and installed-host acceptance gates.
+
 ## Diagnostics & Limits
 
 - **Errors**: Returned with stable structured error codes (`INVALID_INPUT`, `READ_FAILED`, `CONFLICT`, `PARTIAL`, `WRITE_FAILED`, `SUBPROCESS_TIMEOUT`).
