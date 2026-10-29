@@ -460,6 +460,7 @@ def load_profile(home, *, parent_only=False, inspect=False):
         )
     ):
         raise NativeError("PROFILE_INACTIVE_OR_INVALID")
+    metadata = trusted_bundle(profile["releaseSha256"])
     scope = capture_scope(profile)
     commit_routes(profile)
     if parent_only and (scope != "user" or "parentHome" in profile):
@@ -518,7 +519,6 @@ def load_profile(home, *, parent_only=False, inspect=False):
         if parent_home is not None:
             parent, owner = load_profile(parent_home, parent_only=True, inspect=inspect)
             validate_child(parent, owner, home, profile)
-        metadata = trusted_bundle(profile["releaseSha256"])
         if metadata["releaseId"] != profile.get("releaseId"):
             raise NativeError("PROFILE_RELEASE_INVALID")
         checked_state_directory(home)
@@ -536,7 +536,6 @@ def load_profile(home, *, parent_only=False, inspect=False):
                 raise NativeError("PROFILE_DRIFT")
         elif digest(body) != profile["files"][name]:
             raise NativeError("PROFILE_DRIFT")
-    trusted_bundle(profile["releaseSha256"])
     clean_project(profile["project"])
     return home, profile
 
@@ -2288,6 +2287,7 @@ def commit_routes(profile):
         return {}
     if profile.get("host") != "claude-plugin":
         raise NativeError("COMMIT_ROUTES_HOST_UNSUPPORTED")
+    trusted_bundle(profile["releaseSha256"])
     consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
     try:
         return consumer["validate_commit_routes"](profile.get("commitRoutes", {}))

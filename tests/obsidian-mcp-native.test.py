@@ -7,6 +7,7 @@ import re
 import runpy
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -5709,6 +5710,91 @@ class CommitRoutesTest(NativeCaptureFixture):
             profile = json.loads(path.read_text())
             profile["commitRoutes"] = routes
             path.write_text(json.dumps(profile))
+
+    def test_tampered_route_consumer_never_executes_before_bundle_rejection(self):
+        self.bundle = Path(shutil.copytree(self.bundle, self.directory / "client"))
+        self.policy.write_text("{}")
+        self.configure("--commit-routes", str(self.policy))
+        valid = self.cli("profile-status", "--home", str(self.home))
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        consumer = self.bundle / "bin/obsidian-mcp-capture-commit"
+        marker = self.directory / "consumer-executed"
+        consumer.write_text(
+            consumer.read_text() + f"\nPath({str(marker)!r}).write_text('executed')\n"
+        )
+        capabilities = self.cli("capabilities", "--release-sha256", self.digest)
+        self.assertEqual(capabilities.returncode, 64)
+        self.assertIn("BUNDLE_UNTRUSTED", capabilities.stderr)
+        self.assertFalse(marker.exists())
+        for operation in ("profile-status", "hook"):
+            with self.subTest(operation=operation):
+                marker.unlink(missing_ok=True)
+                rejected = self.cli(
+                    operation,
+                    "--home",
+                    str(self.home),
+                    payload=self.event("UserPromptSubmit", prompt="work"),
+                )
+                self.assertEqual(rejected.returncode, 64)
+                self.assertIn("BUNDLE_UNTRUSTED", rejected.stderr)
+                self.assertFalse(
+                    marker.exists(), operation + " executed tampered consumer"
+                )
+        marker.unlink(missing_ok=True)
+        native = self.load_native()
+        profile = json.loads((self.home / "capture-profile.json").read_text())
+        with self.assertRaisesRegex(native.NativeError, "BUNDLE_UNTRUSTED"):
+            native.commit_routes(profile)
+        self.assertFalse(marker.exists())
+
+    def test_tampered_producer_never_executes_during_profile_load(self):
+        source = self.bundle
+        for host, scope in (
+            ("claude-plugin", "project"),
+            ("claude-plugin", "user"),
+            ("codex", "project"),
+        ):
+            with self.subTest(host=host, scope=scope):
+                directory = self.directory / (host + "-" + scope)
+                directory.mkdir()
+                self.bundle = Path(shutil.copytree(source, directory / "client"))
+                home = directory / "profile"
+                configured = self.cli(
+                    "create" if host == "codex" else "attach",
+                    "--host",
+                    host,
+                    "--scope",
+                    scope,
+                    "--home",
+                    str(home),
+                    "--folder",
+                    "Sessions",
+                    "--release-sha256",
+                    self.digest,
+                    *(["--project", str(self.project)] if scope == "project" else []),
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                valid = self.cli("profile-status", "--home", str(home))
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                producer = self.bundle / "bin/obsidian-mcp-commit-event"
+                marker = directory / "producer-executed"
+                producer.write_text(
+                    producer.read_text()
+                    + f"\nPath({str(marker)!r}).write_text('executed')\n"
+                )
+                rejected = self.cli(
+                    "hook",
+                    "--home",
+                    str(home),
+                    payload=self.event(
+                        "UserPromptSubmit", prompt="work", turn_id="turn-1"
+                    ),
+                )
+                self.assertEqual(rejected.returncode, 64)
+                self.assertIn("BUNDLE_UNTRUSTED", rejected.stderr)
+                self.assertFalse(
+                    marker.exists(), host + "/" + scope + " executed tampered producer"
+                )
 
     def test_shared_selection_exact_routes_nonmatch_and_canonical_compatibility(self):
         consumer = runpy.run_path(str(self.bundle / "bin/obsidian-mcp-capture-commit"))
