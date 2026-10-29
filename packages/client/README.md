@@ -339,8 +339,8 @@ and commit-targeted append events still refuse before creating capture state.
 Ordinary tools and manual appends with unrelated keys do not settle automatic
 capture. Use a separately attached Git profile for commit capture; the integrating
 plugin must choose the
-most specific explicit canonical root and reject duplicate registrations. An
-unmapped workspace must be attached explicitly, with no local keeper fallback.
+most specific explicit canonical root and reject duplicate registrations. Without
+a user-scope fallback, an unmapped workspace must be attached explicitly.
 
 Install and verify the supporting release, check its mode capabilities, and attach
 a fresh profile before the plugin's separately managed ownership handoff. Existing
@@ -351,7 +351,7 @@ Dispatcher commands (JSON stdout, nonzero exit on invalid profile/state):
 
 | Command | Contract |
 | --- | --- |
-| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `host`, `project`, `projectMode`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active` and `apiVersion`. Does not require a session ID. |
+| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `scope`, `host`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active`, and `apiVersion`. Project scope also returns `project` and `projectMode`. Does not require a session ID. |
 | `hook --home <profile>` | Reads the full Claude hook JSON from stdin; emits host hook JSON. The dispatcher performs no turn normalization. |
 | `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, and `active_request`. Emits no saved body or transcript. |
 
@@ -367,6 +367,73 @@ snapshot-resolution evidence. A nonzero exit is never permission to hand off.
 for lossless draining. `disable` and `run` are unsupported for attached profiles;
 the plugin owns writer admission and rollback separately. No registration or
 ownership change is performed by any of these API calls.
+
+### User scope without workspace registration
+
+An integrating Claude plugin can configure a single fallback session folder and
+daily folder, then delegate events from newly opened workspaces without attaching
+each project. First require the additive capability map
+`captureScopes={"claude-plugin":["project","user"],"codex":["project"]}`.
+Profiles without `scope` retain `project` behavior; Codex remains project-only.
+
+```sh
+python3 <verified-bundle>/bin/obsidian-mcp-native attach --host claude-plugin \
+  --scope user --home /absolute/new-private-user-profile \
+  --folder Sessions --daily-folder Journal \
+  --release-sha256 <trusted-release-json-sha256>
+```
+
+The parent descriptor has `scope: "user"`, the existing host, Python, bundle,
+immutable release pin, `folder`, `dailyFolder`, `files: {}`, and `active: true`.
+It omits `project` and `projectMode`; those CLI arguments are rejected for user
+attachment. `active` validates the runtime descriptor, not writer ownership.
+Attachment creates only private configuration and never activates the plugin's
+user owner. The plugin manages activation and exclusions separately.
+`profile-status` validates the parent without a project and returns `scope:
+"user"`, omitting `project` and `projectMode`.
+
+The runtime creates ordinary project descriptors under the parent's private
+`workspaces/<workspace-hash>` directory. A Git workspace uses its canonical Git
+root, including subdirectory or symlink entry; otherwise the canonical event cwd
+gets directory session capture. Missing Git produces a session-only diagnostic,
+never a commit event or receipt. No configuration, hook, or state is written into
+either workspace. Child descriptors inherit the parent's folders and immutable
+release pin and are checked against it on every load. Direct child CLI operations
+also validate the parent. All directories are mode 0700; state files are 0600.
+
+`bindings/<session-hash>.json` durably binds a session to its first workspace.
+A session cannot rebind to another workspace, including while a commit or session
+write is pending. Each child keeps its own existing commit gate; there is no
+shared parent `active.json`. Parent `status`, `request`, `prepare`, `retry`, and
+other session operations accept the existing hashed `--session` and resolve its
+bound child. Hook recovery guidance also identifies the child directly.
+
+Parent `drain-status` inspects every child and binding under a nonblocking parent
+lock. It retains the existing `quiescent`, `session_count`, and `sessions` fields,
+adds `workspace_count` and per-child `workspaces`, and annotates sessions with
+their workspace hash. It refuses unknown files, tampered or missing children,
+invalid bindings, missing enrolled session state, contention, or more than 256
+children, bindings, or total sessions. Pending work in any child prevents a clean
+drain. The plugin must keep its admission barrier closed during drain and handoff.
+
+Bindings and child evidence are retained indefinitely; the 256-binding admission
+limit is cumulative across the parent's lifetime, not a count of active sessions.
+At that limit, new sessions receive advisory diagnostics without automatic
+capture; existing bound sessions can continue. There is no built-in pruning or
+automatic rollover. A fresh parent and explicit plugin ownership handoff can
+provide a new admission budget only after the old parent successfully drains;
+retain the old private profile for its evidence. Unresolved work or a failed drain
+still prevents handoff. Deleting bindings to clear the limit is not recovery.
+
+User-scope prompt failures emit advisory context and allow the ordinary prompt to
+proceed. An unresolved previous turn remains unchanged; the binding pauses new
+capture for that session instead of erasing the old turn or attributing new work
+to it. Unrelated Bash commands proceed, automatic capture MCP calls are denied
+while paused, and Stop reports advisory context. Inspect and resolve the original
+child state using the existing recovery commands, then submit a new prompt to
+resume capture. This deliberately retains one pending turn rather than adding a
+multi-turn queue. Enrolled, unpaused pending work keeps the existing bounded Stop
+recovery behavior. Missing enrollment never creates a Stop recovery loop.
 
 Register `UserPromptSubmit`, `SessionStart` (including resume), `Stop`,
 `StopFailure`, and paired `PreToolUse`, `PostToolUse`, `PostToolUseFailure` handlers.
@@ -385,8 +452,9 @@ deliveries at the same boundary reuse the turn; the same text at a later boundar
 gets a new turn. Missing first-prompt transcript files use an empty watermark.
 Resume reuses persisted state without inventing a turn or replaying history.
 Changed transcript identity, orphan tool/Stop events and unresolved previous
-turns refuse advancement. A changed boundary cannot prove a late delivery was a
-duplicate, so unresolved work blocks a new occurrence. State stores hashes, not
+turns refuse capture advancement. A changed boundary cannot prove a late delivery
+was a duplicate, so unresolved work prevents a new capture occurrence. User-scope
+prompts proceed with the advisory pause described above. State stores hashes, not
 prompt text, transcript paths or raw transcript copies. Subagent events are
 explicitly unsupported and cannot be attributed to the main session.
 
@@ -435,3 +503,7 @@ a fixture Git commit, observes simulated session and direct commit MCP receipts
 through plugin hooks without CLI preparation, verifies drain, and hands
 ownership to disabled. All state stays in temporary directories; no real server,
 provider, user configuration or running writer is involved.
+The additional user-scope pair fixture attaches one parent, activates the plugin's
+user owner, opens fresh Git and nonGit directories without enrollment, observes
+exact simulated session receipts through the real dispatcher, and verifies both
+saved children and an aggregate clean drain.

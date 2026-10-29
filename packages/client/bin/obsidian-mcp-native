@@ -147,6 +147,15 @@ def project_mode(profile):
     return mode
 
 
+def capture_scope(profile):
+    scope = profile.get("scope", "project")
+    if scope not in ("project", "user") or (
+        scope == "user" and profile.get("host") != "claude-plugin"
+    ):
+        raise NativeError("CAPTURE_SCOPE_INVALID")
+    return scope
+
+
 def require_git_profile(profile):
     if project_mode(profile) != "git":
         raise NativeError("DIRECTORY_SESSION_ONLY")
@@ -230,8 +239,15 @@ def attach_profile(args):
     if args.host != "claude-plugin":
         raise NativeError("ATTACH_HOST_REQUIRED")
     metadata = trusted_bundle(args.release_sha256)
-    mode = project_mode(dict(host=args.host, projectMode=args.project_mode))
-    project = project_root(args.project, mode)
+    if args.scope == "user":
+        if args.project is not None or args.project_mode is not None:
+            raise NativeError("USER_PROJECT_ARGUMENTS_UNSUPPORTED")
+        project = None
+    else:
+        mode = project_mode(
+            dict(host=args.host, projectMode=args.project_mode or "git")
+        )
+        project = project_root(args.project, mode)
     folder = relative_folder(args.folder)
     daily = relative_folder(args.daily_folder)
     home = Path(args.home).absolute()
@@ -249,21 +265,27 @@ def attach_profile(args):
         bundle=str(BUNDLE),
         releaseSha256=args.release_sha256,
         releaseId=metadata["releaseId"],
-        project=str(project),
-        projectMode=mode,
         folder=folder,
         dailyFolder=daily,
         files={},
         active=True,
     )
+    if args.scope == "user":
+        descriptor["scope"] = "user"
+    else:
+        descriptor.update(project=str(project), projectMode=mode)
     home.mkdir(mode=0o700)
     (home / "capture-state").mkdir(mode=0o700)
+    if args.scope == "user":
+        (home / "workspaces").mkdir(mode=0o700)
+        (home / "bindings").mkdir(mode=0o700)
     atomic_write(home / "capture-profile.json", encode(descriptor))
     return dict(
         status="attached",
         host="claude-plugin",
         home=str(home),
-        project=str(project),
+        project=str(project) if project is not None else None,
+        scope=args.scope,
         release_id=metadata["releaseId"],
         ownership_changed=False,
     )
@@ -275,6 +297,7 @@ def capabilities(expected):
         apiVersion=1,
         hosts=["codex", "claude-plugin"],
         projectModes={"claude-plugin": ["git", "directory"], "codex": ["git"]},
+        captureScopes={"claude-plugin": ["project", "user"], "codex": ["project"]},
         release_id=metadata["releaseId"],
         operations=[
             "attach",
@@ -293,7 +316,9 @@ def capabilities(expected):
 
 
 def create_profile(args):
-    require_git_profile(dict(host="codex", projectMode=args.project_mode))
+    if args.scope != "project":
+        raise NativeError("CAPTURE_SCOPE_INVALID")
+    require_git_profile(dict(host="codex", projectMode=args.project_mode or "git"))
     metadata = trusted_bundle(args.release_sha256)
     project = clean_project(args.project)
     home = Path(args.home).absolute()
@@ -399,7 +424,7 @@ def create_profile(args):
     )
 
 
-def load_profile(home):
+def load_profile(home, *, parent_only=False):
     home = Path(home).absolute()
     item = home.lstat()
     if (
@@ -424,7 +449,10 @@ def load_profile(home):
         )
     ):
         raise NativeError("PROFILE_INACTIVE_OR_INVALID")
-    mode = project_mode(profile)
+    scope = capture_scope(profile)
+    if parent_only and (scope != "user" or "parentHome" in profile):
+        raise NativeError("CHILD_PARENT_INVALID")
+    mode = project_mode(profile) if scope == "project" else None
     python = Path(profile.get("python", ""))
     if (
         not python.is_absolute()
@@ -437,8 +465,30 @@ def load_profile(home):
     if profile["host"] == "claude-plugin":
         relative_folder(profile["folder"])
         relative_folder(profile["dailyFolder"])
-        if str(project_root(profile["project"], mode)) != profile["project"]:
+        if scope == "user":
+            if (
+                profile.get("project") is not None
+                or "projectMode" in profile
+                or "parentHome" in profile
+            ):
+                raise NativeError("USER_PROFILE_INVALID")
+            private_directory(home / "workspaces")
+            private_directory(home / "bindings")
+        elif str(project_root(profile["project"], mode)) != profile["project"]:
             raise NativeError("PROFILE_PROJECT_INVALID")
+        parent_home = profile.get("parentHome")
+        if parent_home is None and home.parent.name == "workspaces":
+            try:
+                hint = json.loads(
+                    private_read(home.parent.parent / "capture-profile.json")
+                )
+            except FileNotFoundError:
+                hint = {}
+            if isinstance(hint, dict) and hint.get("scope") == "user":
+                parent_home = str(home.parent.parent)
+        if parent_home is not None:
+            parent, owner = load_profile(parent_home, parent_only=True)
+            validate_child(parent, owner, home, profile)
         metadata = trusted_bundle(profile["releaseSha256"])
         if metadata["releaseId"] != profile.get("releaseId"):
             raise NativeError("PROFILE_RELEASE_INVALID")
@@ -460,6 +510,298 @@ def load_profile(home):
     trusted_bundle(profile["releaseSha256"])
     clean_project(profile["project"])
     return home, profile
+
+
+def private_directory(path):
+    item = path.lstat()
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or path.resolve() != path
+        or item.st_uid != os.getuid()
+        or stat.S_IMODE(item.st_mode) != 0o700
+    ):
+        raise NativeError("PRIVATE_DIRECTORY_INVALID")
+    return path
+
+
+def bounded_entries(directory, code):
+    entries = []
+    for entry in directory.iterdir():
+        if len(entries) >= MAX_DRAIN_SESSIONS:
+            raise NativeError(code)
+        entries.append(entry)
+    return entries
+
+
+def workspace_key(project, mode):
+    return digest(encode([project, mode]))
+
+
+def child_profile(home, profile, project, mode):
+    return dict(
+        {k: v for k, v in profile.items() if k != "scope"},
+        project=project,
+        projectMode=mode,
+        parentHome=str(home),
+    )
+
+
+def validate_child(parent, owner, home, profile):
+    project = profile.get("project")
+    mode = project_mode(profile)
+    key = workspace_key(project, mode)
+    private_directory(parent / "workspaces")
+    if home != parent / "workspaces" / key or profile != child_profile(
+        parent, owner, project, mode
+    ):
+        raise NativeError("CHILD_PROFILE_INVALID")
+
+
+def read_binding(home, session):
+    if not isinstance(session, str) or HEX.fullmatch(session) is None:
+        raise NativeError("SESSION_KEY_INVALID")
+    directory = private_directory(home / "bindings")
+    path = directory / (session + ".json")
+    try:
+        record = json.loads(private_read(path))
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise NativeError("SESSION_BINDING_INVALID") from None
+        return None, path
+    if (
+        not isinstance(record, dict)
+        or set(record)
+        != {
+            "schemaVersion",
+            "session",
+            "workspace",
+            "project",
+            "projectMode",
+            "paused",
+            "enrolled",
+        }
+        or record.get("schemaVersion") != 1
+        or record.get("session") != session
+        or record.get("projectMode") not in ("git", "directory")
+        or not isinstance(record.get("project"), str)
+        or not Path(record["project"]).is_absolute()
+        or type(record.get("paused")) is not bool
+        or type(record.get("enrolled")) is not bool
+        or record.get("workspace")
+        != workspace_key(record["project"], record["projectMode"])
+    ):
+        raise NativeError("SESSION_BINDING_INVALID")
+    return record, path
+
+
+def bound_child(home, profile, record):
+    private_directory(home / "workspaces")
+    child = home / "workspaces" / record["workspace"]
+    child, descriptor = load_profile(child)
+    validate_child(home, profile, child, descriptor)
+    if descriptor != child_profile(
+        home, profile, record["project"], record["projectMode"]
+    ):
+        raise NativeError("SESSION_BINDING_INVALID")
+    if record["enrolled"]:
+        private_read(child / "capture-state" / (record["session"] + ".json"))
+    return child, descriptor
+
+
+def event_workspace(event):
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
+        raise NativeError("PROJECT_ROOT_REQUIRED")
+    directory = Path(cwd).resolve(strict=True)
+    if not directory.is_dir():
+        raise NativeError("PROJECT_ROOT_REQUIRED")
+    try:
+        root = git(
+            directory, "rev-parse", "--show-toplevel", allow_failure=True
+        ).strip()
+    except FileNotFoundError:
+        root = ""
+    return (
+        (str(Path(root).resolve(strict=True)), "git")
+        if root
+        else (str(directory), "directory")
+    )
+
+
+def user_hook_failure(event, code):
+    name = event.get("hook_event_name")
+    message = (
+        "Obsidian capture advisory: "
+        + code
+        + "; pending state retained, no new capture."
+    )
+    if name == "PreToolUse" and event.get("tool_name") in (
+        *CLAUDE_TOOLS,
+        *CLAUDE_TOOLS.values(),
+    ):
+        return {
+            "hookSpecificOutput": dict(
+                hookEventName=name,
+                permissionDecision="deny",
+                permissionDecisionReason=message,
+            )
+        }
+    return context(name, message)
+
+
+def check_user_state(home):
+    if any(p.name != "active.lock" for p in checked_state_directory(home).iterdir()):
+        raise NativeError("USER_STATE_INVALID")
+
+
+def user_hook(home, profile, event):
+    try:
+        with gate_lock(home, nonblocking=True):
+            check_user_state(home)
+            session = digest(identifier(event.get("session_id")).encode())
+            record, path = read_binding(home, session)
+            project, mode = event_workspace(event)
+            key = workspace_key(project, mode)
+            if record is not None and record["workspace"] != key:
+                raise NativeError("SESSION_WORKSPACE_CHANGED")
+            if record is None:
+                if event.get("hook_event_name") not in (
+                    "SessionStart",
+                    "UserPromptSubmit",
+                ):
+                    raise NativeError("PROMPT_EVENT_REQUIRED")
+                claude_transcript(event)
+                children = private_directory(home / "workspaces")
+                if (
+                    len(bounded_entries(children, "DRAIN_WORKSPACE_LIMIT"))
+                    >= MAX_DRAIN_SESSIONS
+                    and not (children / key).exists()
+                ):
+                    raise NativeError("DRAIN_WORKSPACE_LIMIT")
+                if (
+                    len(bounded_entries(home / "bindings", "DRAIN_SESSION_LIMIT"))
+                    >= MAX_DRAIN_SESSIONS
+                ):
+                    raise NativeError("DRAIN_SESSION_LIMIT")
+                child = children / key
+                if not child.exists() and not child.is_symlink():
+                    child.mkdir(mode=0o700)
+                    (child / "capture-state").mkdir(mode=0o700)
+                    atomic_write(
+                        child / "capture-profile.json",
+                        encode(child_profile(home, profile, project, mode)),
+                    )
+                record = dict(
+                    schemaVersion=1,
+                    session=session,
+                    workspace=key,
+                    project=project,
+                    projectMode=mode,
+                    paused=False,
+                    enrolled=False,
+                )
+                bound_child(home, profile, record)
+                atomic_write(path, encode(record))
+            child, descriptor = bound_child(home, profile, record)
+            if record["paused"] and event.get("hook_event_name") != "UserPromptSubmit":
+                return user_hook_failure(
+                    event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
+                )
+            try:
+                result = claude_output(
+                    engine_hook(child, descriptor, event), event.get("hook_event_name")
+                )
+            except (
+                NativeError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+            ):
+                if event.get("hook_event_name") == "UserPromptSubmit":
+                    record["paused"] = True
+                    atomic_write(path, encode(record))
+                raise
+            if event.get("hook_event_name") == "UserPromptSubmit" and (
+                record["paused"] or not record["enrolled"]
+            ):
+                record["paused"] = False
+                record["enrolled"] = True
+                atomic_write(path, encode(record))
+            if mode == "directory" and event.get("hook_event_name") in (
+                "SessionStart",
+                "UserPromptSubmit",
+            ):
+                result.setdefault("hookSpecificOutput", {}).setdefault(
+                    "additionalContext", ""
+                )
+                result["hookSpecificOutput"][
+                    "additionalContext"
+                ] += "\nGit unavailable for this workspace; session-only capture, no commit inferred."
+            return result
+    except (
+        NativeError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as error:
+        return user_hook_failure(
+            event,
+            (
+                str(error)
+                if isinstance(error, NativeError)
+                else "USER_CAPTURE_UNAVAILABLE"
+            ),
+        )
+
+
+def user_drain_status(home, profile):
+    with gate_lock(home, nonblocking=True):
+        check_user_state(home)
+        children = private_directory(home / "workspaces")
+        bindings = private_directory(home / "bindings")
+        records = {}
+        for entry in bounded_entries(bindings, "DRAIN_SESSION_LIMIT"):
+            if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            record, _ = read_binding(home, entry.stem)
+            if record is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            bound_child(home, profile, record)
+            records[entry.stem] = record
+        sessions = []
+        workspaces = []
+        for child in bounded_entries(children, "DRAIN_WORKSPACE_LIMIT"):
+            if HEX.fullmatch(child.name) is None:
+                raise NativeError("DRAIN_WORKSPACE_LIMIT")
+            child, descriptor = load_profile(child)
+            validate_child(home, profile, child, descriptor)
+            status = drain_status(child)
+            workspaces.append(dict(workspace=child.name, **status))
+            for session in status["sessions"]:
+                if (
+                    session["session"] not in records
+                    or records[session["session"]]["workspace"] != child.name
+                    or not records[session["session"]]["enrolled"]
+                ):
+                    raise NativeError("SESSION_BINDING_INVALID")
+                sessions.append(dict(workspace=child.name, **session))
+                if len(sessions) > MAX_DRAIN_SESSIONS:
+                    raise NativeError("DRAIN_SESSION_LIMIT")
+        return dict(
+            status="inspected",
+            quiescent=all(w["quiescent"] for w in workspaces),
+            workspace_count=len(workspaces),
+            session_count=len(sessions),
+            sessions=sessions,
+            workspaces=workspaces,
+            active_request=None,
+        )
 
 
 def checked_state_directory(home):
@@ -611,8 +953,8 @@ def drain_status(home):
             ):
                 raise NativeError("DRAIN_STATE_INVALID")
             keys.add(entry.stem)
-        if len(keys) > MAX_DRAIN_SESSIONS:
-            raise NativeError("DRAIN_SESSION_LIMIT")
+            if len(keys) > MAX_DRAIN_SESSIONS:
+                raise NativeError("DRAIN_SESSION_LIMIT")
         sessions = []
         present = set()
         for key in sorted(keys):
@@ -1219,6 +1561,8 @@ def claude_output(value, name):
 
 
 def hook(home, profile, event):
+    if capture_scope(profile) == "user":
+        return user_hook(home, profile, event)
     if profile["host"] != "claude-plugin":
         return engine_hook(home, profile, event)
     name = event.get("hook_event_name")
@@ -1231,6 +1575,7 @@ def hook(home, profile, event):
         ValueError,
         KeyError,
         TypeError,
+        subprocess.SubprocessError,
     ) as error:
         code = (
             str(error)
@@ -1238,7 +1583,10 @@ def hook(home, profile, event):
             else "HOOK_STATE_OR_EVENT_INVALID"
         )
         message = "Obsidian capture unresolved: " + code
-        if name == "PreToolUse":
+        if name == "PreToolUse" and event.get("tool_name") in (
+            *CLAUDE_TOOLS,
+            *CLAUDE_TOOLS.values(),
+        ):
             return {
                 "hookSpecificOutput": dict(
                     hookEventName=name,
@@ -1246,14 +1594,8 @@ def hook(home, profile, event):
                     permissionDecisionReason=message,
                 )
             }
-        if name == "UserPromptSubmit":
-            return dict(decision="block", reason=message)
         if name == "Stop":
-            return (
-                dict(systemMessage=message)
-                if event.get("stop_hook_active")
-                else dict(decision="block", reason=message)
-            )
+            return dict(systemMessage=message)
         return context(name, message)
 
 
@@ -1943,7 +2285,8 @@ def main():
     parser.add_argument("--home")
     parser.add_argument("--host", choices=("codex", "claude-plugin"))
     parser.add_argument("--project")
-    parser.add_argument("--project-mode", choices=("git", "directory"), default="git")
+    parser.add_argument("--scope", choices=("project", "user"), default="project")
+    parser.add_argument("--project-mode", choices=("git", "directory"))
     parser.add_argument("--folder")
     parser.add_argument("--daily-folder", default="Daily")
     parser.add_argument("--release-sha256")
@@ -1968,8 +2311,10 @@ def main():
             raise NativeError("CAPABILITIES_ARGUMENTS_INVALID")
         result = capabilities(args.release_sha256)
     elif args.operation in ("create", "attach"):
-        if extra or not all(
-            (args.home, args.project, args.folder, args.release_sha256)
+        if (
+            extra
+            or not all((args.home, args.folder, args.release_sha256))
+            or (args.scope == "project" and not args.project)
         ):
             raise NativeError("CREATE_ARGUMENTS_REQUIRED")
         if args.operation == "create":
@@ -1982,6 +2327,17 @@ def main():
         if not args.home:
             raise NativeError("HOME_REQUIRED")
         home, profile = load_profile(args.home)
+        scope = capture_scope(profile)
+        if scope == "user" and args.operation not in (
+            "profile-status",
+            "drain-status",
+            "hook",
+        ):
+            with gate_lock(home, nonblocking=True):
+                record, _ = read_binding(home, args.session)
+                if record is None:
+                    raise NativeError("SESSION_BINDING_REQUIRED")
+                home, profile = bound_child(home, profile, record)
         mode = project_mode(profile)
         if mode == "directory" and (
             args.operation
@@ -1998,8 +2354,7 @@ def main():
                 apiVersion=1,
                 host=profile["host"],
                 home=str(home),
-                project=profile["project"],
-                projectMode=mode,
+                scope=capture_scope(profile),
                 folder=profile["folder"],
                 daily_folder=profile.get("dailyFolder", "Daily"),
                 release_id=profile["releaseId"],
@@ -2008,8 +2363,14 @@ def main():
                 active=True,
                 ownership_managed=False,
             )
+            if scope == "project":
+                result.update(project=profile["project"], projectMode=mode)
         elif args.operation == "drain-status":
-            result = drain_status(home)
+            result = (
+                user_drain_status(home, profile)
+                if scope == "user"
+                else drain_status(home)
+            )
         elif args.operation == "execute-commit":
             return execute_commit(home, profile, args)
         elif args.operation == "hook":

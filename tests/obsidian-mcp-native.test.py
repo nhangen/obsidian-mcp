@@ -2323,8 +2323,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         output = self.hook(
             "UserPromptSubmit", cwd=str(child), prompt="Foreign nested repository"
         )
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("PROJECT_MISMATCH", output["reason"])
+        self.assertNotIn("decision", output)
+        self.assertIn("PROJECT_MISMATCH", json.dumps(output))
         self.assertFalse(self.state_paths())
 
     def test_failure_envelope_keeps_original_claude_event_name(self):
@@ -2522,8 +2522,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             capture_output=True,
         )
         result = self.hook("UserPromptSubmit", cwd=str(nested), prompt="Nested work")
-        self.assertEqual(result["decision"], "block")
-        self.assertIn("PROJECT_MISMATCH", result["reason"])
+        self.assertNotIn("decision", result)
+        self.assertIn("PROJECT_MISMATCH", json.dumps(result))
         self.assertFalse(self.state_paths())
 
     def test_failed_write_is_unresolved_and_retry_retains_exact_payload(self):
@@ -2580,12 +2580,40 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             tool_use_id="orphan",
             tool_input={"command": "git commit -m fixture"},
         )
-        self.assertEqual(orphan["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertNotIn("permissionDecision", orphan.get("hookSpecificOutput", {}))
         self.assertFalse(self.state_paths())
         self.hook("UserPromptSubmit", prompt="Work")
         first = self.hook("Stop", stop_hook_active=False)
         self.assertEqual(first["decision"], "block")
         self.assertNotIn("decision", self.hook("Stop", stop_hook_active=True))
+        self.assertNotIn("decision", self.hook("Stop", stop_hook_active=False))
+
+    def test_generic_hook_errors_are_advisory_except_protected_mcp_writes(self):
+        self.assertEqual(self.configure().returncode, 0)
+        self.hook("UserPromptSubmit", prompt="Original work")
+        path = self.state_paths()[0]
+        before = path.read_bytes()
+        prompt = self.hook("UserPromptSubmit", session_id="", prompt="New work")
+        self.assertNotIn("decision", prompt)
+        self.assertIn("EVENT_ID_INVALID", json.dumps(prompt))
+        for active in (False, True):
+            output = self.hook("Stop", session_id="", stop_hook_active=active)
+            self.assertNotIn("decision", output)
+            self.assertIn("EVENT_ID_INVALID", json.dumps(output))
+        shell = self.hook(
+            "PreToolUse", session_id="", tool_name="Bash", tool_input={"command": "pwd"}
+        )
+        self.assertNotIn("permissionDecision", shell.get("hookSpecificOutput", {}))
+        for prefix in ("mcp__obsidian-write__", "mcp__obsidian_write__"):
+            for tool in ("obsidian_keeper_save", "obsidian_daily_append"):
+                output = self.hook(
+                    "PreToolUse", session_id="", tool_name=prefix + tool, tool_input={}
+                )
+                self.assertEqual(
+                    output["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.hook("Stop", stop_hook_active=False)["decision"], "block")
         self.assertNotIn("decision", self.hook("Stop", stop_hook_active=False))
 
     def test_commit_executor_and_failure_receipts_use_shared_canonical_plan(self):
@@ -2762,7 +2790,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             self.transcript.read_text() + '{"type":"user","uuid":"new"}\n'
         )
         denied = self.hook("UserPromptSubmit", prompt="Another prompt")
-        self.assertEqual(denied["decision"], "block")
+        self.assertNotIn("decision", denied)
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(denied))
         self.assertEqual(
             json.loads(path.read_text())["session_save"]["idempotency_key"],
             args["idempotency_key"],
@@ -2989,10 +3018,15 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
                 tool_use_id="bad-release",
                 tool_input={"command": "git status"},
             )
-            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
-            self.assertEqual(
-                dispatch("Stop", stop_hook_active=False)["decision"], "block"
+            self.assertNotIn("permissionDecision", denied.get("hookSpecificOutput", {}))
+            denied = dispatch(
+                "PreToolUse",
+                tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                tool_use_id="bad-release-write",
+                tool_input=args,
             )
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertNotIn("decision", dispatch("Stop", stop_hook_active=False))
             self.assertNotIn("decision", dispatch("Stop", stop_hook_active=True))
         finally:
             descriptor.write_bytes(original)
@@ -3078,9 +3112,9 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.transcript.write_text(
             self.transcript.read_text() + '{"type":"user","uuid":"later"}\n'
         )
-        self.assertEqual(
-            self.hook("UserPromptSubmit", prompt="Later")["decision"], "block"
-        )
+        output = self.hook("UserPromptSubmit", prompt="Later")
+        self.assertNotIn("decision", output)
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
 
     def test_failure_before_executor_start_preserves_snapshot(self):
         path = self.start()
@@ -3143,6 +3177,9 @@ class DirectoryCaptureTest(NativeCaptureFixture):
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
     drain = ClaudePluginCaptureTest.drain
+    test_generic_hook_errors_are_advisory_except_protected_mcp_writes = (
+        ClaudePluginCaptureTest.test_generic_hook_errors_are_advisory_except_protected_mcp_writes
+    )
 
     def setUp(self):
         super().setUp()
@@ -3275,8 +3312,8 @@ class DirectoryCaptureTest(NativeCaptureFixture):
                 result = self.hook(
                     "UserPromptSubmit", cwd=str(cwd), prompt="Outside work"
                 )
-                self.assertEqual(result["decision"], "block")
-                self.assertIn("PROJECT_MISMATCH", result["reason"])
+                self.assertNotIn("decision", result)
+                self.assertIn("PROJECT_MISMATCH", json.dumps(result))
                 self.assertEqual(self.profile_snapshot(), before)
         refusal = self.hook(
             "PreToolUse",
@@ -3284,7 +3321,7 @@ class DirectoryCaptureTest(NativeCaptureFixture):
             tool_name="Bash",
             tool_input={"command": "printf fixture"},
         )
-        self.assertEqual(refusal["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertNotIn("permissionDecision", refusal.get("hookSpecificOutput", {}))
         self.assertIn("PROJECT_MISMATCH", json.dumps(refusal))
         self.assertEqual(self.profile_snapshot(), before)
         self.assertFalse(self.git_log.exists())
@@ -3328,7 +3365,7 @@ class DirectoryCaptureTest(NativeCaptureFixture):
             transcript_path=str(loop / "transcript.jsonl"),
             prompt="Must refuse looped transcript",
         )
-        self.assertEqual(result["decision"], "block")
+        self.assertNotIn("decision", result)
         self.assertEqual(self.profile_snapshot(), before)
         self.assertEqual(self.state_paths(), [])
         self.assertFalse(self.git_log.exists())
@@ -3521,6 +3558,571 @@ class DirectoryCaptureTest(NativeCaptureFixture):
         default = ClaudePluginCaptureTest.configure(self)
         self.assertEqual(default.returncode, 64, default.stderr)
         self.assertFalse(self.home.exists())
+
+
+class UserCaptureTest(NativeCaptureFixture):
+    expected_rewrite_decision = None
+    event = ClaudePluginCaptureTest.event
+    session_arguments = ClaudePluginCaptureTest.session_arguments
+    save = ClaudePluginCaptureTest.save
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.directory / "conversation.jsonl"
+        self.transcript.write_text('{"type":"system","uuid":"start"}\n')
+
+    def configure(self, *extra):
+        result = self.cli(
+            "attach",
+            "--scope",
+            "user",
+            "--host",
+            "claude-plugin",
+            "--home",
+            str(self.home),
+            "--folder",
+            "Sessions",
+            "--daily-folder",
+            "Journal",
+            "--release-sha256",
+            self.digest,
+            *extra,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def state_paths(self):
+        return list(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+
+    def drain(self):
+        result = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_user_attach_schema_capabilities_and_no_workspace_files(self):
+        before = set(self.project.rglob("*"))
+        self.configure()
+        profile = json.loads((self.home / "capture-profile.json").read_text())
+        self.assertEqual(profile["scope"], "user")
+        self.assertNotIn("project", profile)
+        self.assertNotIn("projectMode", profile)
+        self.assertEqual(profile["files"], {})
+        status = self.cli("profile-status", "--home", str(self.home))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["scope"], "user")
+        self.assertIsNone(json.loads(status.stdout).get("project"))
+        self.assertNotIn("projectMode", json.loads(status.stdout))
+        capabilities = self.cli("capabilities", "--release-sha256", self.digest)
+        self.assertEqual(
+            json.loads(capabilities.stdout)["captureScopes"],
+            {
+                "claude-plugin": ["project", "user"],
+                "codex": ["project"],
+            },
+        )
+        self.assertTrue(self.drain()["quiescent"])
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assertEqual(set(self.project.rglob("*")), before)
+        for path in self.home.rglob("*"):
+            self.assertEqual(
+                path.stat().st_mode & 0o777, 0o700 if path.is_dir() else 0o600
+            )
+        self.assertFalse((self.home / "capture-state/active.json").exists())
+
+    def test_new_workspaces_git_subdirectories_symlinks_and_nongit(self):
+        self.configure()
+        nested = self.project / "nested"
+        nested.mkdir()
+        alias = self.directory / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        self.hook("UserPromptSubmit", cwd=str(alias), prompt="first")
+        self.hook(
+            "UserPromptSubmit",
+            cwd=str(self.project),
+            session_id="second",
+            prompt="second",
+        )
+        plain = self.directory / "plain"
+        plain.mkdir()
+        output = self.hook(
+            "UserPromptSubmit", cwd=str(plain), session_id="plain", prompt="third"
+        )
+        self.assertIn("session-only", json.dumps(output))
+        children = list((self.home / "workspaces").iterdir())
+        self.assertEqual(len(children), 2)
+        profiles = [
+            json.loads((p / "capture-profile.json").read_text()) for p in children
+        ]
+        self.assertEqual(
+            {p["project"] for p in profiles}, {str(self.project), str(plain)}
+        )
+        self.assertEqual({p["projectMode"] for p in profiles}, {"git", "directory"})
+        status = self.drain()
+        self.assertFalse(status["quiescent"])
+        self.assertEqual(status["session_count"], 3)
+        self.assertEqual(status["workspace_count"], 2)
+        self.assertFalse(list(plain.iterdir()))
+
+    def test_session_binding_never_moves_pending_work_to_another_workspace(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        before = path.read_bytes()
+        other = self.directory / "other"
+        other.mkdir()
+        advisory = self.hook("UserPromptSubmit", cwd=str(other), prompt="next")
+        self.assertNotIn("decision", advisory)
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(advisory))
+        self.assertEqual(path.read_bytes(), before)
+        shell = self.hook(
+            "PreToolUse",
+            cwd=str(other),
+            tool_name="Bash",
+            tool_use_id="safe",
+            tool_input={"command": "pwd"},
+        )
+        self.assertNotIn("permissionDecision", shell.get("hookSpecificOutput", {}))
+        denied = self.hook(
+            "PreToolUse",
+            cwd=str(other),
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="unsafe",
+            tool_input={},
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(len(list((self.home / "workspaces").iterdir())), 1)
+
+    def test_unresolved_previous_turn_is_retained_and_next_prompt_is_advisory(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        before = path.read_bytes()
+        self.transcript.write_text(
+            self.transcript.read_text() + '{"type":"user","uuid":"next"}\n'
+        )
+        output = self.hook("UserPromptSubmit", prompt="new ordinary prompt")
+        self.assertNotIn("decision", output)
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+        arguments = self.session_arguments(path)
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="save",
+            tool_input=arguments,
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(path.read_bytes(), before)
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertNotIn("decision", stopped)
+        self.assertFalse(self.drain()["quiescent"])
+        old = json.loads(before)
+        skipped = self.cli(
+            "skip",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--turn",
+            old["turn"],
+            "--reason",
+            "no_meaningful_work",
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.hook("UserPromptSubmit", prompt="new ordinary prompt")
+        self.assertNotEqual(json.loads(path.read_text())["turn"], old["turn"])
+
+    def test_children_reuse_commit_engine_and_parent_cli_routes_bound_session(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        path, state, commit = self.pending_commit()
+        self.assertEqual(state["commits"][commit]["status"], "pending")
+        self.assertEqual(self.prepare(path, commit).returncode, 0)
+        status = self.cli("status", "--home", str(self.home), "--session", path.stem)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["gate"]["session"], path.stem)
+        self.assertFalse((self.home / "capture-state/active.json").exists())
+        self.assertFalse(self.drain()["quiescent"])
+
+    def test_tampered_child_or_binding_fails_closed_and_drain_refuses(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        child = self.state_paths()[0].parents[1]
+        descriptor = child / "capture-profile.json"
+        original = descriptor.read_bytes()
+        profile = json.loads(original)
+        profile["folder"] = "Other"
+        descriptor.write_text(json.dumps(profile))
+        result = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(result.returncode, 64)
+        direct = self.cli("profile-status", "--home", str(child))
+        self.assertEqual(direct.returncode, 64)
+        profile = json.loads(original)
+        profile.pop("parentHome")
+        descriptor.write_text(json.dumps(profile))
+        self.assertEqual(
+            self.cli("profile-status", "--home", str(child)).returncode, 64
+        )
+        descriptor.write_bytes(original)
+        binding = self.home / "bindings" / (self.session_key("session-1") + ".json")
+        record = json.loads(binding.read_text())
+        record["workspace"] = "0" * 64
+        binding.write_text(json.dumps(record))
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="bad",
+            tool_input={},
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_primitive_tool_input_denies_protected_writes_without_blocking_bash(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        before = self.state_paths()[0].read_bytes()
+        for malformed in (None, [], 1, "bad"):
+            with self.subTest(malformed=malformed):
+                denied = self.hook(
+                    "PreToolUse",
+                    tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                    tool_use_id="bad",
+                    tool_input=malformed,
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                shell = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="bad",
+                    tool_input=malformed,
+                )
+                self.assertNotIn(
+                    "permissionDecision", shell.get("hookSpecificOutput", {})
+                )
+        self.assertEqual(self.state_paths()[0].read_bytes(), before)
+
+    def test_user_scope_rejects_project_arguments_and_codex_and_limits_enrollment(self):
+        rejected = self.cli(
+            "attach",
+            "--host",
+            "claude-plugin",
+            "--scope",
+            "user",
+            "--home",
+            str(self.home),
+            "--project",
+            str(self.project),
+            "--folder",
+            "Sessions",
+            "--release-sha256",
+            self.digest,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertFalse(self.home.exists())
+        rejected = self.cli(
+            "create",
+            "--scope",
+            "user",
+            "--home",
+            str(self.home),
+            "--folder",
+            "Sessions",
+            "--release-sha256",
+            self.digest,
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertFalse(self.home.exists())
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        native = self.load_native()
+        home, profile = native.load_profile(self.home)
+        with mock.patch.object(native, "MAX_DRAIN_SESSIONS", 1):
+            output = native.hook(
+                home,
+                profile,
+                self.event("UserPromptSubmit", session_id="extra", prompt="work"),
+            )
+        self.assertNotIn("decision", output)
+        self.assertIn("DRAIN_SESSION_LIMIT", json.dumps(output))
+        self.assertEqual(len(list((self.home / "bindings").iterdir())), 1)
+
+    def test_missing_enrolled_state_or_unknown_parent_state_is_not_drained(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        path = self.state_paths()[0]
+        original = path.read_bytes()
+        path.unlink()
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+        path.write_bytes(original)
+        path.chmod(0o600)
+        unexpected = self.home / "capture-state" / "unknown.json"
+        unexpected.write_text("{}")
+        unexpected.chmod(0o600)
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+
+    def test_missing_git_uses_session_only_and_commit_writes_refuse(self):
+        self.configure()
+        native = self.load_native()
+        home, profile = native.load_profile(self.home)
+        with mock.patch.object(native, "git", side_effect=FileNotFoundError):
+            output = native.hook(
+                home, profile, self.event("UserPromptSubmit", prompt="work")
+            )
+            shell = native.hook(
+                home,
+                profile,
+                self.event(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="ordinary",
+                    tool_input={"command": "pwd"},
+                ),
+            )
+            denied = native.hook(
+                home,
+                profile,
+                self.event(
+                    "PreToolUse",
+                    tool_name="mcp__obsidian-write__obsidian_daily_append",
+                    tool_use_id="fake",
+                    tool_input={
+                        "skip_if_hash": "a" * 40,
+                        "idempotency_key": "commit-capture:fake",
+                    },
+                ),
+            )
+        self.assertIn("session-only", json.dumps(output))
+        path = self.state_paths()[0]
+        self.assertEqual(json.loads(path.read_text())["commits"], {})
+        self.assertNotIn("permissionDecision", shell.get("hookSpecificOutput", {}))
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("DIRECTORY_SESSION_ONLY", json.dumps(denied))
+
+    def test_two_git_workspaces_have_independent_pending_commit_gates(self):
+        self.configure()
+        other = self.directory / "other-git"
+        other.mkdir()
+        initialized = subprocess.run(
+            ["git", "-C", str(other), "init"],
+            env=self.environment,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        for session, cwd in (("first", self.project), ("second", other)):
+            self.hook(
+                "UserPromptSubmit", session_id=session, cwd=str(cwd), prompt="work"
+            )
+            rewritten = self.hook(
+                "PreToolUse",
+                session_id=session,
+                cwd=str(cwd),
+                tool_name="Bash",
+                tool_use_id="commit",
+                tool_input={"command": "git commit -m fixture"},
+            )
+            self.assertIn("updatedInput", rewritten["hookSpecificOutput"])
+        gates = list((self.home / "workspaces").glob("*/capture-state/active.json"))
+        self.assertEqual(len(gates), 2)
+        self.assertEqual(
+            {json.loads(p.read_text())["session"] for p in gates},
+            {self.session_key("first"), self.session_key("second")},
+        )
+        self.assertFalse((self.home / "capture-state/active.json").exists())
+        self.assertFalse(self.drain()["quiescent"])
+
+    def test_bound_and_unbound_busy_hooks_do_not_block_prompts_or_unrelated_bash(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        native = self.load_native()
+        with native.gate_lock(self.home):
+            prompt = self.hook("UserPromptSubmit", prompt="more work")
+            self.assertNotIn("decision", prompt)
+            shell = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="pwd",
+                tool_input={"command": "pwd"},
+            )
+            self.assertNotIn("permissionDecision", shell.get("hookSpecificOutput", {}))
+            self.assertEqual(
+                self.cli("drain-status", "--home", str(self.home)).returncode, 64
+            )
+        (self.home / "bindings" / (self.session_key("session-1") + ".json")).unlink()
+        output = self.hook("Stop", session_id="unbound", stop_hook_active=False)
+        self.assertNotIn("decision", output)
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+
+    def test_symlinked_child_and_binding_and_unknown_scopes_refuse(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        binding = self.home / "bindings" / (self.session_key("session-1") + ".json")
+        real = self.home / "real-binding"
+        binding.rename(real)
+        binding.symlink_to(real)
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+        binding.unlink()
+        real.rename(binding)
+        child = self.state_paths()[0].parents[1]
+        backup = self.home / "real-child"
+        child.rename(backup)
+        child.symlink_to(backup, target_is_directory=True)
+        self.assertEqual(
+            self.cli("drain-status", "--home", str(self.home)).returncode, 64
+        )
+        child.unlink()
+        backup.rename(child)
+        descriptor = self.home / "capture-profile.json"
+        profile = json.loads(descriptor.read_text())
+        profile["scope"] = "typo"
+        descriptor.write_text(json.dumps(profile))
+        self.assertEqual(
+            self.cli("profile-status", "--home", str(self.home)).returncode, 64
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("OBSIDIAN_MCP_TEST_PLUGIN_ROOT"),
+        "optional public plugin checkout not supplied",
+    )
+    def test_user_plugin_handoff_enrolls_new_git_and_nongit_and_drains_receipts(self):
+        plugin = Path(os.environ["OBSIDIAN_MCP_TEST_PLUGIN_ROOT"]).resolve(strict=True)
+        fixture_home = self.directory / "home"
+        fixture_home.mkdir()
+        self.environment.update(
+            HOME=str(fixture_home),
+            XDG_STATE_HOME=str(self.directory / "state"),
+            XDG_CONFIG_HOME=str(self.directory / "config"),
+            XDG_CACHE_HOME=str(self.directory / "cache"),
+        )
+        prefix = self.directory / "installed-client"
+        installed = subprocess.run(
+            [
+                str(self.bundle / "bin/obsidian-mcp-client-install"),
+                "--prefix",
+                str(prefix),
+                "--bundle",
+                str(self.bundle),
+                "--release-sha256",
+                self.digest,
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.bundle = prefix / "current"
+        self.configure()
+        ownership_path = (
+            Path(self.environment["XDG_STATE_HOME"])
+            / "claude-obsidian/capture-ownership/owner.json"
+        )
+        self.assertFalse(ownership_path.exists())
+        switched = subprocess.run(
+            [
+                "python3",
+                str(plugin / "scripts/lib/capture-owner.py"),
+                "handoff",
+                "--owner",
+                "mcp",
+                "--scope",
+                "user",
+                "--profile",
+                str(self.home),
+                "--verification",
+                "legacy-writers-stopped-and-history-inspected",
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(switched.returncode, 0, switched.stderr)
+        ownership = json.loads(ownership_path.read_text())
+        self.assertEqual(ownership["default_profile"], str(self.home))
+        self.assertEqual(ownership["profiles"], {})
+        plain = self.directory / "unregistered-notes"
+        plain.mkdir()
+        for session, cwd in (
+            ("new-git-session", self.project),
+            ("new-directory-session", plain),
+        ):
+
+            def dispatch(name, **extra):
+                result = subprocess.run(
+                    ["bash", str(plugin / "scripts/capture-hook.sh"), name],
+                    input=json.dumps(
+                        self.event(name, session_id=session, cwd=str(cwd), **extra)
+                    ),
+                    env=self.environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout or "{}")
+
+            before = set(cwd.rglob("*"))
+            prompt = dispatch(
+                "UserPromptSubmit", prompt="Capture newly opened workspace"
+            )
+            self.assertIn(
+                "mcp__obsidian-write__obsidian_keeper_save", json.dumps(prompt)
+            )
+            paths = list(
+                (self.home / "workspaces").glob(
+                    "*/capture-state/" + self.session_key(session) + ".json"
+                )
+            )
+            self.assertEqual(len(paths), 1)
+            path = paths[0]
+            self.assertFalse(self.drain()["quiescent"])
+            args = self.session_arguments(path)
+            plan = json.loads(path.read_text())["session_save"]
+            call = dict(
+                tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                tool_use_id="paired-save",
+                tool_input=args,
+            )
+            self.assertEqual(dispatch("PreToolUse", **call), {})
+            receipt = dict(
+                status="committed",
+                request_id="paired-user-fixture",
+                idempotency_key=args["idempotency_key"],
+                path=plan["path"],
+                affected_paths=[plan["path"], plan["index"], plan["daily"]],
+                warnings=[],
+                recovery={"required": False, "action": ""},
+                error_code=None,
+                retryable=False,
+            )
+            self.assertEqual(
+                dispatch("PostToolUse", **call, tool_response=json.dumps(receipt)), {}
+            )
+            self.assertEqual(json.loads(path.read_text())["disposition"], "saved")
+            self.assertEqual(dispatch("Stop", stop_hook_active=False), {})
+            self.assertEqual(set(cwd.rglob("*")), before)
+        drained = self.drain()
+        self.assertTrue(drained["quiescent"])
+        self.assertEqual(drained["workspace_count"], 2)
+        self.assertEqual(drained["session_count"], 2)
+        self.assertEqual(json.loads(ownership_path.read_text()), ownership)
 
 
 if __name__ == "__main__":
