@@ -884,18 +884,22 @@ def retire_terminal_sessions(home, profile):
             raise NativeError("SESSION_BINDING_INVALID")
         binding, _ = read_binding(home, entry.stem, restore=False)
         child, _ = bound_child(home, profile, binding, inspect=True)
-        with state_lock(child, entry.stem) as (state, _):
-            if (state is not None and drain_reasons(state)) or (
-                active_request(child) or {}
-            ).get("session") == entry.stem:
-                active += 1
-                continue
-            if binding["enrolled"] and state is None:
-                raise NativeError("RETENTION_CONFLICT")
-            generation = digest(encode([binding, state]))
-            record = dict(
-                schemaVersion=1, binding=binding, state=state, generation=generation
-            )
+        try:
+            with state_lock(child, entry.stem) as (state, _):
+                if (state is not None and drain_reasons(state)) or (
+                    active_request(child) or {}
+                ).get("session") == entry.stem:
+                    active += 1
+                    continue
+                if binding["enrolled"] and state is None:
+                    raise NativeError("RETENTION_CONFLICT")
+                generation = digest(encode([binding, state]))
+                record = dict(
+                    schemaVersion=1, binding=binding, state=state, generation=generation
+                )
+        except BlockingIOError:
+            active += 1
+            continue
         transition_retention(home, "archive", record, archive_index(home, entry.stem))
     return active
 
@@ -2485,7 +2489,7 @@ def prepare_commit(home, profile, args):
     return result
 
 
-def execute_commit(home, profile, args):
+def execute_commit(home, profile, args, parent_locks=None):
     require_git_profile(profile)
     with state_lock(home, args.session) as (state, path):
         if state is None or args.snapshot not in state["snapshots"]:
@@ -2516,6 +2520,8 @@ def execute_commit(home, profile, args):
                 words.pop(0)
         before["execution_started"] = True
         atomic_write(path, encode(state))
+        if parent_locks is not None:
+            parent_locks.close()
         producer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-commit-event"))
         environment = producer["isolated_environment"]()
         for role in ("AUTHOR", "COMMITTER"):
@@ -2926,7 +2932,7 @@ def dispatch_command(args, extra, locks):
                 else drain_status(home)
             )
         elif args.operation == "execute-commit":
-            return execute_commit(home, profile, args)
+            return execute_commit(home, profile, args, locks)
         elif args.operation == "hook":
             result = hook(home, profile, input_json())
         elif args.operation in ("prepare", "retry"):

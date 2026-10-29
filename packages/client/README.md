@@ -437,6 +437,9 @@ state files. Next admission or a mutating session operation reconciles an
 interrupted transition only when identities, generations, and payloads match;
 conflicts fail closed. State and gate lock files are never moved or deleted.
 Historical empty locks consume no admission capacity, but busy locks refuse drain.
+Admission counts a busy session conservatively as active without refusing unrelated
+workspaces below the active-work limit. Wrapped Git execution pins its child/session
+state before releasing the parent lock, so independent workspace commits can proceed.
 
 Resuming an archived session restores only its exact validated binding and state;
 missing or conflicting evidence never falls back to fresh enrollment. Earlier

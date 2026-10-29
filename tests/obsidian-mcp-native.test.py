@@ -3566,6 +3566,115 @@ class UserCaptureTest(NativeCaptureFixture):
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
 
+    def test_busy_executor_does_not_block_other_workspace_commit_or_admission(self):
+        self.configure()
+        commands = []
+        roots = [self.project, self.directory / "other-git"]
+        for number, root in enumerate(roots):
+            if number:
+                root.mkdir()
+                subprocess.run(
+                    ["git", "-C", str(root), "init"],
+                    env=self.environment,
+                    check=True,
+                    capture_output=True,
+                )
+            self.hook(
+                "UserPromptSubmit",
+                cwd=str(root),
+                session_id=f"git-{number}",
+                prompt="Work",
+            )
+            (root / "change").write_text("fixture")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "change"],
+                env=self.environment,
+                check=True,
+            )
+            output = self.hook(
+                "PreToolUse",
+                cwd=str(root),
+                session_id=f"git-{number}",
+                tool_name="Bash",
+                tool_use_id=f"commit-{number}",
+                tool_input={"command": "git commit -m fixture"},
+            )
+            commands.append(
+                shlex.split(output["hookSpecificOutput"]["updatedInput"]["command"])
+            )
+        entered, release = self.directory / "entered", self.directory / "release"
+        hook = roots[0] / ".git/hooks/pre-commit"
+        hook.write_text(
+            f"#!{sys.executable}\nfrom pathlib import Path\nimport time\n"
+            f"Path({str(entered)!r}).touch()\nend=time.monotonic()+15\n"
+            f"while not Path({str(release)!r}).exists() and time.monotonic()<end: time.sleep(.02)\n"
+        )
+        hook.chmod(0o700)
+        with subprocess.Popen(
+            commands[0],
+            cwd=roots[0],
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as first:
+            try:
+                deadline = time.monotonic() + 10
+                while (
+                    not entered.exists()
+                    and first.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertTrue(entered.exists(), "executor never entered Git hook")
+                second = subprocess.run(
+                    commands[1],
+                    cwd=roots[1],
+                    env=self.environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                fresh = self.directory / "fresh-directory"
+                fresh.mkdir()
+                replay = subprocess.run(
+                    commands[0],
+                    cwd=roots[0],
+                    env=self.environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                native = self.load_native()
+                home, profile = native.load_profile(self.home)
+                with mock.patch.object(native, "MAX_DRAIN_SESSIONS", 2):
+                    at_capacity = native.hook(
+                        home,
+                        profile,
+                        self.event(
+                            "UserPromptSubmit",
+                            cwd=str(fresh),
+                            session_id="fresh",
+                            prompt="Independent work",
+                        ),
+                    )
+                self.assertIn("DRAIN_SESSION_LIMIT", json.dumps(at_capacity))
+                admission = self.hook(
+                    "UserPromptSubmit",
+                    cwd=str(fresh),
+                    session_id="fresh",
+                    prompt="Independent work",
+                )
+                held = first.poll() is None
+            finally:
+                release.touch()
+                stdout, stderr = first.communicate(timeout=15)
+        self.assertTrue(held, "isolation checks did not overlap running Git")
+        self.assertEqual(first.returncode, 0, stderr + stdout)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(replay.returncode, 64, replay.stdout)
+        self.assertIn("obsidian_keeper_save", json.dumps(admission))
+
     def pause_next_prompt(self):
         self.transcript.write_text(
             self.transcript.read_text() + '{"type":"user","uuid":"next"}\n'
