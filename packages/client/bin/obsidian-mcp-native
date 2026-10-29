@@ -424,7 +424,7 @@ def create_profile(args):
     )
 
 
-def load_profile(home, *, parent_only=False):
+def load_profile(home, *, parent_only=False, inspect=False):
     home = Path(home).absolute()
     item = home.lstat()
     if (
@@ -474,8 +474,25 @@ def load_profile(home, *, parent_only=False):
                 raise NativeError("USER_PROFILE_INVALID")
             private_directory(home / "workspaces")
             private_directory(home / "bindings")
-        elif str(project_root(profile["project"], mode)) != profile["project"]:
-            raise NativeError("PROFILE_PROJECT_INVALID")
+        else:
+            project = profile.get("project")
+            if (
+                not isinstance(project, str)
+                or not Path(project).is_absolute()
+                or os.path.normpath(project) != project
+            ):
+                raise NativeError("PROFILE_PROJECT_INVALID")
+            if not inspect and str(project_root(project, mode)) != project:
+                raise NativeError("PROFILE_PROJECT_INVALID")
+            if inspect:
+                try:
+                    present = Path(project).resolve(strict=True)
+                except FileNotFoundError:
+                    present = None
+                if present is not None and (
+                    str(present) != project or not present.is_dir()
+                ):
+                    raise NativeError("PROFILE_PROJECT_INVALID")
         parent_home = profile.get("parentHome")
         if parent_home is None and home.parent.name == "workspaces":
             try:
@@ -487,7 +504,7 @@ def load_profile(home, *, parent_only=False):
             if isinstance(hint, dict) and hint.get("scope") == "user":
                 parent_home = str(home.parent.parent)
         if parent_home is not None:
-            parent, owner = load_profile(parent_home, parent_only=True)
+            parent, owner = load_profile(parent_home, parent_only=True, inspect=inspect)
             validate_child(parent, owner, home, profile)
         metadata = trusted_bundle(profile["releaseSha256"])
         if metadata["releaseId"] != profile.get("releaseId"):
@@ -524,15 +541,6 @@ def private_directory(path):
     return path
 
 
-def bounded_entries(directory, code):
-    entries = []
-    for entry in directory.iterdir():
-        if len(entries) >= MAX_DRAIN_SESSIONS:
-            raise NativeError(code)
-        entries.append(entry)
-    return entries
-
-
 def workspace_key(project, mode):
     return digest(encode([project, mode]))
 
@@ -557,7 +565,7 @@ def validate_child(parent, owner, home, profile):
         raise NativeError("CHILD_PROFILE_INVALID")
 
 
-def read_binding(home, session):
+def read_hot_binding(home, session):
     if not isinstance(session, str) or HEX.fullmatch(session) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = private_directory(home / "bindings")
@@ -568,9 +576,14 @@ def read_binding(home, session):
         if path.is_symlink():
             raise NativeError("SESSION_BINDING_INVALID") from None
         return None, path
+    validate_binding(record, session)
+    return record, path
+
+
+def validate_binding(record, session):
     if (
         not isinstance(record, dict)
-        or set(record)
+        or set(record) - {"archiveGeneration"}
         != {
             "schemaVersion",
             "session",
@@ -587,24 +600,322 @@ def read_binding(home, session):
         or not Path(record["project"]).is_absolute()
         or type(record.get("paused")) is not bool
         or type(record.get("enrolled")) is not bool
+        or (
+            "archiveGeneration" in record
+            and (
+                not isinstance(record["archiveGeneration"], str)
+                or HEX.fullmatch(record["archiveGeneration"]) is None
+            )
+        )
         or record.get("workspace")
         != workspace_key(record["project"], record["projectMode"])
     ):
         raise NativeError("SESSION_BINDING_INVALID")
-    return record, path
 
 
-def bound_child(home, profile, record):
+def streamed_entries(directory):
+    private_directory(directory)
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            yield Path(entry.path)
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def archive_index(home, session):
+    directory = home / "archive" / session
+    if not directory.exists() and not directory.is_symlink():
+        locator = home / "retained-bindings" / (session + ".json")
+        if locator.exists() or locator.is_symlink():
+            raise NativeError("RETENTION_ARCHIVE_MISSING")
+        return None
+    private_directory(home / "archive")
+    private_directory(directory)
+    index = json.loads(private_read(directory / "index.json"))
+    if (
+        not isinstance(index, dict)
+        or set(index) != {"generation", "location"}
+        or index.get("location") not in ("hot", "archive")
+        or not isinstance(index.get("generation"), str)
+        or HEX.fullmatch(index["generation"]) is None
+    ):
+        raise NativeError("RETENTION_INDEX_INVALID")
+    return index
+
+
+def validate_archive(value, session, generation):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "binding", "state", "generation"}
+        or value.get("schemaVersion") != 1
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    binding, state = value["binding"], value["state"]
+    validate_binding(binding, session)
+    if (
+        value.get("generation") != generation
+        or digest(encode([binding, state])) != generation
+        or not isinstance(binding, dict)
+        or binding.get("session") != session
+        or binding.get("workspace")
+        != workspace_key(binding.get("project"), binding.get("projectMode"))
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    if state is None:
+        if binding.get("enrolled") is not False:
+            raise NativeError("RETENTION_ARCHIVE_INVALID")
+    elif (
+        not isinstance(state, dict)
+        or state.get("schemaVersion") != 1
+        or state.get("session") != session
+        or drain_reasons(state)
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    return value
+
+
+def archived_record(home, session, index):
+    generation = index["generation"]
+    value = json.loads(
+        private_read(home / "archive" / session / (generation + ".json"))
+    )
+    return validate_archive(value, session, generation)
+
+
+def retained_locator(home, session, envelope, *, create=False):
+    directory = home / "retained-bindings"
+    if create:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    path = directory / (session + ".json")
+    try:
+        value = json.loads(private_read(path))
+    except FileNotFoundError:
+        if not create or path.is_symlink():
+            raise NativeError("RETENTION_BINDING_MISSING") from None
+        value = dict(
+            session=session,
+            workspace=envelope["binding"]["workspace"],
+            firstGeneration=envelope["generation"],
+        )
+        atomic_write(path, encode(value))
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"session", "workspace", "firstGeneration"}
+        or value.get("session") != session
+        or value.get("workspace") != envelope["binding"]["workspace"]
+        or not isinstance(value.get("firstGeneration"), str)
+        or HEX.fullmatch(value["firstGeneration"]) is None
+    ):
+        raise NativeError("RETENTION_BINDING_INVALID")
+    first = home / "archive" / session / (value["firstGeneration"] + ".json")
+    validate_archive(json.loads(private_read(first)), session, value["firstGeneration"])
+
+
+def read_binding(home, session, *, restore=True):
+    hot, path = read_hot_binding(home, session)
+    index = archive_index(home, session)
+    if index is None:
+        if hot and "archiveGeneration" in hot:
+            raise NativeError("RETENTION_CONFLICT")
+        return hot, path
+    archived = archived_record(home, session, index)
+    retained_locator(home, session, archived)
+    if index["location"] == "hot":
+        if (
+            hot is None
+            or hot.get("archiveGeneration") != index["generation"]
+            or any(
+                hot.get(k) != archived["binding"].get(k)
+                for k in (
+                    "schemaVersion",
+                    "session",
+                    "workspace",
+                    "project",
+                    "projectMode",
+                )
+            )
+        ):
+            raise NativeError("RETENTION_CONFLICT")
+        return hot, path
+    if hot is not None:
+        raise NativeError("RETENTION_CONFLICT")
+    if restore:
+        transition_retention(home, "restore", archived, index)
+        return read_hot_binding(home, session)
+    return archived["binding"], path
+
+
+def reconcile_retention(home):
+    journal = home / "retention-journal.json"
+    try:
+        value = json.loads(private_read(journal))
+    except FileNotFoundError:
+        if journal.is_symlink():
+            raise NativeError("RETENTION_JOURNAL_INVALID") from None
+        return
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "operation", "record", "before"}
+        or value.get("schemaVersion") != 1
+        or value.get("operation") not in ("archive", "restore")
+    ):
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    envelope = value["record"]
+    session = (
+        envelope.get("binding", {}).get("session")
+        if isinstance(envelope, dict)
+        else None
+    )
+    if not isinstance(session, str) or HEX.fullmatch(session) is None:
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    envelope = validate_archive(envelope, session, envelope.get("generation"))
+    before = value["before"]
+    if before is not None and (
+        not isinstance(before, dict)
+        or set(before) != {"generation", "location"}
+        or before.get("location") not in ("hot", "archive")
+        or not isinstance(before.get("generation"), str)
+        or HEX.fullmatch(before["generation"]) is None
+    ):
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    binding = envelope["binding"]
+    child = home / "workspaces" / binding["workspace"]
+    _, descriptor = load_profile(child, inspect=True)
+    _, parent = load_profile(home, inspect=True)
+    validate_child(home, parent, child, descriptor)
+    archive = home / "archive"
+    archive.mkdir(mode=0o700, exist_ok=True)
+    private_directory(archive)
+    directory = archive / session
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    generation = envelope["generation"]
+    target = directory / (generation + ".json")
+    try:
+        index = archive_index(home, session)
+    except FileNotFoundError:
+        if value["before"] is not None:
+            raise NativeError("RETENTION_CONFLICT") from None
+        index = None
+    after = dict(
+        generation=generation,
+        location="archive" if value["operation"] == "archive" else "hot",
+    )
+    if index != value["before"] and index != after:
+        raise NativeError("RETENTION_CONFLICT")
+    binding_path = home / "bindings" / (session + ".json")
+    state_path = child / "capture-state" / (session + ".json")
+    with state_lock(child, session) as (state, _):
+        hot, _ = read_hot_binding(home, session)
+        if value["operation"] == "archive":
+            if (active_request(child) or {}).get("session") == session:
+                raise NativeError("RETENTION_CONFLICT")
+            if (
+                (hot is not None and hot != binding)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index != after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+            if target.exists() or target.is_symlink():
+                if private_read(target) != encode(envelope):
+                    raise NativeError("RETENTION_CONFLICT")
+            else:
+                if hot is None:
+                    raise NativeError("RETENTION_CONFLICT")
+                atomic_write(target, encode(envelope))
+            retained_locator(home, session, envelope, create=before is None)
+            atomic_write(directory / "index.json", encode(after))
+            sync_directory(archive)
+            sync_directory(home)
+            binding_path.unlink(missing_ok=True)
+            state_path.unlink(missing_ok=True)
+            sync_directory(binding_path.parent)
+            sync_directory(state_path.parent)
+        else:
+            retained_locator(home, session, envelope)
+            if private_read(target) != encode(envelope):
+                raise NativeError("RETENTION_CONFLICT")
+            restored = dict(binding, archiveGeneration=generation)
+            if (
+                (hot is not None and hot != restored)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index == after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+            if envelope["state"] is not None:
+                atomic_write(state_path, encode(envelope["state"]))
+            atomic_write(binding_path, encode(restored))
+            atomic_write(directory / "index.json", encode(after))
+    journal.unlink()
+    sync_directory(home)
+
+
+def transition_retention(home, operation, record, before):
+    if (home / "retention-journal.json").exists() or (
+        home / "retention-journal.json"
+    ).is_symlink():
+        raise NativeError("RETENTION_JOURNAL_PENDING")
+    atomic_write(
+        home / "retention-journal.json",
+        encode(
+            dict(schemaVersion=1, operation=operation, record=record, before=before)
+        ),
+    )
+    reconcile_retention(home)
+
+
+def retire_terminal_sessions(home, profile):
+    active = 0
+    for entry in streamed_entries(home / "bindings"):
+        if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+            raise NativeError("SESSION_BINDING_INVALID")
+        binding, _ = read_binding(home, entry.stem, restore=False)
+        child, _ = bound_child(home, profile, binding, inspect=True)
+        with state_lock(child, entry.stem) as (state, _):
+            if (state is not None and drain_reasons(state)) or (
+                active_request(child) or {}
+            ).get("session") == entry.stem:
+                active += 1
+                continue
+            if binding["enrolled"] and state is None:
+                raise NativeError("RETENTION_CONFLICT")
+            generation = digest(encode([binding, state]))
+            record = dict(
+                schemaVersion=1, binding=binding, state=state, generation=generation
+            )
+        transition_retention(home, "archive", record, archive_index(home, entry.stem))
+    return active
+
+
+def bound_child(home, profile, record, *, inspect=False):
     private_directory(home / "workspaces")
     child = home / "workspaces" / record["workspace"]
-    child, descriptor = load_profile(child)
+    child, descriptor = load_profile(child, inspect=inspect)
     validate_child(home, profile, child, descriptor)
     if descriptor != child_profile(
         home, profile, record["project"], record["projectMode"]
     ):
         raise NativeError("SESSION_BINDING_INVALID")
     if record["enrolled"]:
-        private_read(child / "capture-state" / (record["session"] + ".json"))
+        index = archive_index(home, record["session"]) if inspect else None
+        if index is not None and index["location"] == "archive":
+            if archived_record(home, record["session"], index)["binding"] != record:
+                raise NativeError("RETENTION_CONFLICT")
+        else:
+            private_read(child / "capture-state" / (record["session"] + ".json"))
     return child, descriptor
 
 
@@ -654,6 +965,52 @@ def check_user_state(home):
         raise NativeError("USER_STATE_INVALID")
 
 
+def provision_child(home, profile, project, mode):
+    key = workspace_key(project, mode)
+    children = private_directory(home / "workspaces")
+    child = children / key
+    staging = home / "provisioning"
+    staging.mkdir(mode=0o700, exist_ok=True)
+    private_directory(staging)
+    stage = staging / key
+    expected = child_profile(home, profile, project, mode)
+    if child.exists() or child.is_symlink():
+        private_directory(child)
+        if (child / "capture-profile.json").exists():
+            loaded, descriptor = load_profile(child)
+            validate_child(home, profile, loaded, descriptor)
+            return child
+        if (
+            stage.exists()
+            or {p.name for p in child.iterdir()} != {"capture-state"}
+            or any(checked_state_directory(child).iterdir())
+        ):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        os.rename(child, stage)
+    stage.mkdir(mode=0o700, exist_ok=True)
+    private_directory(stage)
+    (stage / "capture-state").mkdir(mode=0o700, exist_ok=True)
+    checked_state_directory(stage)
+    if any((stage / "capture-state").iterdir()) or any(
+        p.name not in ("capture-state", "capture-profile.json") for p in stage.iterdir()
+    ):
+        raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+    descriptor = stage / "capture-profile.json"
+    if descriptor.exists() or descriptor.is_symlink():
+        if json.loads(private_read(descriptor)) != expected:
+            raise NativeError("CHILD_PROFILE_INVALID")
+    else:
+        atomic_write(descriptor, encode(expected))
+    os.rename(stage, child)
+    for directory in (staging, children):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return child
+
+
 def retained_capture_event(home, event):
     session = digest(identifier(event.get("session_id")).encode())
     with state_lock(home, session) as (state, _):
@@ -686,39 +1043,46 @@ def user_hook(home, profile, event):
     try:
         with gate_lock(home, nonblocking=True):
             check_user_state(home)
+            reconcile_retention(home)
             session = digest(identifier(event.get("session_id")).encode())
+            hot, _ = read_hot_binding(home, session)
+            index = archive_index(home, session)
+            if (
+                hot is None
+                and index is None
+                and event.get("hook_event_name") == "SessionStart"
+            ):
+                claude_transcript(event)
+                return context(
+                    "SessionStart",
+                    "Obsidian capture awaits UserPromptSubmit; startup does not enroll a session.",
+                )
+            activation = event.get("hook_event_name") == "UserPromptSubmit"
+            if event.get("hook_event_name") == "PreToolUse":
+                if hot is None:
+                    activation = index is not None
+                else:
+                    child = home / "workspaces" / hot["workspace"]
+                    private_directory(child)
+                    with state_lock(child, session) as (state, _):
+                        activation = state is None or not drain_reasons(state)
+            if activation:
+                if event.get("hook_event_name") == "UserPromptSubmit":
+                    normalize_claude(event, None)
+                active = retire_terminal_sessions(home, profile)
+                hot, _ = read_hot_binding(home, session)
+                index = archive_index(home, session)
+                if hot is None and active >= MAX_DRAIN_SESSIONS:
+                    raise NativeError("DRAIN_SESSION_LIMIT")
             record, path = read_binding(home, session)
             project, mode = event_workspace(event)
             key = workspace_key(project, mode)
             if record is not None and record["workspace"] != key:
                 raise NativeError("SESSION_WORKSPACE_CHANGED")
             if record is None:
-                if event.get("hook_event_name") not in (
-                    "SessionStart",
-                    "UserPromptSubmit",
-                ):
+                if event.get("hook_event_name") != "UserPromptSubmit":
                     raise NativeError("PROMPT_EVENT_REQUIRED")
-                claude_transcript(event)
-                children = private_directory(home / "workspaces")
-                if (
-                    len(bounded_entries(children, "DRAIN_WORKSPACE_LIMIT"))
-                    >= MAX_DRAIN_SESSIONS
-                    and not (children / key).exists()
-                ):
-                    raise NativeError("DRAIN_WORKSPACE_LIMIT")
-                if (
-                    len(bounded_entries(home / "bindings", "DRAIN_SESSION_LIMIT"))
-                    >= MAX_DRAIN_SESSIONS
-                ):
-                    raise NativeError("DRAIN_SESSION_LIMIT")
-                child = children / key
-                if not child.exists() and not child.is_symlink():
-                    child.mkdir(mode=0o700)
-                    (child / "capture-state").mkdir(mode=0o700)
-                    atomic_write(
-                        child / "capture-profile.json",
-                        encode(child_profile(home, profile, project, mode)),
-                    )
+                provision_child(home, profile, project, mode)
                 record = dict(
                     schemaVersion=1,
                     session=session,
@@ -792,46 +1156,152 @@ def user_hook(home, profile, event):
         )
 
 
+def inspect_child_records(home, child):
+    with gate_lock(child, nonblocking=True):
+        owner = active_request(child)
+        for entry in streamed_entries(checked_state_directory(child)):
+            if entry.name in (ACTIVE, "active.lock"):
+                continue
+            if (
+                entry.suffix not in (".json", ".lock")
+                or HEX.fullmatch(entry.stem) is None
+            ):
+                raise NativeError("DRAIN_STATE_INVALID")
+            with state_lock(child, entry.stem) as (state, _):
+                if state is not None:
+                    record, _ = read_hot_binding(home, entry.stem)
+                    if (
+                        record is None
+                        or record["workspace"] != child.name
+                        or not record["enrolled"]
+                    ):
+                        raise NativeError("SESSION_BINDING_INVALID")
+                    drain_reasons(state)
+        return owner
+
+
+def inspect_provisioning(home, profile):
+    directory = home / "provisioning"
+    if not directory.exists() and not directory.is_symlink():
+        return
+    for stage in streamed_entries(directory):
+        if HEX.fullmatch(stage.name) is None:
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        private_directory(stage)
+        if any(streamed_entries(checked_state_directory(stage))):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        for entry in streamed_entries(stage):
+            if entry.name == "capture-state":
+                continue
+            if entry.name != "capture-profile.json":
+                raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+            descriptor = json.loads(private_read(entry))
+            mode = project_mode(descriptor)
+            project = descriptor.get("project")
+            if stage.name != workspace_key(
+                project, mode
+            ) or descriptor != child_profile(home, profile, project, mode):
+                raise NativeError("CHILD_PROFILE_INVALID")
+
+
 def user_drain_status(home, profile):
     with gate_lock(home, nonblocking=True):
         check_user_state(home)
-        children = private_directory(home / "workspaces")
-        bindings = private_directory(home / "bindings")
-        records = {}
-        for entry in bounded_entries(bindings, "DRAIN_SESSION_LIMIT"):
-            if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
-                raise NativeError("SESSION_BINDING_INVALID")
-            record, _ = read_binding(home, entry.stem)
-            if record is None:
-                raise NativeError("SESSION_BINDING_INVALID")
-            bound_child(home, profile, record)
-            records[entry.stem] = record
+        if (home / "retention-journal.json").exists() or (
+            home / "retention-journal.json"
+        ).is_symlink():
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="RETENTION_JOURNAL_PENDING",
+            )
+        inspect_provisioning(home, profile)
+        hot_count = archive_count = workspace_count = unresolved_count = 0
         sessions = []
         workspaces = []
-        for child in bounded_entries(children, "DRAIN_WORKSPACE_LIMIT"):
-            if HEX.fullmatch(child.name) is None:
-                raise NativeError("DRAIN_WORKSPACE_LIMIT")
-            child, descriptor = load_profile(child)
-            validate_child(home, profile, child, descriptor)
-            status = drain_status(child)
-            workspaces.append(dict(workspace=child.name, **status))
-            for session in status["sessions"]:
-                if (
-                    session["session"] not in records
-                    or records[session["session"]]["workspace"] != child.name
-                    or not records[session["session"]]["enrolled"]
-                ):
+        quiescent = True
+        for entry in streamed_entries(home / "bindings"):
+            if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            record, _ = read_binding(home, entry.stem, restore=False)
+            if record is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            child, _ = bound_child(home, profile, record, inspect=True)
+            with state_lock(child, entry.stem) as (state, _):
+                reasons = drain_reasons(state) if state is not None else []
+                if record["enrolled"] != (state is not None):
                     raise NativeError("SESSION_BINDING_INVALID")
-                sessions.append(dict(workspace=child.name, **session))
-                if len(sessions) > MAX_DRAIN_SESSIONS:
-                    raise NativeError("DRAIN_SESSION_LIMIT")
+            hot_count += 1
+            if reasons:
+                unresolved_count += 1
+                quiescent = False
+                if len(sessions) < MAX_DRAIN_SESSIONS:
+                    sessions.append(
+                        dict(
+                            session=entry.stem,
+                            workspace=record["workspace"],
+                            unresolved=reasons,
+                        )
+                    )
+        archive = home / "archive"
+        if archive.exists() or archive.is_symlink():
+            for directory in streamed_entries(archive):
+                session = directory.name
+                if HEX.fullmatch(session) is None:
+                    raise NativeError("RETENTION_ARCHIVE_INVALID")
+                index = archive_index(home, session)
+                current = archived_record(home, session, index)
+                bound_child(home, profile, current["binding"], inspect=True)
+                read_binding(home, session, restore=False)
+                for entry in streamed_entries(directory):
+                    if entry.name == "index.json":
+                        continue
+                    if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                        raise NativeError("RETENTION_ARCHIVE_INVALID")
+                    validate_archive(
+                        json.loads(private_read(entry)), session, entry.stem
+                    )
+                if index["location"] == "archive":
+                    archive_count += 1
+        locators = home / "retained-bindings"
+        if locators.exists() or locators.is_symlink():
+            for entry in streamed_entries(locators):
+                if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                    raise NativeError("RETENTION_BINDING_INVALID")
+                index = archive_index(home, entry.stem)
+                if index is None:
+                    raise NativeError("RETENTION_ARCHIVE_MISSING")
+                retained_locator(
+                    home, entry.stem, archived_record(home, entry.stem, index)
+                )
+        for child in streamed_entries(home / "workspaces"):
+            if HEX.fullmatch(child.name) is None:
+                raise NativeError("CHILD_PROFILE_INVALID")
+            child, descriptor = load_profile(child, inspect=True)
+            validate_child(home, profile, child, descriptor)
+            owner = inspect_child_records(home, child)
+            workspace_count += 1
+            if owner is not None:
+                record, _ = read_hot_binding(home, owner["session"])
+                if record is None or record["workspace"] != child.name:
+                    raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
+                quiescent = False
+            if len(workspaces) < MAX_DRAIN_SESSIONS:
+                workspaces.append(dict(workspace=child.name, active_request=owner))
         return dict(
             status="inspected",
-            quiescent=all(w["quiescent"] for w in workspaces),
-            workspace_count=len(workspaces),
-            session_count=len(sessions),
+            complete=True,
+            quiescent=quiescent,
+            workspace_count=workspace_count,
+            session_count=hot_count + archive_count,
+            hot_session_count=hot_count,
+            archived_session_count=archive_count,
+            unresolved_session_count=unresolved_count,
             sessions=sessions,
             workspaces=workspaces,
+            details_truncated=workspace_count > len(workspaces)
+            or unresolved_count > len(sessions),
             active_request=None,
         )
 
@@ -860,7 +1330,11 @@ def state_lock(home, key):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         path = directory / (key + ".json")
-        state = json.loads(private_read(path)) if path.exists() else None
+        state = (
+            json.loads(private_read(path))
+            if path.exists() or path.is_symlink()
+            else None
+        )
         if state is not None and (
             not isinstance(state, dict)
             or state.get("schemaVersion") != 1
@@ -2338,6 +2812,23 @@ def main():
         "--reason", choices=("no_meaningful_work", "user_requested_no_capture")
     )
     args, extra = parser.parse_known_args()
+    with ExitStack() as locks:
+        return dispatch_command(args, extra, locks)
+
+
+def status_result(state, owner):
+    result = json.loads(encode(state)) if state else {"status": "session_unavailable"}
+    result.pop("session_request", None)
+    for pending in result.get("commits", {}).values():
+        pending.pop("request", None)
+        pending.pop("native_arguments", None)
+    result["gate"] = owner
+    return result
+
+
+def dispatch_command(args, extra, locks):
+    if extra and args.operation not in ("run", "capabilities", "attach", "create"):
+        raise NativeError("ARGUMENTS_INVALID")
     if args.operation == "capabilities":
         if extra or not args.release_sha256 or args.home or args.host:
             raise NativeError("CAPABILITIES_ARGUMENTS_INVALID")
@@ -2358,18 +2849,49 @@ def main():
     else:
         if not args.home:
             raise NativeError("HOME_REQUIRED")
-        home, profile = load_profile(args.home)
+        inspection = args.operation in (
+            "profile-status",
+            "drain-status",
+            "status",
+            "request",
+        )
+        home, profile = load_profile(args.home, inspect=inspection)
+        if "parentHome" in profile and args.operation != "profile-status":
+            home, profile = load_profile(
+                profile["parentHome"], parent_only=True, inspect=inspection
+            )
         scope = capture_scope(profile)
         if scope == "user" and args.operation not in (
             "profile-status",
             "drain-status",
             "hook",
         ):
-            with gate_lock(home, nonblocking=True):
-                record, _ = read_binding(home, args.session)
-                if record is None:
-                    raise NativeError("SESSION_BINDING_REQUIRED")
-                home, profile = bound_child(home, profile, record)
+            locks.enter_context(gate_lock(home, nonblocking=True))
+            if inspection and (home / "retention-journal.json").exists():
+                raise NativeError("RETENTION_JOURNAL_PENDING")
+            if not inspection:
+                reconcile_retention(home)
+            record, _ = read_binding(home, args.session, restore=not inspection)
+            if record is None:
+                raise NativeError("SESSION_BINDING_REQUIRED")
+            index = archive_index(home, args.session)
+            child, descriptor = bound_child(home, profile, record, inspect=inspection)
+            if inspection and index is not None and index["location"] == "archive":
+                if project_mode(descriptor) == "directory" and (
+                    args.commit is not None or args.snapshot is not None
+                ):
+                    raise NativeError("DIRECTORY_SESSION_ONLY")
+                state = archived_record(home, args.session, index)["state"]
+                result = (
+                    (state or {}).get(
+                        "session_request", {"status": "request_unavailable"}
+                    )
+                    if args.operation == "request"
+                    else status_result(state, None)
+                )
+                print(json.dumps(result))
+                return 0
+            home, profile = child, descriptor
         mode = project_mode(profile)
         if mode == "directory" and (
             args.operation
@@ -2465,16 +2987,7 @@ def main():
                         "session_request", {"status": "request_unavailable"}
                     )
                 else:
-                    result = (
-                        json.loads(encode(state))
-                        if state
-                        else {"status": "session_unavailable"}
-                    )
-                    result.pop("session_request", None)
-                    for pending in result.get("commits", {}).values():
-                        pending.pop("request", None)
-                        pending.pop("native_arguments", None)
-                    result["gate"] = active_request(home)
+                    result = status_result(state, active_request(home))
         elif args.operation == "disable":
             if profile["host"] == "claude-plugin":
                 raise NativeError("PLUGIN_OWNERSHIP_MANAGED_EXTERNALLY")

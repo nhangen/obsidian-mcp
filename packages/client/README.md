@@ -359,7 +359,9 @@ The plugin must close its ownership/admission barrier **before** draining and ke
 it closed through owner or profile remapping. Drain is an observation, not a
 writer lease. It acquires the gate and every discovered session lock without
 waiting, refuses contention, corrupt state, missing active-owner state, unknown
-state files and more than 256 sessions, and never repairs or deletes evidence.
+state files and, for standalone project profiles, more than 256 sessions. User
+parents use the streamed retained-state inspection described below. Drain never
+repairs or deletes evidence.
 `quiescent: true` requires no active request, pending session disposition,
 in-flight/recovery state, snapshots, pending/uncaptured commits or unresolved
 snapshot-resolution evidence. A nonzero exit is never permission to hand off.
@@ -410,28 +412,49 @@ bound child. Hook recovery guidance also identifies the child directly.
 
 Parent `drain-status` inspects every child and binding under a nonblocking parent
 lock. It retains the existing `quiescent`, `session_count`, and `sessions` fields,
-adds `workspace_count` and per-child `workspaces`, and annotates sessions with
-their workspace hash. It refuses unknown files, tampered or missing children,
-invalid bindings, missing enrolled session state, contention, or more than 256
-children, bindings, or total sessions. Pending work in any child prevents a clean
-drain. The plugin must keep its admission barrier closed during drain and handoff.
+adds `complete`, `workspace_count`, `hot_session_count`, `archived_session_count`,
+and `unresolved_session_count`. It streams all retained records one bounded record
+at a time, returns at most 256 unresolved-session details and workspace summaries,
+and marks truncated details separately from complete inspection. History has no
+lifetime session or workspace admission limit. Busy locks, missing or tampered
+evidence, invalid bindings, and pending work prevent a clean drain. An unfinished
+retention journal returns `complete: false, quiescent: false`; a timeout or failure
+is never permission to hand off. Inspection time grows with retained history, but
+memory and response details remain bounded. The plugin must keep its admission
+barrier closed during drain and handoff.
 
-Bindings and child evidence are retained indefinitely; the 256-binding admission
-limit is cumulative across the parent's lifetime, not a count of active sessions.
-At that limit, new sessions receive advisory diagnostics without automatic
-capture; existing bound sessions can continue. There is no built-in pruning or
-automatic rollover. A fresh parent and explicit plugin ownership handoff can
-provide a new admission budget only after the old parent successfully drains;
-retain the old private profile for its evidence. Unresolved work or a failed drain
-still prevents handoff. Deleting bindings to clear the limit is not recovery.
+On valid prompts, verified terminal sessions move automatically out of hot
+admission accounting. Only active or unresolved work consumes the 256-session
+budget. New capture pauses advisably at that active-work limit; resolving existing
+work releases capacity without new configuration. SessionStart inspects an
+existing session but never creates enrollment; the first valid prompt enrolls it.
+
+Terminal binding/state pairs are preserved in private immutable digest-addressed
+records under `archive/<session-hash>`, with a current location/generation index
+and a durable retained-binding locator. A fsynced `retention-journal.json` freezes
+the transition. Complete archive publication precedes removal of hot binding and
+state files. Next admission or a mutating session operation reconciles an
+interrupted transition only when identities, generations, and payloads match;
+conflicts fail closed. State and gate lock files are never moved or deleted.
+Historical empty locks consume no admission capacity, but busy locks refuse drain.
+
+Resuming an archived session restores only its exact validated binding and state;
+missing or conflicting evidence never falls back to fresh enrollment. Earlier
+archive generations remain retained. Read-only status, request, profile validation,
+and drain validate descriptors, parent identity, release pins, and retained state
+without requiring a retired workspace to exist. Execution still checks the live
+project. Child creation stages its complete private descriptor and empty state
+directory outside `workspaces` before atomic publication; unambiguous interrupted
+staging resumes, while conflicting leftovers remain preserved for inspection.
 
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
 capture for that session instead of erasing the old turn or attributing new work
-to it. Unrelated Bash commands proceed, automatic capture MCP calls are denied
-while paused, and Stop reports advisory context. Inspect and resolve the original
-child state using the existing recovery commands, then submit a new prompt to
-resume capture. This deliberately retains one pending turn rather than adding a
+to it. Unrelated Bash commands proceed and Stop reports advisory context. Frozen
+requests and matching late receipts still reach the existing validators: partial
+or ambiguous writes need the existing authoritative `retry` review, and changed
+payloads or unprepared new captures remain denied. Resolve the original state,
+then submit a new prompt to resume capture. This retains one pending turn rather than adding a
 multi-turn queue. Enrolled, unpaused pending work keeps the existing bounded Stop
 recovery behavior. Missing enrollment never creates a Stop recovery loop.
 
@@ -507,3 +530,14 @@ The additional user-scope pair fixture attaches one parent, activates the plugin
 user owner, opens fresh Git and nonGit directories without enrollment, observes
 exact simulated session receipts through the real dispatcher, and verifies both
 saved children and an aggregate clean drain.
+
+The source fixture suite also covers 258 terminal sessions, exact archive resume,
+interrupted archive/restore publication, digest conflicts, removed workspaces,
+and retained busy locks. To run the longer production-threshold CLI acceptance
+for 257 resolved, removed workspaces under one parent:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OBSIDIAN_MCP_TEST_LONG_HISTORY=1 \
+  python3 tests/obsidian-mcp-native.test.py \
+  UserCaptureTest.test_cli_accepts_257_retired_workspaces_without_new_parent
+```
