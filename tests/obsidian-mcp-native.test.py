@@ -3566,6 +3566,261 @@ class UserCaptureTest(NativeCaptureFixture):
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
 
+    def unpublished_publication(self, phase):
+        self.configure()
+        if phase == "journal":
+            original = self.terminal_session()
+            frozen = json.loads(original.read_text())
+            self.terminal_session("terminal-B")
+            event = self.event("SessionStart", source="resume")
+        elif phase == "paused":
+            self.hook("UserPromptSubmit", prompt="Original pending work")
+            original = self.state_paths()[0]
+            frozen = json.loads(original.read_text())
+            self.transcript.write_text(
+                self.transcript.read_text() + '{"type":"user","uuid":"pause"}\n'
+            )
+            event = self.event("UserPromptSubmit", prompt="Next ordinary prompt")
+        else:
+            original = None
+            frozen = None
+            event = self.event("UserPromptSubmit", prompt="Original")
+        program = """
+import json, os, sys, types
+from pathlib import Path
+script, home, phase, event = sys.argv[1:]
+module = types.ModuleType("unpublished_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+original = module.os.replace
+def crash(source, target):
+    target = Path(target)
+    wanted = (
+        (phase == "journal" and target.name == "retention-journal.json")
+        or (phase == "descriptor" and target.name == "capture-profile.json" and target.parent.parent.name == "provisioning")
+        or (phase == "state" and target.parent.name == "capture-state" and target.suffix == ".json")
+        or (phase in ("binding", "enrolled") and target.parent.name == "bindings" and json.loads(Path(source).read_bytes())["enrolled"] == (phase == "enrolled"))
+        or (phase == "paused" and target.parent.name == "bindings" and json.loads(Path(source).read_bytes())["paused"] is True)
+    )
+    if wanted:
+        os._exit(73)
+    return original(source, target)
+module.os.replace = crash
+profile_home, descriptor = module.load_profile(home)
+module.hook(profile_home, descriptor, json.loads(event))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                phase,
+                json.dumps(event),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 73, result.stderr)
+        (temporary,) = self.home.rglob(".capture-*")
+        return temporary, original, frozen
+
+    def test_unpublished_first_publications_recover_before_unrelated_transition(self):
+        for phase in (
+            "journal",
+            "descriptor",
+            "binding",
+            "state",
+            "enrolled",
+            "paused",
+        ):
+            with self.subTest(phase=phase):
+                self.home = self.directory / phase
+                temporary, original, frozen = self.unpublished_publication(phase)
+                before = {
+                    str(p): p.read_bytes()
+                    for p in self.home.rglob("*")
+                    if p.is_file() and p.suffix != ".lock"
+                }
+                inspected = self.cli("drain-status", "--home", str(self.home))
+                self.assertTrue(
+                    inspected.returncode != 0
+                    or not json.loads(inspected.stdout)["complete"],
+                    inspected.stdout,
+                )
+                self.assertEqual(
+                    {
+                        str(p): p.read_bytes()
+                        for p in self.home.rglob("*")
+                        if p.is_file() and p.suffix != ".lock"
+                    },
+                    before,
+                )
+                output = self.hook(
+                    "UserPromptSubmit",
+                    session_id="new-C" if phase == "journal" else "session-1",
+                    prompt="Original",
+                )
+                if phase == "paused":
+                    self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+                    self.assertEqual(json.loads(original.read_text()), frozen)
+                    independent = self.directory / "after-paused"
+                    independent.mkdir()
+                    admitted = self.hook(
+                        "UserPromptSubmit",
+                        cwd=str(independent),
+                        session_id="independent",
+                        prompt="Other work",
+                    )
+                    self.assertIn("obsidian_keeper_save", json.dumps(admitted))
+                else:
+                    self.assertIn("obsidian_keeper_save", json.dumps(output))
+                self.assertEqual(list(self.home.rglob(".capture-*")), [])
+                if phase == "journal":
+                    archive = self.home / "archive" / original.stem
+                    generation = json.loads((archive / "index.json").read_text())[
+                        "generation"
+                    ]
+                    self.assertEqual(
+                        json.loads((archive / (generation + ".json")).read_text())[
+                            "state"
+                        ],
+                        frozen,
+                    )
+                else:
+                    (path,) = self.state_paths()
+                    state = json.loads(path.read_text())
+                    self.assertEqual(state["disposition"], "pending")
+                    self.assertEqual(state["commits"], {})
+                    binding = json.loads(
+                        (self.home / "bindings" / (path.stem + ".json")).read_text()
+                    )
+                    self.assertTrue(binding["enrolled"])
+                self.assertTrue(self.drain()["complete"])
+
+    def test_unpublished_publication_unsafe_or_conflicting_bytes_remain_preserved(self):
+        for phase in (
+            "journal",
+            "descriptor",
+            "binding",
+            "state",
+            "enrolled",
+            "paused",
+        ):
+            for damage in ("partial", "conflict", "symlink", "hardlink"):
+                with self.subTest(phase=phase, damage=damage):
+                    self.home = self.directory / (phase + "-" + damage)
+                    temporary, _, _ = self.unpublished_publication(phase)
+                    if damage == "partial":
+                        temporary.write_bytes(b'{"schemaVersion":')
+                    elif damage == "conflict":
+                        value = json.loads(temporary.read_bytes())
+                        if phase == "journal":
+                            value["before"]["generation"] = "f" * 64
+                        elif phase == "descriptor":
+                            value["folder"] = "Conflicting"
+                        elif phase in ("binding", "enrolled"):
+                            value["paused"] = True
+                        elif phase == "paused":
+                            value["session"] = "f" * 64
+                        else:
+                            value["session_save"]["folder"] = "Conflicting"
+                        temporary.write_bytes(
+                            json.dumps(
+                                value, sort_keys=True, separators=(",", ":")
+                            ).encode()
+                        )
+                    else:
+                        evidence = self.directory / (phase + "-" + damage + "-evidence")
+                        temporary.rename(evidence)
+                        if damage == "symlink":
+                            temporary.symlink_to(evidence)
+                        else:
+                            os.link(evidence, temporary)
+                    preserved = temporary.read_bytes()
+                    output = self.hook(
+                        "UserPromptSubmit",
+                        session_id="new-C" if phase == "journal" else "session-1",
+                        prompt="Original",
+                    )
+                    self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+                    self.assertEqual(temporary.read_bytes(), preserved)
+                    inspected = self.cli("drain-status", "--home", str(self.home))
+                    self.assertTrue(
+                        inspected.returncode != 0
+                        or not json.loads(inspected.stdout)["quiescent"]
+                    )
+
+    def test_recovered_initial_state_preserves_old_prompt_and_refuses_established_state_replacement(
+        self,
+    ):
+        for established in (False, True):
+            with self.subTest(established=established):
+                self.home = self.directory / (
+                    "established" if established else "pending"
+                )
+                temporary, _, _ = self.unpublished_publication("state")
+                intended = json.loads(temporary.read_bytes())
+                if established:
+                    held = self.directory / "preserved-initial-intent"
+                    temporary.rename(held)
+                    self.hook("UserPromptSubmit", prompt="Established different work")
+                    held.rename(temporary)
+                (path,) = (
+                    self.state_paths()
+                    if established
+                    else list((self.home / "workspaces").glob("*/capture-state/*.lock"))
+                )
+                path = path.with_suffix(".json")
+                frozen = path.read_bytes() if established else None
+                self.transcript.write_text(
+                    self.transcript.read_text()
+                    + '{"type":"user","uuid":"changed-prompt"}\n'
+                )
+                output = self.hook("UserPromptSubmit", prompt="New unrelated prompt")
+                self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+                if established:
+                    self.assertEqual(path.read_bytes(), frozen)
+                    self.assertTrue(temporary.exists())
+                else:
+                    self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+                    self.assertEqual(json.loads(path.read_bytes()), intended)
+                    self.assertFalse(temporary.exists())
+                    skipped = self.cli(
+                        "skip",
+                        "--home",
+                        str(self.home),
+                        "--session",
+                        path.stem,
+                        "--turn",
+                        intended["turn"],
+                        "--reason",
+                        "no_meaningful_work",
+                    )
+                    self.assertEqual(skipped.returncode, 0, skipped.stderr)
+                    resumed = self.hook(
+                        "UserPromptSubmit", prompt="New unrelated prompt"
+                    )
+                    self.assertIn("obsidian_keeper_save", json.dumps(resumed))
+
+    def test_binding_publication_cannot_bypass_missing_retained_ancestry(self):
+        temporary, original, _ = self.unpublished_publication("paused")
+        binding_path = self.home / "bindings" / (original.stem + ".json")
+        before = json.loads(binding_path.read_bytes())
+        before["archiveGeneration"] = "f" * 64
+        candidate = json.loads(temporary.read_bytes())
+        candidate["archiveGeneration"] = "f" * 64
+        native = self.load_native()
+        binding_path.write_bytes(native.encode(before))
+        temporary.write_bytes(native.encode(candidate))
+        output = self.hook("UserPromptSubmit", prompt="Next ordinary prompt")
+        self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+        self.assertEqual(json.loads(binding_path.read_bytes()), before)
+        self.assertTrue(temporary.exists())
+
     def test_busy_executor_does_not_block_other_workspace_commit_or_admission(self):
         self.configure()
         commands = []

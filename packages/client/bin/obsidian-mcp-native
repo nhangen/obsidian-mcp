@@ -809,14 +809,7 @@ def clean_retention_temporaries(expected):
         sync_directory(directory)
 
 
-def reconcile_retention(home):
-    journal = home / "retention-journal.json"
-    try:
-        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
-    except FileNotFoundError:
-        if journal.is_symlink():
-            raise NativeError("RETENTION_JOURNAL_INVALID") from None
-        return
+def validate_retention_journal(home, value, *, unpublished=False):
     if (
         not isinstance(value, dict)
         or set(value) != {"schemaVersion", "operation", "record", "before"}
@@ -827,7 +820,7 @@ def reconcile_retention(home):
     envelope = value["record"]
     session = (
         envelope.get("binding", {}).get("session")
-        if isinstance(envelope, dict)
+        if isinstance(envelope, dict) and isinstance(envelope.get("binding"), dict)
         else None
     )
     if not isinstance(session, str) or HEX.fullmatch(session) is None:
@@ -848,11 +841,9 @@ def reconcile_retention(home):
     _, parent = load_profile(home, inspect=True)
     validate_child(home, parent, child, descriptor)
     archive = home / "archive"
-    archive.mkdir(mode=0o700, exist_ok=True)
-    private_directory(archive)
+    if archive.exists() or archive.is_symlink():
+        private_directory(archive)
     directory = archive / session
-    directory.mkdir(mode=0o700, exist_ok=True)
-    private_directory(directory)
     generation = envelope["generation"]
     target = directory / (generation + ".json")
     try:
@@ -867,6 +858,16 @@ def reconcile_retention(home):
     )
     if index != value["before"] and index != after:
         raise NativeError("RETENTION_CONFLICT")
+    if unpublished and index != before:
+        raise NativeError("RETENTION_CONFLICT")
+    if value["operation"] == "restore":
+        if before != dict(generation=generation, location="archive"):
+            raise NativeError("RETENTION_JOURNAL_INVALID")
+    elif before is None:
+        if "archiveGeneration" in binding:
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+    elif before["location"] != "hot":
+        raise NativeError("RETENTION_JOURNAL_INVALID")
     if before is not None:
         archived_record(home, session, before)
         if (
@@ -874,6 +875,98 @@ def reconcile_retention(home):
             and binding.get("archiveGeneration") != before["generation"]
         ):
             raise NativeError("RETENTION_LINEAGE_INVALID")
+    with state_lock(child, session, create=False) as (state, _):
+        hot, _ = read_hot_binding(home, session)
+        if value["operation"] == "archive":
+            if (active_request(child) or {}).get("session") == session or (
+                (hot is not None and hot != binding)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index != after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+        elif (
+            (hot is not None and hot != dict(binding, archiveGeneration=generation))
+            or (state is not None and state != envelope["state"])
+            or (
+                index == after
+                and (hot is None or (binding["enrolled"] and state is None))
+            )
+            or (unpublished and (hot is not None or state is not None))
+        ):
+            raise NativeError("RETENTION_CONFLICT")
+        if target.exists() or target.is_symlink() or value["operation"] == "restore":
+            if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
+                raise NativeError("RETENTION_CONFLICT")
+    return envelope, before, child, directory, index, after
+
+
+def publication_candidates(directory, *, limit=LIMIT):
+    for entry in streamed_entries(directory):
+        if entry.name.startswith(".capture-"):
+            body = private_read(entry, limit=limit)
+            value = json.loads(body)
+            if not isinstance(value, dict) or encode(value) != body:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            yield entry, body, value
+
+
+def select_publication(directory, selector, *, limit=LIMIT):
+    selected = None
+    for candidate in publication_candidates(directory, limit=limit):
+        if selector(candidate[2]):
+            if selected is not None and selected[1] != candidate[1]:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            selected = candidate
+    return selected
+
+
+def publish_candidate(candidate, target, *, limit=LIMIT, before=None):
+    entry, body, _ = candidate
+    if private_read(entry, limit=limit) != body:
+        raise NativeError("PUBLICATION_AMBIGUOUS")
+    if target.exists() or target.is_symlink():
+        existing = private_read(target, limit=limit)
+        if existing == body:
+            entry.unlink()
+        elif before is not None and existing == before:
+            os.replace(entry, target)
+        else:
+            raise NativeError("PUBLICATION_CONFLICT")
+    else:
+        os.replace(entry, target)
+    sync_directory(target.parent)
+
+
+def reconcile_retention(home):
+    journal = home / "retention-journal.json"
+    try:
+        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
+    except FileNotFoundError:
+        if journal.is_symlink():
+            raise NativeError("RETENTION_JOURNAL_INVALID") from None
+        candidate = select_publication(home, lambda value: True, limit=RETENTION_LIMIT)
+        if candidate is None:
+            return
+        validate_retention_journal(home, candidate[2], unpublished=True)
+        publish_candidate(candidate, journal, limit=RETENTION_LIMIT)
+        value = candidate[2]
+    envelope, before, child, directory, index, after = validate_retention_journal(
+        home, value
+    )
+    for _, body, _ in publication_candidates(home, limit=RETENTION_LIMIT):
+        if body != encode(value):
+            raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
+    binding = envelope["binding"]
+    session, generation = binding["session"], envelope["generation"]
+    archive = home / "archive"
+    archive.mkdir(mode=0o700, exist_ok=True)
+    private_directory(archive)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    target = directory / (generation + ".json")
     binding_path = home / "bindings" / (session + ".json")
     state_path = child / "capture-state" / (session + ".json")
     with state_lock(child, session) as (state, _):
@@ -938,15 +1031,16 @@ def reconcile_retention(home):
 
 
 def transition_retention(home, operation, record, before):
+    reconcile_retention(home)
     if (home / "retention-journal.json").exists() or (
         home / "retention-journal.json"
     ).is_symlink():
         raise NativeError("RETENTION_JOURNAL_PENDING")
+    value = dict(schemaVersion=1, operation=operation, record=record, before=before)
+    validate_retention_journal(home, value, unpublished=True)
     atomic_write(
         home / "retention-journal.json",
-        encode(
-            dict(schemaVersion=1, operation=operation, record=record, before=before)
-        ),
+        encode(value),
         limit=RETENTION_LIMIT,
     )
     reconcile_retention(home)
@@ -959,6 +1053,12 @@ def retire_terminal_sessions(home, profile):
             raise NativeError("SESSION_BINDING_INVALID")
         binding, _ = read_binding(home, entry.stem, restore=False)
         child, _ = bound_child(home, profile, binding, inspect=True)
+        if any(
+            p.name.startswith(".capture-")
+            for p in streamed_entries(checked_state_directory(child))
+        ):
+            active += 1
+            continue
         try:
             with state_lock(child, entry.stem) as (state, _):
                 if (state is not None and drain_reasons(state)) or (
@@ -1071,10 +1171,18 @@ def provision_child(home, profile, project, mode):
     (stage / "capture-state").mkdir(mode=0o700, exist_ok=True)
     checked_state_directory(stage)
     if any((stage / "capture-state").iterdir()) or any(
-        p.name not in ("capture-state", "capture-profile.json") for p in stage.iterdir()
+        p.name not in ("capture-state", "capture-profile.json")
+        and not p.name.startswith(".capture-")
+        for p in stage.iterdir()
     ):
         raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
     descriptor = stage / "capture-profile.json"
+    candidate = select_publication(stage, lambda value: True)
+    if candidate is not None:
+        if candidate[1] != encode(expected):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        publish_candidate(candidate, descriptor)
+        clean_retention_temporaries({stage: (encode(expected),)})
     if descriptor.exists() or descriptor.is_symlink():
         if json.loads(private_read(descriptor)) != expected:
             raise NativeError("CHILD_PROFILE_INVALID")
@@ -1088,6 +1196,109 @@ def provision_child(home, profile, project, mode):
         finally:
             os.close(fd)
     return child
+
+
+def initial_session_state(profile, session, turn, transcript=None, *, date=None):
+    state = dict(
+        schemaVersion=1,
+        python=profile["python"],
+        session=session,
+        turn=turn,
+        disposition="pending",
+        session_save=session_plan(profile, session, turn, date=date),
+        snapshots={},
+        commits={},
+    )
+    if transcript is not None:
+        state["claude_transcript"] = transcript
+    return state
+
+
+def validate_initial_state(profile, session, state):
+    if not isinstance(state, dict) or not isinstance(state.get("session_save"), dict):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+    turn, transcript = state.get("turn"), state.get("claude_transcript")
+    date = state.get("session_save", {}).get("date")
+    if (
+        not isinstance(turn, str)
+        or HEX.fullmatch(turn) is None
+        or not isinstance(transcript, str)
+        or HEX.fullmatch(transcript) is None
+        or not isinstance(date, str)
+        or datetime.date.fromisoformat(date).isoformat() != date
+        or state != initial_session_state(profile, session, turn, transcript, date=date)
+    ):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+
+
+def reconcile_enrollment(home, profile):
+    directory = home / "bindings"
+    candidate = select_publication(directory, lambda value: True)
+    if candidate is not None:
+        record = candidate[2]
+        session = record.get("session")
+        current, path = read_hot_binding(home, session)
+        validate_binding(record, session)
+        child = home / "workspaces" / record["workspace"]
+        _, descriptor = load_profile(child, inspect=True)
+        validate_child(home, profile, child, descriptor)
+        if descriptor != child_profile(
+            home, profile, record["project"], record["projectMode"]
+        ):
+            raise NativeError("SESSION_BINDING_INVALID")
+        with state_lock(child, session) as (state, _):
+            if read_binding(home, session, restore=False)[0] != current:
+                raise NativeError("PUBLICATION_CONFLICT")
+            if current != record:
+                if current is None:
+                    if (
+                        archive_index(home, session) is not None
+                        or "archiveGeneration" in record
+                    ):
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    expected = dict(record, enrolled=False, paused=False)
+                    if state is not None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                elif (
+                    record == dict(current, paused=True) and current["paused"] is False
+                ):
+                    if current["enrolled"] and state is None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    if state is not None:
+                        drain_reasons(state)
+                    expected = dict(current, paused=True)
+                elif not current["enrolled"] or current["paused"]:
+                    validate_initial_state(descriptor, session, state)
+                    expected = dict(current, enrolled=True, paused=False)
+                else:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                if record != expected:
+                    raise NativeError("PUBLICATION_CONFLICT")
+            publish_candidate(
+                candidate, path, before=encode(current) if current is not None else None
+            )
+            clean_retention_temporaries({directory: (candidate[1],)})
+    for path in streamed_entries(directory):
+        if path.suffix != ".json" or HEX.fullmatch(path.stem) is None:
+            raise NativeError("SESSION_BINDING_INVALID")
+        record, _ = read_hot_binding(home, path.stem)
+        if record["enrolled"] or record["paused"]:
+            continue
+        if archive_index(home, path.stem) is not None:
+            continue
+        child, descriptor = bound_child(home, profile, record, inspect=True)
+        with state_lock(child, path.stem) as (state, state_path):
+            candidate = select_publication(state_path.parent, lambda value: True)
+            if candidate is not None:
+                validate_initial_state(descriptor, path.stem, candidate[2])
+                if state is not None and state != candidate[2]:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                publish_candidate(candidate, state_path)
+                clean_retention_temporaries({state_path.parent: (candidate[1],)})
+                state = candidate[2]
+            if state is not None:
+                validate_initial_state(descriptor, path.stem, state)
+                atomic_write(path, encode(dict(record, enrolled=True)))
 
 
 def retained_capture_event(home, event):
@@ -1123,6 +1334,7 @@ def user_hook(home, profile, event):
         with gate_lock(home, nonblocking=True):
             check_user_state(home)
             reconcile_retention(home)
+            reconcile_enrollment(home, profile)
             session = digest(identifier(event.get("session_id")).encode())
             hot, _ = read_hot_binding(home, session)
             index = archive_index(home, session)
@@ -1174,6 +1386,11 @@ def user_hook(home, profile, event):
                 bound_child(home, profile, record)
                 atomic_write(path, encode(record))
             child, descriptor = bound_child(home, profile, record)
+            if any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
             if (
                 record["paused"]
                 and event.get("hook_event_name") != "UserPromptSubmit"
@@ -1283,9 +1500,36 @@ def inspect_provisioning(home, profile):
                 raise NativeError("CHILD_PROFILE_INVALID")
 
 
+def unpublished_user_state(home):
+    def pending(directory):
+        return any(
+            entry.name.startswith(".capture-") for entry in streamed_entries(directory)
+        )
+
+    if pending(home) or pending(home / "bindings"):
+        return True
+    for child in streamed_entries(home / "workspaces"):
+        private_directory(child)
+        if pending(checked_state_directory(child)):
+            return True
+    stages = home / "provisioning"
+    if stages.exists() or stages.is_symlink():
+        for stage in streamed_entries(stages):
+            if pending(stage):
+                return True
+    return False
+
+
 def user_drain_status(home, profile):
     with gate_lock(home, nonblocking=True):
         check_user_state(home)
+        if unpublished_user_state(home):
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="PUBLICATION_PENDING",
+            )
         if (home / "retention-journal.json").exists() or (
             home / "retention-journal.json"
         ).is_symlink():
@@ -1401,12 +1645,14 @@ def checked_state_directory(home):
 
 
 @contextmanager
-def state_lock(home, key):
+def state_lock(home, key, *, create=True):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
     fd = os.open(
-        directory / (key + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        directory / (key + ".lock"),
+        (os.O_CREAT if create else 0) | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1777,8 +2023,8 @@ def producer_event(root, before):
     return event, consumer["run_producer"](BUNDLE, event, sys.executable)
 
 
-def session_plan(profile, session, turn):
-    date = datetime.date.today().isoformat()
+def session_plan(profile, session, turn, *, date=None):
+    date = date or datetime.date.today().isoformat()
     title = "Session " + digest((session + turn).encode())[:20]
     folder = profile["folder"]
     return dict(
@@ -2285,18 +2531,16 @@ def engine_hook(home, profile, event):
                     and drain_reasons(state)
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
-                state = dict(
-                    schemaVersion=1,
-                    python=profile["python"],
-                    session=session,
-                    turn=turn,
-                    disposition="pending",
-                    session_save=session_plan(profile, session, turn),
-                    snapshots={},
-                    commits={},
+                state = initial_session_state(
+                    profile,
+                    session,
+                    turn,
+                    (
+                        event["claude_transcript"]
+                        if profile["host"] == "claude-plugin"
+                        else None
+                    ),
                 )
-                if profile["host"] == "claude-plugin":
-                    state["claude_transcript"] = event["claude_transcript"]
             atomic_write(path, encode(state))
             return context(
                 name,
@@ -3018,15 +3262,23 @@ def dispatch_command(args, extra, locks):
             "hook",
         ):
             locks.enter_context(gate_lock(home, nonblocking=True))
+            if inspection and unpublished_user_state(home):
+                raise NativeError("PUBLICATION_PENDING")
             if inspection and (home / "retention-journal.json").exists():
                 raise NativeError("RETENTION_JOURNAL_PENDING")
             if not inspection:
                 reconcile_retention(home)
+                reconcile_enrollment(home, profile)
             record, _ = read_binding(home, args.session, restore=not inspection)
             if record is None:
                 raise NativeError("SESSION_BINDING_REQUIRED")
             index = archive_index(home, args.session)
             child, descriptor = bound_child(home, profile, record, inspect=inspection)
+            if not inspection and any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
             if inspection and index is not None and index["location"] == "archive":
                 if project_mode(descriptor) == "directory" and (
                     args.commit is not None or args.snapshot is not None
