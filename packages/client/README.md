@@ -459,6 +459,13 @@ stays incomplete. Archive/journal envelopes have a separate fixed serialization
 bound allowing both accepted components and canonical-encoding overhead; active
 state and hook input retain their 262,144-byte limit. Payloads are never truncated.
 
+Recovery also covers a fully written private intent left before journal publication.
+An unpublished journal must pass the same identity, ancestry, index, binding, and
+state checks as a published journal before promotion, ahead of another transition.
+Partial, conflicting, symlinked, and hardlinked intents remain preserved and fail
+closed. Inspection does not recover or delete intents and never reports complete
+drain while any publication remains pending.
+
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
 capture for that session instead of erasing the old turn or attributing new work

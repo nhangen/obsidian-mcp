@@ -799,14 +799,7 @@ def clean_retention_temporaries(expected):
         sync_directory(directory)
 
 
-def reconcile_retention(home):
-    journal = home / "retention-journal.json"
-    try:
-        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
-    except FileNotFoundError:
-        if journal.is_symlink():
-            raise NativeError("RETENTION_JOURNAL_INVALID") from None
-        return
+def validate_retention_journal(home, value, *, unpublished=False):
     if (
         not isinstance(value, dict)
         or set(value) != {"schemaVersion", "operation", "record", "before"}
@@ -817,7 +810,7 @@ def reconcile_retention(home):
     envelope = value["record"]
     session = (
         envelope.get("binding", {}).get("session")
-        if isinstance(envelope, dict)
+        if isinstance(envelope, dict) and isinstance(envelope.get("binding"), dict)
         else None
     )
     if not isinstance(session, str) or HEX.fullmatch(session) is None:
@@ -838,11 +831,9 @@ def reconcile_retention(home):
     _, parent = load_profile(home, inspect=True)
     validate_child(home, parent, child, descriptor)
     archive = home / "archive"
-    archive.mkdir(mode=0o700, exist_ok=True)
-    private_directory(archive)
+    if archive.exists() or archive.is_symlink():
+        private_directory(archive)
     directory = archive / session
-    directory.mkdir(mode=0o700, exist_ok=True)
-    private_directory(directory)
     generation = envelope["generation"]
     target = directory / (generation + ".json")
     try:
@@ -857,6 +848,16 @@ def reconcile_retention(home):
     )
     if index != value["before"] and index != after:
         raise NativeError("RETENTION_CONFLICT")
+    if unpublished and index != before:
+        raise NativeError("RETENTION_CONFLICT")
+    if value["operation"] == "restore":
+        if before != dict(generation=generation, location="archive"):
+            raise NativeError("RETENTION_JOURNAL_INVALID")
+    elif before is None:
+        if "archiveGeneration" in binding:
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+    elif before["location"] != "hot":
+        raise NativeError("RETENTION_JOURNAL_INVALID")
     if before is not None:
         archived_record(home, session, before)
         if (
@@ -864,6 +865,98 @@ def reconcile_retention(home):
             and binding.get("archiveGeneration") != before["generation"]
         ):
             raise NativeError("RETENTION_LINEAGE_INVALID")
+    with state_lock(child, session, create=False) as (state, _):
+        hot, _ = read_hot_binding(home, session)
+        if value["operation"] == "archive":
+            if (active_request(child) or {}).get("session") == session or (
+                (hot is not None and hot != binding)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index != after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+        elif (
+            (hot is not None and hot != dict(binding, archiveGeneration=generation))
+            or (state is not None and state != envelope["state"])
+            or (
+                index == after
+                and (hot is None or (binding["enrolled"] and state is None))
+            )
+            or (unpublished and (hot is not None or state is not None))
+        ):
+            raise NativeError("RETENTION_CONFLICT")
+        if target.exists() or target.is_symlink() or value["operation"] == "restore":
+            if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
+                raise NativeError("RETENTION_CONFLICT")
+    return envelope, before, child, directory, index, after
+
+
+def publication_candidates(directory, *, limit=LIMIT):
+    for entry in streamed_entries(directory):
+        if entry.name.startswith(".capture-"):
+            body = private_read(entry, limit=limit)
+            value = json.loads(body)
+            if not isinstance(value, dict) or encode(value) != body:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            yield entry, body, value
+
+
+def select_publication(directory, selector, *, limit=LIMIT):
+    selected = None
+    for candidate in publication_candidates(directory, limit=limit):
+        if selector(candidate[2]):
+            if selected is not None and selected[1] != candidate[1]:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            selected = candidate
+    return selected
+
+
+def publish_candidate(candidate, target, *, limit=LIMIT, before=None):
+    entry, body, _ = candidate
+    if private_read(entry, limit=limit) != body:
+        raise NativeError("PUBLICATION_AMBIGUOUS")
+    if target.exists() or target.is_symlink():
+        existing = private_read(target, limit=limit)
+        if existing == body:
+            entry.unlink()
+        elif before is not None and existing == before:
+            os.replace(entry, target)
+        else:
+            raise NativeError("PUBLICATION_CONFLICT")
+    else:
+        os.replace(entry, target)
+    sync_directory(target.parent)
+
+
+def reconcile_retention(home):
+    journal = home / "retention-journal.json"
+    try:
+        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
+    except FileNotFoundError:
+        if journal.is_symlink():
+            raise NativeError("RETENTION_JOURNAL_INVALID") from None
+        candidate = select_publication(home, lambda value: True, limit=RETENTION_LIMIT)
+        if candidate is None:
+            return
+        validate_retention_journal(home, candidate[2], unpublished=True)
+        publish_candidate(candidate, journal, limit=RETENTION_LIMIT)
+        value = candidate[2]
+    envelope, before, child, directory, index, after = validate_retention_journal(
+        home, value
+    )
+    for _, body, _ in publication_candidates(home, limit=RETENTION_LIMIT):
+        if body != encode(value):
+            raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
+    binding = envelope["binding"]
+    session, generation = binding["session"], envelope["generation"]
+    archive = home / "archive"
+    archive.mkdir(mode=0o700, exist_ok=True)
+    private_directory(archive)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    target = directory / (generation + ".json")
     binding_path = home / "bindings" / (session + ".json")
     state_path = child / "capture-state" / (session + ".json")
     with state_lock(child, session) as (state, _):
@@ -928,15 +1021,16 @@ def reconcile_retention(home):
 
 
 def transition_retention(home, operation, record, before):
+    reconcile_retention(home)
     if (home / "retention-journal.json").exists() or (
         home / "retention-journal.json"
     ).is_symlink():
         raise NativeError("RETENTION_JOURNAL_PENDING")
+    value = dict(schemaVersion=1, operation=operation, record=record, before=before)
+    validate_retention_journal(home, value, unpublished=True)
     atomic_write(
         home / "retention-journal.json",
-        encode(
-            dict(schemaVersion=1, operation=operation, record=record, before=before)
-        ),
+        encode(value),
         limit=RETENTION_LIMIT,
     )
     reconcile_retention(home)
@@ -1273,9 +1367,36 @@ def inspect_provisioning(home, profile):
                 raise NativeError("CHILD_PROFILE_INVALID")
 
 
+def unpublished_user_state(home):
+    def pending(directory):
+        return any(
+            entry.name.startswith(".capture-") for entry in streamed_entries(directory)
+        )
+
+    if pending(home) or pending(home / "bindings"):
+        return True
+    for child in streamed_entries(home / "workspaces"):
+        private_directory(child)
+        if pending(checked_state_directory(child)):
+            return True
+    stages = home / "provisioning"
+    if stages.exists() or stages.is_symlink():
+        for stage in streamed_entries(stages):
+            if pending(stage):
+                return True
+    return False
+
+
 def user_drain_status(home, profile):
     with gate_lock(home, nonblocking=True):
         check_user_state(home)
+        if unpublished_user_state(home):
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="PUBLICATION_PENDING",
+            )
         if (home / "retention-journal.json").exists() or (
             home / "retention-journal.json"
         ).is_symlink():
@@ -1391,12 +1512,14 @@ def checked_state_directory(home):
 
 
 @contextmanager
-def state_lock(home, key):
+def state_lock(home, key, *, create=True):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
     fd = os.open(
-        directory / (key + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        directory / (key + ".lock"),
+        (os.O_CREAT if create else 0) | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2940,6 +3063,8 @@ def dispatch_command(args, extra, locks):
             "hook",
         ):
             locks.enter_context(gate_lock(home, nonblocking=True))
+            if inspection and unpublished_user_state(home):
+                raise NativeError("PUBLICATION_PENDING")
             if inspection and (home / "retention-journal.json").exists():
                 raise NativeError("RETENTION_JOURNAL_PENDING")
             if not inspection:
