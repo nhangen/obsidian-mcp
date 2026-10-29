@@ -1155,10 +1155,18 @@ def provision_child(home, profile, project, mode):
     (stage / "capture-state").mkdir(mode=0o700, exist_ok=True)
     checked_state_directory(stage)
     if any((stage / "capture-state").iterdir()) or any(
-        p.name not in ("capture-state", "capture-profile.json") for p in stage.iterdir()
+        p.name not in ("capture-state", "capture-profile.json")
+        and not p.name.startswith(".capture-")
+        for p in stage.iterdir()
     ):
         raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
     descriptor = stage / "capture-profile.json"
+    candidate = select_publication(stage, lambda value: True)
+    if candidate is not None:
+        if candidate[1] != encode(expected):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        publish_candidate(candidate, descriptor)
+        clean_retention_temporaries({stage: (encode(expected),)})
     if descriptor.exists() or descriptor.is_symlink():
         if json.loads(private_read(descriptor)) != expected:
             raise NativeError("CHILD_PROFILE_INVALID")

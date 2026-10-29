@@ -466,6 +466,10 @@ Partial, conflicting, symlinked, and hardlinked intents remain preserved and fai
 closed. Inspection does not recover or delete intents and never reports complete
 drain while any publication remains pending.
 
+Staged descriptor recovery additionally requires exact expected parent-pinned
+bytes, private files and directories, and empty validated staging state. Unknown
+or conflicting staging data is retained, never broadly removed.
+
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
 capture for that session instead of erasing the old turn or attributing new work

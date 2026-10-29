@@ -3629,7 +3629,7 @@ module.hook(profile_home, descriptor, json.loads(event))
         return temporary, original, frozen
 
     def test_unpublished_first_publications_recover_before_unrelated_transition(self):
-        for phase in ("journal",):
+        for phase in ("journal", "descriptor"):
             with self.subTest(phase=phase):
                 self.home = self.directory / phase
                 temporary, original, frozen = self.unpublished_publication(phase)
@@ -3695,7 +3695,7 @@ module.hook(profile_home, descriptor, json.loads(event))
                 self.assertTrue(self.drain()["complete"])
 
     def test_unpublished_publication_unsafe_or_conflicting_bytes_remain_preserved(self):
-        for phase in ("journal",):
+        for phase in ("journal", "descriptor"):
             for damage in ("partial", "conflict", "symlink", "hardlink"):
                 with self.subTest(phase=phase, damage=damage):
                     self.home = self.directory / (phase + "-" + damage)
