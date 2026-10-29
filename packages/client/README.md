@@ -112,11 +112,11 @@ HTTP with non-planned status. The initialize response must return that exact
 protocol, an initialized tools capability object, and the server version pinned by
 the manifest before the client sends any initialized notification or tool request.
 
-The default target is
-`Projects/Development/<org>/<repo>/<date>.md` for every repository. This public
-consumer contains no employer-specific path overrides. Do not migrate an existing
-custom-routing workflow without explicitly reconciling its target and writer
-ownership first.
+The standalone consumer target is
+`Projects/Development/<org>/<repo>/<date>.md` for every repository. Attached Claude
+profiles can preserve existing paths through the optional
+[commit route policy](#commit-route-policy). Reconcile an existing workflow's
+targets and writer ownership before migration.
 The section includes commit-local time and the full hash; the body includes the
 branch and supplied context. A deterministic idempotency key is derived from the
 sanitized repository identity and full commit hash, so changed context under the
@@ -306,6 +306,51 @@ different daily path remain unresolved rather than relaxing verification.
 Every profile load verifies the same release bytes and installed trust record as
 the isolated runtime. A profile remains pinned to its immutable release even if
 the installer's `current` pointer later changes.
+
+### Commit route policy
+
+Claude `attach` accepts `--commit-routes /absolute/private/routes.json` for either
+project or user scope. Configure it once on a user profile to cover newly opened
+repositories without workspace registration. Example file:
+
+```json
+{
+  "business/engine": "Business/engine/commits/{date}-engine.md",
+  "business/other": "Business/other/{date}.md"
+}
+```
+
+Keys must exactly match the producer's sanitized `org_repo`, including case.
+There are no globs or aliases. Values are vault-relative `.md` paths; `{date}`
+is the only substitution and uses the commit-local date. Absolute paths, empty
+or dot segments, backslashes, colons, control characters, surrounding whitespace,
+and other braces/placeholders are rejected. Rendered paths are capped at 1024
+UTF-8 bytes. Static paths are allowed.
+
+The file must be an invoking-user-owned regular file with mode `0400` or `0600`,
+one hard link, and no symlinks in any path component. JSON is capped at 64 KiB
+and 128 entries, with duplicate keys and malformed values rejected. The validated
+snapshot must also fit 64 KiB when JSON-encoded. Invalid policy fails before
+attachment creates a profile. The profile stores the validated map, not its source
+filename; editing that file has no effect on an attached profile. New user-scope
+children inherit the snapshot. Omission or `{}` keeps canonical defaults, as does
+a repository with no exact match. An empty file is invalid.
+
+The selected target freezes with verified commit observation, before context is
+prepared. Guidance, preparation, native argument validation, receipt checks, and
+retry retain that target. Existing prepared records keep their exact arguments.
+Legacy unprepared records without a frozen path can continue only when the policy
+still selects their canonical target; otherwise
+`COMMIT_ROUTE_RECONCILIATION_REQUIRED` requires explicit operator reconciliation
+of the historical target and writer ownership before proceeding. No command moves,
+backfills, or reroutes historical notes. Repository/hash idempotency keys and
+changed-body conflict guards remain unchanged, and server path/scope checks still
+apply.
+
+This option is supported only by `obsidian-mcp-native attach --host claude-plugin`.
+Other native operations/hosts and the standalone consumer reject it. Codex profiles
+and direct standalone invocations remain canonical. Attaching a policy does not
+activate writers or change credentials, services, or host ownership.
 
 ### Explicit directory session profiles
 

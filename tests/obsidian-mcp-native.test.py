@@ -5073,5 +5073,341 @@ module.hook(home, descriptor, json.loads(event))
         self.assertEqual(json.loads(ownership_path.read_text()), ownership)
 
 
+class CommitRoutesTest(NativeCaptureFixture):
+    expected_rewrite_decision = None
+    configure = UserCaptureTest.configure
+    commit_arguments = ClaudePluginCaptureTest.commit_arguments
+    commit_event = ClaudePluginCaptureTest.commit_event
+    commit_receipt = ClaudePluginCaptureTest.commit_receipt
+
+    def event(self, name, **extra):
+        return ClaudePluginCaptureTest.event(
+            self,
+            name,
+            **dict(session_id=getattr(self, "current_session", "session-1"), **extra),
+        )
+
+    def state_paths(self):
+        key = self.session_key(getattr(self, "current_session", "session-1"))
+        return list((self.home / "workspaces").glob("*/capture-state/" + key + ".json"))
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.directory / "conversation.jsonl"
+        self.transcript.write_text('{"type":"system","uuid":"start"}\n')
+        self.routes = {
+            "business/engine": "Business/engine/commits/{date}-engine.md",
+            "business/other": "Business/other/{date}.md",
+        }
+        self.policy = self.directory / "routes.json"
+        self.policy.write_text(json.dumps(self.routes))
+        self.policy.chmod(0o600)
+
+    def start(self, routed=True):
+        self.git("remote", "add", "origin", "git@github.com:business/engine.git")
+        self.configure(*(["--commit-routes", str(self.policy)] if routed else []))
+        self.hook("UserPromptSubmit", prompt="work")
+        return self.pending_commit()
+
+    def change_snapshot(self, routes):
+        paths = [self.home / "capture-profile.json"]
+        paths.extend((self.home / "workspaces").glob("*/capture-profile.json"))
+        for path in paths:
+            profile = json.loads(path.read_text())
+            profile["commitRoutes"] = routes
+            path.write_text(json.dumps(profile))
+
+    def test_shared_selection_exact_routes_nonmatch_and_canonical_compatibility(self):
+        consumer = runpy.run_path(str(self.bundle / "bin/obsidian-mcp-capture-commit"))
+        metadata = dict(
+            org_repo="business/engine",
+            date="2026-10-29",
+            hash="a" * 40,
+            branch="fixture",
+            time="10:30",
+        )
+        canonical, original = consumer["capture_arguments"](metadata, ["fact"])
+        self.assertEqual(
+            canonical, "Projects/Development/business/engine/2026-10-29.md"
+        )
+        self.assertEqual(consumer["capture_target"](metadata, {}), canonical)
+        for repo, expected in (
+            ("business/engine", "Business/engine/commits/2026-10-29-engine.md"),
+            ("business/other", "Business/other/2026-10-29.md"),
+            (
+                "business/engine-extra",
+                "Projects/Development/business/engine-extra/2026-10-29.md",
+            ),
+        ):
+            with self.subTest(repo=repo):
+                selected = consumer["capture_target"](
+                    dict(metadata, org_repo=repo), self.routes
+                )
+                self.assertEqual(selected, expected)
+        target, routed = consumer["capture_arguments"](
+            metadata, ["fact"], routes=self.routes
+        )
+        self.assertEqual(target, "Business/engine/commits/2026-10-29-engine.md")
+        self.assertEqual(routed, dict(original, target_path=target))
+
+    def test_attach_snapshots_once_and_new_roots_inherit_without_enrollment(self):
+        self.configure("--commit-routes", str(self.policy))
+        self.policy.write_text("invalid changed external policy")
+        for name, prefix, suffix in (
+            ("engine", "Business/engine/commits/", "-engine.md"),
+            ("other", "Business/other/", ".md"),
+            ("engine-extra", "Projects/Development/business/engine-extra/", ".md"),
+        ):
+            self.project = self.directory / name
+            self.project.mkdir()
+            self.current_session = name
+            self.git("init", "-b", "native-fixture")
+            self.git(
+                "remote", "add", "origin", "git@github.com:business/" + name + ".git"
+            )
+            self.hook("UserPromptSubmit", prompt="work")
+            path, state, commit = self.pending_commit()
+            expected = prefix + state["commits"][commit]["metadata"]["date"] + suffix
+            prepared = self.prepare(path, commit)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.assertEqual(
+                json.loads(prepared.stdout)["arguments"]["target_path"], expected
+            )
+        profiles = [
+            json.loads(p.read_text())
+            for p in (self.home / "workspaces").glob("*/capture-profile.json")
+        ]
+        self.assertEqual(len(profiles), 3)
+        self.assertTrue(all(p["commitRoutes"] == self.routes for p in profiles))
+        self.assertNotIn(
+            str(self.policy), (self.home / "capture-profile.json").read_text()
+        )
+
+    def test_empty_map_readonly_file_preserves_canonical_target(self):
+        self.policy.write_text("{}")
+        self.policy.chmod(0o400)
+        path, state, commit = self.start()
+        expected = (
+            "Projects/Development/business/engine/"
+            + state["commits"][commit]["metadata"]["date"]
+            + ".md"
+        )
+        self.assertEqual(state["commits"][commit]["capture_path"], expected)
+        prepared = self.prepare(path, commit)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertEqual(
+            json.loads(prepared.stdout)["arguments"]["target_path"], expected
+        )
+
+    def test_observation_freezes_before_context_and_retry_preserves_same_key_body(self):
+        path, state, commit = self.start()
+        pending = state["commits"][commit]
+        expected = (
+            "Business/engine/commits/" + pending["metadata"]["date"] + "-engine.md"
+        )
+        self.assertEqual(pending["capture_path"], expected)
+        self.assertNotIn("native_arguments", pending)
+        self.change_snapshot({"business/engine": "Changed/{date}.md"})
+        arguments = self.commit_arguments(path, ["Original fact"])
+        self.assertEqual(arguments["target_path"], expected)
+        event = self.commit_event(arguments)
+        self.assertEqual(self.hook("PreToolUse", **event), {})
+        denied = self.hook(
+            "PreToolUse",
+            **self.commit_event(
+                dict(arguments, content=arguments["content"] + "\n- Changed fact")
+            ),
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.hook("PostToolUseFailure", **event, error="fixture failure")
+        pending = json.loads(path.read_text())["commits"][commit]
+        retry = self.cli(
+            "retry",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--commit",
+            commit,
+            "--payload-sha256",
+            pending["payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["arguments"], arguments)
+        event = self.commit_event(arguments, "reviewed")
+        self.assertEqual(self.hook("PreToolUse", **event), {})
+        self.hook("PostToolUse", **event, tool_response=self.commit_receipt(arguments))
+        self.assertEqual(
+            json.loads(path.read_text())["commits"][commit]["status"], "committed"
+        )
+
+    def test_executor_observation_survives_policy_change_before_post_hook(self):
+        self.git("remote", "add", "origin", "git@github.com:business/engine.git")
+        self.configure("--commit-routes", str(self.policy))
+        self.hook("UserPromptSubmit", prompt="work")
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="commit-call",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = self.hook("PreToolUse", **args)
+        (self.project / "file.txt").write_text("fixture\n")
+        self.git("add", "file.txt")
+        executed = self.execute_rewritten(rewritten)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        self.change_snapshot({"business/engine": "Changed/{date}.md"})
+        self.hook("PostToolUse", **args, tool_response=executed.stdout)
+        path = self.state_paths()[0]
+        pending = next(iter(json.loads(path.read_text())["commits"].values()))
+        self.assertEqual(
+            pending["capture_path"],
+            "Business/engine/commits/" + pending["metadata"]["date"] + "-engine.md",
+        )
+
+    def test_legacy_unprepared_conflicting_policy_requires_reconciliation(self):
+        path, state, commit = self.start(routed=False)
+        state["commits"][commit].pop("capture_path", None)
+        path.write_text(json.dumps(state))
+        self.change_snapshot(self.routes)
+        before = path.read_bytes()
+        result = self.prepare(path, commit)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("COMMIT_ROUTE_RECONCILIATION_REQUIRED", result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        advisory = self.hook("SessionStart", source="resume")
+        self.assertIn("COMMIT_ROUTE_RECONCILIATION_REQUIRED", json.dumps(advisory))
+        self.assertNotIn("Commit capture arguments:", json.dumps(advisory))
+        self.change_snapshot({})
+        prepared = self.prepare(path, commit)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertTrue(
+            json.loads(prepared.stdout)["arguments"]["target_path"].startswith(
+                "Projects/Development/business/engine/"
+            )
+        )
+
+    def test_legacy_prepared_exact_arguments_survive_changed_policy(self):
+        path, state, commit = self.start(routed=False)
+        first = self.prepare(path, commit)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original = json.loads(first.stdout)
+        state = json.loads(path.read_text())
+        state["commits"][commit]["path"] = "Historical/exact.md"
+        state["commits"][commit]["native_arguments"][
+            "target_path"
+        ] = "Historical/exact.md"
+        path.write_text(json.dumps(state))
+        self.change_snapshot(self.routes)
+        again = self.prepare(path, commit)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(
+            json.loads(again.stdout),
+            dict(
+                original,
+                arguments=dict(
+                    original["arguments"], target_path="Historical/exact.md"
+                ),
+            ),
+        )
+
+    def test_invalid_policy_fails_before_any_attach_mutation(self):
+        cases = [
+            "[]",
+            "null",
+            "",
+            '{"business/engine":"A/{date}.md","business/engine":"B/{date}.md"}',
+            '{"business/engine":1}',
+            '{"business/*":"A/{date}.md"}',
+            '{"business//engine":"A/{date}.md"}',
+            '{"business/engine":"../{date}.md"}',
+            '{"business/engine":"/A/{date}.md"}',
+            '{"business/engine":"A//{date}.md"}',
+            '{"business/engine":"A/{repo}.md"}',
+            '{"business/engine":"A/{date.__class__}.md"}',
+            '{"business/engine":"A/{date:10}.md"}',
+            '{"business/engine":"C:/{date}.md"}',
+            '{"business/engine":" A/{date}.md"}',
+            '{"business/engine":"A/./{date}.md"}',
+            '{"business/engine":"A/{date}.txt"}',
+            '{"business/engine":"A/.md"}',
+            '{"business/engine":"A/\\u0000{date}.md"}',
+            '{"business/engine":"A/\\\\{date}.md"}',
+            '{"business/engine":"A/\\ud800{date}.md"}',
+            " " * 65537,
+            "{bad json",
+            json.dumps({"business/engine": "a" * 1024 + ".md"}),
+            json.dumps({"business/repo" + str(i): "A/{date}.md" for i in range(129)}),
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw[:90]):
+                self.policy.write_text(raw)
+                self.assert_attach_rejected(self.policy)
+        self.policy.write_text(json.dumps(self.routes))
+        for mode in (0o644, 0o660):
+            self.policy.chmod(mode)
+            self.assert_attach_rejected(self.policy)
+        self.policy.chmod(0o600)
+        alias = self.directory / "alias.json"
+        alias.symlink_to(self.policy)
+        self.assert_attach_rejected(alias)
+        alias.unlink()
+        os.link(self.policy, alias)
+        self.assert_attach_rejected(self.policy)
+        alias.unlink()
+        self.assert_attach_rejected(self.directory)
+        self.assert_attach_rejected(self.directory / "missing.json")
+        parent_alias = self.directory / "linked-parent"
+        parent_alias.symlink_to(self.directory, target_is_directory=True)
+        self.assert_attach_rejected(parent_alias / "routes.json")
+        fifo = self.directory / "routes.fifo"
+        os.mkfifo(fifo, 0o600)
+        self.assert_attach_rejected(fifo)
+
+    def test_route_file_requires_invoking_owner(self):
+        consumer = runpy.run_path(str(self.bundle / "bin/obsidian-mcp-capture-commit"))
+        with mock.patch.object(consumer["os"], "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(consumer["CaptureError"]):
+                consumer["read_commit_routes"](str(self.policy))
+
+    def assert_attach_rejected(self, policy):
+        result = self.cli(
+            "attach",
+            "--scope",
+            "user",
+            "--host",
+            "claude-plugin",
+            "--home",
+            str(self.home),
+            "--folder",
+            "Sessions",
+            "--release-sha256",
+            self.digest,
+            "--commit-routes",
+            str(policy),
+        )
+        self.assertEqual(result.returncode, 64, result.stdout)
+        self.assertFalse(self.home.exists())
+
+    def test_route_flag_rejected_for_unsupported_operations(self):
+        for operation in ("create", "capabilities", "run", "profile-status"):
+            result = self.cli(
+                operation,
+                "--commit-routes",
+                str(self.policy),
+                "--home",
+                str(self.home),
+                "--project",
+                str(self.project),
+                "--folder",
+                "Sessions",
+                "--release-sha256",
+                self.digest,
+            )
+            self.assertEqual(result.returncode, 64)
+            self.assertFalse(self.home.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
