@@ -339,8 +339,8 @@ and commit-targeted append events still refuse before creating capture state.
 Ordinary tools and manual appends with unrelated keys do not settle automatic
 capture. Use a separately attached Git profile for commit capture; the integrating
 plugin must choose the
-most specific explicit canonical root and reject duplicate registrations. An
-unmapped workspace must be attached explicitly, with no local keeper fallback.
+most specific explicit canonical root and reject duplicate registrations. Without
+a user-scope fallback, an unmapped workspace must be attached explicitly.
 
 Install and verify the supporting release, check its mode capabilities, and attach
 a fresh profile before the plugin's separately managed ownership handoff. Existing
@@ -351,7 +351,7 @@ Dispatcher commands (JSON stdout, nonzero exit on invalid profile/state):
 
 | Command | Contract |
 | --- | --- |
-| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `host`, `project`, `projectMode`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active` and `apiVersion`. Does not require a session ID. |
+| `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `scope`, `host`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active`, and `apiVersion`. Project scope also returns `project` and `projectMode`. Does not require a session ID. |
 | `hook --home <profile>` | Reads the full Claude hook JSON from stdin; emits host hook JSON. The dispatcher performs no turn normalization. |
 | `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, and `active_request`. Emits no saved body or transcript. |
 
@@ -359,7 +359,9 @@ The plugin must close its ownership/admission barrier **before** draining and ke
 it closed through owner or profile remapping. Drain is an observation, not a
 writer lease. It acquires the gate and every discovered session lock without
 waiting, refuses contention, corrupt state, missing active-owner state, unknown
-state files and more than 256 sessions, and never repairs or deletes evidence.
+state files and, for standalone project profiles, more than 256 sessions. User
+parents use the streamed retained-state inspection described below. Drain never
+repairs or deletes evidence.
 `quiescent: true` requires no active request, pending session disposition,
 in-flight/recovery state, snapshots, pending/uncaptured commits or unresolved
 snapshot-resolution evidence. A nonzero exit is never permission to hand off.
@@ -367,6 +369,128 @@ snapshot-resolution evidence. A nonzero exit is never permission to hand off.
 for lossless draining. `disable` and `run` are unsupported for attached profiles;
 the plugin owns writer admission and rollback separately. No registration or
 ownership change is performed by any of these API calls.
+
+### User scope without workspace registration
+
+An integrating Claude plugin can configure a single fallback session folder and
+daily folder, then delegate events from newly opened workspaces without attaching
+each project. First require the additive capability map
+`captureScopes={"claude-plugin":["project","user"],"codex":["project"]}`.
+Profiles without `scope` retain `project` behavior; Codex remains project-only.
+
+```sh
+python3 <verified-bundle>/bin/obsidian-mcp-native attach --host claude-plugin \
+  --scope user --home /absolute/new-private-user-profile \
+  --folder Sessions --daily-folder Journal \
+  --release-sha256 <trusted-release-json-sha256>
+```
+
+The parent descriptor has `scope: "user"`, the existing host, Python, bundle,
+immutable release pin, `folder`, `dailyFolder`, `files: {}`, and `active: true`.
+It omits `project` and `projectMode`; those CLI arguments are rejected for user
+attachment. `active` validates the runtime descriptor, not writer ownership.
+Attachment creates only private configuration and never activates the plugin's
+user owner. The plugin manages activation and exclusions separately.
+`profile-status` validates the parent without a project and returns `scope:
+"user"`, omitting `project` and `projectMode`.
+
+The runtime creates ordinary project descriptors under the parent's private
+`workspaces/<workspace-hash>` directory. A Git workspace uses its canonical Git
+root, including subdirectory or symlink entry; otherwise the canonical event cwd
+gets directory session capture. Missing Git produces a session-only diagnostic,
+never a commit event or receipt. No configuration, hook, or state is written into
+either workspace. Child descriptors inherit the parent's folders and immutable
+release pin and are checked against it on every load. Direct child CLI operations
+also validate the parent. All directories are mode 0700; state files are 0600.
+
+`bindings/<session-hash>.json` durably binds a session to its first workspace.
+A session cannot rebind to another workspace, including while a commit or session
+write is pending. Each child keeps its own existing commit gate; there is no
+shared parent `active.json`. Parent `status`, `request`, `prepare`, `retry`, and
+other session operations accept the existing hashed `--session` and resolve its
+bound child. Hook recovery guidance also identifies the child directly.
+
+Parent `drain-status` inspects every child and binding under a nonblocking parent
+lock. It retains the existing `quiescent`, `session_count`, and `sessions` fields,
+adds `complete`, `workspace_count`, `hot_session_count`, `archived_session_count`,
+and `unresolved_session_count`. It streams all retained records one bounded record
+at a time, returns at most 256 unresolved-session details and workspace summaries,
+and marks truncated details separately from complete inspection. History has no
+lifetime session or workspace admission limit. Busy locks, missing or tampered
+evidence, invalid bindings, and pending work prevent a clean drain. An unfinished
+retention journal returns `complete: false, quiescent: false`; a timeout or failure
+is never permission to hand off. Inspection time grows with retained history, but
+memory and response details remain bounded. The plugin must keep its admission
+barrier closed during drain and handoff.
+
+On valid prompts, verified terminal sessions move automatically out of hot
+admission accounting. Only active or unresolved work consumes the 256-session
+budget. New capture pauses advisably at that active-work limit; resolving existing
+work releases capacity without new configuration. SessionStart inspects an
+existing session but never creates enrollment; the first valid prompt enrolls it.
+
+Terminal binding/state pairs are preserved in private immutable digest-addressed
+records under `archive/<session-hash>`, with a current location/generation index
+and a durable retained-binding locator. A fsynced `retention-journal.json` freezes
+the transition. Complete archive publication precedes removal of hot binding and
+state files. Next admission or a mutating session operation reconciles an
+interrupted transition only when identities, generations, and payloads match;
+conflicts fail closed. State and gate lock files are never moved or deleted.
+Historical empty locks consume no admission capacity, but busy locks refuse drain.
+Admission counts a busy session conservatively as active without refusing unrelated
+workspaces below the active-work limit. Wrapped Git execution pins its child/session
+state before releasing the parent lock, so independent workspace commits can proceed.
+
+Resuming an archived session restores only its exact validated binding and state;
+missing or conflicting evidence never falls back to fresh enrollment. Earlier
+archive generations remain retained. Read-only status, request, profile validation,
+and drain validate descriptors, parent identity, release pins, and retained state
+without requiring a retired workspace to exist. Execution still checks the live
+project. Child creation stages its complete private descriptor and empty state
+directory outside `workspaces` before atomic publication; unambiguous interrupted
+staging resumes, while conflicting leftovers remain preserved for inspection.
+
+Retained lookups validate the complete predecessor-generation lineage, including
+the first-generation locator; missing or corrupt intermediate records fail closed.
+Journal reconciliation removes only private temporary files in the current
+transition's directories whose bytes exactly match its expected publications,
+before clearing the journal. Ambiguous temporary data remains preserved and recovery
+stays incomplete. Archive/journal envelopes have a separate fixed serialization
+bound allowing both accepted components and canonical-encoding overhead; active
+state and hook input retain their 262,144-byte limit. Payloads are never truncated.
+
+Recovery also covers a fully written private intent left before journal,
+staged-descriptor, or first-enrollment publication. An unpublished journal must
+pass the same identity, ancestry, index, binding, and state checks as a published
+journal before it is promoted, ahead of another transition. Staged descriptor
+bytes must exactly match the expected parent-pinned descriptor in empty private
+staging. Enrollment recovery accepts only the expected initial binding, an exact
+initial-state plan with no established conflicting state, or a verified binding
+marker transition. A paused-only marker may only restrict an existing binding;
+initial enrollment and new-turn unpause still require the persisted initial state.
+An accepted explicit continuation can unpause an enrolled binding so the retained
+turn can make its first save. Its `continuationCapture` marker binds recovery to
+the existing session, turn, transcript, and canonical capture plan, with validated
+scope and a pending continuation request. Same-turn commit progress does not
+invalidate that witness, including completion by matching receipts; a stale marker
+from another turn cannot authorize recovery.
+Recovery publishes only the binding and leaves pending state bytes unchanged.
+Recovered pending work is never replaced by a later prompt. Partial, conflicting,
+symlinked, and hardlinked intents remain preserved and fail closed. Inspection
+does not recover or delete intents and never reports complete drain while any
+publication remains pending. Other state updates are not promoted from schema
+alone; ambiguous leftovers retain evidence and require inspection.
+
+User-scope prompt failures emit advisory context and allow the ordinary prompt to
+proceed. An unresolved previous turn remains unchanged; the binding pauses new
+capture for that session instead of erasing the old turn or attributing new work
+to it. Unrelated Bash commands proceed and Stop reports advisory context. Frozen
+requests and matching late receipts still reach the existing validators: partial
+or ambiguous writes need the existing authoritative `retry` review, and changed
+payloads or unprepared new captures remain denied. Resolve the original state,
+then submit a new prompt to resume capture. This retains one pending turn rather than adding a
+multi-turn queue. Enrolled, unpaused pending work keeps the existing bounded Stop
+recovery behavior. Missing enrollment never creates a Stop recovery loop.
 
 Register `UserPromptSubmit`, `SessionStart` (including resume), `Stop`,
 `StopFailure`, and paired `PreToolUse`, `PostToolUse`, `PostToolUseFailure` handlers.
@@ -385,8 +509,9 @@ deliveries at the same boundary reuse the turn; the same text at a later boundar
 gets a new turn. Missing first-prompt transcript files use an empty watermark.
 Resume reuses persisted state without inventing a turn or replaying history.
 Changed transcript identity, orphan tool/Stop events and unresolved previous
-turns refuse advancement. A changed boundary cannot prove a late delivery was a
-duplicate, so unresolved work blocks a new occurrence. State stores hashes, not
+turns refuse capture advancement. A changed boundary cannot prove a late delivery
+was a duplicate, so unresolved work prevents a new capture occurrence. User-scope
+prompts proceed with the advisory pause described above. State stores hashes, not
 prompt text, transcript paths or raw transcript copies. Subagent events are
 explicitly unsupported and cannot be attributed to the main session.
 
@@ -435,3 +560,18 @@ a fixture Git commit, observes simulated session and direct commit MCP receipts
 through plugin hooks without CLI preparation, verifies drain, and hands
 ownership to disabled. All state stays in temporary directories; no real server,
 provider, user configuration or running writer is involved.
+The additional user-scope pair fixture attaches one parent, activates the plugin's
+user owner, opens fresh Git and nonGit directories without enrollment, observes
+exact simulated session receipts through the real dispatcher, and verifies both
+saved children and an aggregate clean drain.
+
+The source fixture suite also covers 258 terminal sessions, exact archive resume,
+interrupted archive/restore publication, digest conflicts, removed workspaces,
+and retained busy locks. To run the longer production-threshold CLI acceptance
+for 257 resolved, removed workspaces under one parent:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OBSIDIAN_MCP_TEST_LONG_HISTORY=1 \
+  python3 tests/obsidian-mcp-native.test.py \
+  UserCaptureTest.test_cli_accepts_257_retired_workspaces_without_new_parent
+```

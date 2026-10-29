@@ -29,6 +29,8 @@ BUNDLE = Path(__file__).resolve().parent.parent
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
+# Two accepted JSON components may expand when Unicode is canonicalized.
+RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
 CLAUDE_PRODUCER_TIMEOUT = 3.0
 COMMIT_CONTEXT_TEMPLATE = (
@@ -101,7 +103,7 @@ def identifier(value):
     return value
 
 
-def private_read(path):
+def private_read(path, *, limit=LIMIT):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         item = os.fstat(stream.fileno())
@@ -112,14 +114,14 @@ def private_read(path):
             or stat.S_IMODE(item.st_mode) != 0o600
         ):
             raise NativeError("PRIVATE_FILE_INVALID")
-        value = stream.read(LIMIT + 1)
-    if len(value) > LIMIT:
+        value = stream.read(limit + 1)
+    if len(value) > limit:
         raise NativeError("STATE_TOO_LARGE")
     return value
 
 
-def atomic_write(path, value):
-    if len(value) > LIMIT:
+def atomic_write(path, value, *, limit=LIMIT):
+    if len(value) > limit:
         raise NativeError("STATE_TOO_LARGE")
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".capture-")
     try:
@@ -145,6 +147,15 @@ def project_mode(profile):
     if mode == "directory" and profile.get("host") != "claude-plugin":
         raise NativeError("PROJECT_MODE_HOST_UNSUPPORTED")
     return mode
+
+
+def capture_scope(profile):
+    scope = profile.get("scope", "project")
+    if scope not in ("project", "user") or (
+        scope == "user" and profile.get("host") != "claude-plugin"
+    ):
+        raise NativeError("CAPTURE_SCOPE_INVALID")
+    return scope
 
 
 def require_git_profile(profile):
@@ -230,8 +241,15 @@ def attach_profile(args):
     if args.host != "claude-plugin":
         raise NativeError("ATTACH_HOST_REQUIRED")
     metadata = trusted_bundle(args.release_sha256)
-    mode = project_mode(dict(host=args.host, projectMode=args.project_mode))
-    project = project_root(args.project, mode)
+    if args.scope == "user":
+        if args.project is not None or args.project_mode is not None:
+            raise NativeError("USER_PROJECT_ARGUMENTS_UNSUPPORTED")
+        project = None
+    else:
+        mode = project_mode(
+            dict(host=args.host, projectMode=args.project_mode or "git")
+        )
+        project = project_root(args.project, mode)
     folder = relative_folder(args.folder)
     daily = relative_folder(args.daily_folder)
     home = Path(args.home).absolute()
@@ -249,21 +267,27 @@ def attach_profile(args):
         bundle=str(BUNDLE),
         releaseSha256=args.release_sha256,
         releaseId=metadata["releaseId"],
-        project=str(project),
-        projectMode=mode,
         folder=folder,
         dailyFolder=daily,
         files={},
         active=True,
     )
+    if args.scope == "user":
+        descriptor["scope"] = "user"
+    else:
+        descriptor.update(project=str(project), projectMode=mode)
     home.mkdir(mode=0o700)
     (home / "capture-state").mkdir(mode=0o700)
+    if args.scope == "user":
+        (home / "workspaces").mkdir(mode=0o700)
+        (home / "bindings").mkdir(mode=0o700)
     atomic_write(home / "capture-profile.json", encode(descriptor))
     return dict(
         status="attached",
         host="claude-plugin",
         home=str(home),
-        project=str(project),
+        project=str(project) if project is not None else None,
+        scope=args.scope,
         release_id=metadata["releaseId"],
         ownership_changed=False,
     )
@@ -275,6 +299,7 @@ def capabilities(expected):
         apiVersion=1,
         hosts=["codex", "claude-plugin"],
         projectModes={"claude-plugin": ["git", "directory"], "codex": ["git"]},
+        captureScopes={"claude-plugin": ["project", "user"], "codex": ["project"]},
         release_id=metadata["releaseId"],
         operations=[
             "attach",
@@ -293,7 +318,9 @@ def capabilities(expected):
 
 
 def create_profile(args):
-    require_git_profile(dict(host="codex", projectMode=args.project_mode))
+    if args.scope != "project":
+        raise NativeError("CAPTURE_SCOPE_INVALID")
+    require_git_profile(dict(host="codex", projectMode=args.project_mode or "git"))
     metadata = trusted_bundle(args.release_sha256)
     project = clean_project(args.project)
     home = Path(args.home).absolute()
@@ -399,7 +426,7 @@ def create_profile(args):
     )
 
 
-def load_profile(home):
+def load_profile(home, *, parent_only=False, inspect=False):
     home = Path(home).absolute()
     item = home.lstat()
     if (
@@ -424,7 +451,10 @@ def load_profile(home):
         )
     ):
         raise NativeError("PROFILE_INACTIVE_OR_INVALID")
-    mode = project_mode(profile)
+    scope = capture_scope(profile)
+    if parent_only and (scope != "user" or "parentHome" in profile):
+        raise NativeError("CHILD_PARENT_INVALID")
+    mode = project_mode(profile) if scope == "project" else None
     python = Path(profile.get("python", ""))
     if (
         not python.is_absolute()
@@ -437,8 +467,47 @@ def load_profile(home):
     if profile["host"] == "claude-plugin":
         relative_folder(profile["folder"])
         relative_folder(profile["dailyFolder"])
-        if str(project_root(profile["project"], mode)) != profile["project"]:
-            raise NativeError("PROFILE_PROJECT_INVALID")
+        if scope == "user":
+            if (
+                profile.get("project") is not None
+                or "projectMode" in profile
+                or "parentHome" in profile
+            ):
+                raise NativeError("USER_PROFILE_INVALID")
+            private_directory(home / "workspaces")
+            private_directory(home / "bindings")
+        else:
+            project = profile.get("project")
+            if (
+                not isinstance(project, str)
+                or not Path(project).is_absolute()
+                or os.path.normpath(project) != project
+            ):
+                raise NativeError("PROFILE_PROJECT_INVALID")
+            if not inspect and str(project_root(project, mode)) != project:
+                raise NativeError("PROFILE_PROJECT_INVALID")
+            if inspect:
+                try:
+                    present = Path(project).resolve(strict=True)
+                except FileNotFoundError:
+                    present = None
+                if present is not None and (
+                    str(present) != project or not present.is_dir()
+                ):
+                    raise NativeError("PROFILE_PROJECT_INVALID")
+        parent_home = profile.get("parentHome")
+        if parent_home is None and home.parent.name == "workspaces":
+            try:
+                hint = json.loads(
+                    private_read(home.parent.parent / "capture-profile.json")
+                )
+            except FileNotFoundError:
+                hint = {}
+            if isinstance(hint, dict) and hint.get("scope") == "user":
+                parent_home = str(home.parent.parent)
+        if parent_home is not None:
+            parent, owner = load_profile(parent_home, parent_only=True, inspect=inspect)
+            validate_child(parent, owner, home, profile)
         metadata = trusted_bundle(profile["releaseSha256"])
         if metadata["releaseId"] != profile.get("releaseId"):
             raise NativeError("PROFILE_RELEASE_INVALID")
@@ -462,6 +531,1199 @@ def load_profile(home):
     return home, profile
 
 
+def private_directory(path):
+    item = path.lstat()
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or path.resolve() != path
+        or item.st_uid != os.getuid()
+        or stat.S_IMODE(item.st_mode) != 0o700
+    ):
+        raise NativeError("PRIVATE_DIRECTORY_INVALID")
+    return path
+
+
+def workspace_key(project, mode):
+    return digest(encode([project, mode]))
+
+
+def child_profile(home, profile, project, mode):
+    return dict(
+        {k: v for k, v in profile.items() if k != "scope"},
+        project=project,
+        projectMode=mode,
+        parentHome=str(home),
+    )
+
+
+def validate_child(parent, owner, home, profile):
+    project = profile.get("project")
+    mode = project_mode(profile)
+    key = workspace_key(project, mode)
+    private_directory(parent / "workspaces")
+    if home != parent / "workspaces" / key or profile != child_profile(
+        parent, owner, project, mode
+    ):
+        raise NativeError("CHILD_PROFILE_INVALID")
+
+
+def read_hot_binding(home, session):
+    if not isinstance(session, str) or HEX.fullmatch(session) is None:
+        raise NativeError("SESSION_KEY_INVALID")
+    directory = private_directory(home / "bindings")
+    path = directory / (session + ".json")
+    try:
+        record = json.loads(private_read(path))
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise NativeError("SESSION_BINDING_INVALID") from None
+        return None, path
+    validate_binding(record, session)
+    return record, path
+
+
+def validate_binding(record, session):
+    if (
+        not isinstance(record, dict)
+        or set(record) - {"archiveGeneration", "continuationCapture"}
+        != {
+            "schemaVersion",
+            "session",
+            "workspace",
+            "project",
+            "projectMode",
+            "paused",
+            "enrolled",
+        }
+        or record.get("schemaVersion") != 1
+        or record.get("session") != session
+        or record.get("projectMode") not in ("git", "directory")
+        or not isinstance(record.get("project"), str)
+        or not Path(record["project"]).is_absolute()
+        or type(record.get("paused")) is not bool
+        or type(record.get("enrolled")) is not bool
+        or (
+            "archiveGeneration" in record
+            and (
+                not isinstance(record["archiveGeneration"], str)
+                or HEX.fullmatch(record["archiveGeneration"]) is None
+            )
+        )
+        or (
+            "continuationCapture" in record
+            and (
+                record.get("enrolled") is not True
+                or not isinstance(record["continuationCapture"], str)
+                or HEX.fullmatch(record["continuationCapture"]) is None
+            )
+        )
+        or record.get("workspace")
+        != workspace_key(record["project"], record["projectMode"])
+    ):
+        raise NativeError("SESSION_BINDING_INVALID")
+
+
+def streamed_entries(directory):
+    private_directory(directory)
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            yield Path(entry.path)
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def archive_index(home, session):
+    directory = home / "archive" / session
+    if not directory.exists() and not directory.is_symlink():
+        locator = home / "retained-bindings" / (session + ".json")
+        if locator.exists() or locator.is_symlink():
+            raise NativeError("RETENTION_ARCHIVE_MISSING")
+        return None
+    private_directory(home / "archive")
+    private_directory(directory)
+    index = json.loads(private_read(directory / "index.json", limit=RETENTION_LIMIT))
+    if (
+        not isinstance(index, dict)
+        or set(index) != {"generation", "location"}
+        or index.get("location") not in ("hot", "archive")
+        or not isinstance(index.get("generation"), str)
+        or HEX.fullmatch(index["generation"]) is None
+    ):
+        raise NativeError("RETENTION_INDEX_INVALID")
+    return index
+
+
+def validate_archive(value, session, generation):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "binding", "state", "generation"}
+        or value.get("schemaVersion") != 1
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    binding, state = value["binding"], value["state"]
+    validate_binding(binding, session)
+    if (
+        value.get("generation") != generation
+        or digest(encode([binding, state])) != generation
+        or not isinstance(binding, dict)
+        or binding.get("session") != session
+        or binding.get("workspace")
+        != workspace_key(binding.get("project"), binding.get("projectMode"))
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    if state is None:
+        if binding.get("enrolled") is not False:
+            raise NativeError("RETENTION_ARCHIVE_INVALID")
+    elif (
+        not isinstance(state, dict)
+        or state.get("schemaVersion") != 1
+        or state.get("session") != session
+        or drain_reasons(state)
+    ):
+        raise NativeError("RETENTION_ARCHIVE_INVALID")
+    return value
+
+
+def archived_record(home, session, index):
+    generation = index["generation"]
+    directory = home / "archive" / session
+
+    def read_generation(key):
+        value = validate_archive(
+            json.loads(
+                private_read(directory / (key + ".json"), limit=RETENTION_LIMIT)
+            ),
+            session,
+            key,
+        )
+        return value
+
+    current = value = read_generation(generation)
+    checkpoint, distance, power = generation, 0, 1
+    while predecessor := value["binding"].get("archiveGeneration"):
+        if predecessor == checkpoint:
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+        value = read_generation(predecessor)
+        if any(
+            value["binding"][key] != current["binding"][key]
+            for key in ("session", "workspace", "project", "projectMode")
+        ):
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+        distance += 1
+        if distance == power:
+            checkpoint, distance, power = predecessor, 0, power * 2
+    retained_locator(home, session, current, first_generation=value["generation"])
+    return current
+
+
+def retained_locator(home, session, envelope, *, create=False, first_generation=None):
+    directory = home / "retained-bindings"
+    if create:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    path = directory / (session + ".json")
+    try:
+        value = json.loads(private_read(path))
+    except FileNotFoundError:
+        if not create or path.is_symlink():
+            raise NativeError("RETENTION_BINDING_MISSING") from None
+        value = dict(
+            session=session,
+            workspace=envelope["binding"]["workspace"],
+            firstGeneration=envelope["generation"],
+        )
+        atomic_write(path, encode(value))
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"session", "workspace", "firstGeneration"}
+        or value.get("session") != session
+        or value.get("workspace") != envelope["binding"]["workspace"]
+        or not isinstance(value.get("firstGeneration"), str)
+        or HEX.fullmatch(value["firstGeneration"]) is None
+        or (
+            first_generation is not None
+            and value["firstGeneration"] != first_generation
+        )
+    ):
+        raise NativeError("RETENTION_BINDING_INVALID")
+    first = home / "archive" / session / (value["firstGeneration"] + ".json")
+    first_record = validate_archive(
+        json.loads(private_read(first, limit=RETENTION_LIMIT)),
+        session,
+        value["firstGeneration"],
+    )
+    if "archiveGeneration" in first_record["binding"]:
+        raise NativeError("RETENTION_LINEAGE_INVALID")
+
+
+def read_binding(home, session, *, restore=True):
+    hot, path = read_hot_binding(home, session)
+    index = archive_index(home, session)
+    if index is None:
+        if hot and "archiveGeneration" in hot:
+            raise NativeError("RETENTION_CONFLICT")
+        return hot, path
+    archived = archived_record(home, session, index)
+    retained_locator(home, session, archived)
+    if index["location"] == "hot":
+        if (
+            hot is None
+            or hot.get("archiveGeneration") != index["generation"]
+            or any(
+                hot.get(k) != archived["binding"].get(k)
+                for k in (
+                    "schemaVersion",
+                    "session",
+                    "workspace",
+                    "project",
+                    "projectMode",
+                )
+            )
+        ):
+            raise NativeError("RETENTION_CONFLICT")
+        return hot, path
+    if hot is not None:
+        raise NativeError("RETENTION_CONFLICT")
+    if restore:
+        transition_retention(home, "restore", archived, index)
+        return read_hot_binding(home, session)
+    return archived["binding"], path
+
+
+def clean_retention_temporaries(expected):
+    for directory, bodies in expected.items():
+        for entry in streamed_entries(directory):
+            if not entry.name.startswith(".capture-"):
+                continue
+            if private_read(entry, limit=RETENTION_LIMIT) not in bodies:
+                raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
+            entry.unlink()
+        sync_directory(directory)
+
+
+def validate_retention_journal(home, value, *, unpublished=False):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "operation", "record", "before"}
+        or value.get("schemaVersion") != 1
+        or value.get("operation") not in ("archive", "restore")
+    ):
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    envelope = value["record"]
+    session = (
+        envelope.get("binding", {}).get("session")
+        if isinstance(envelope, dict) and isinstance(envelope.get("binding"), dict)
+        else None
+    )
+    if not isinstance(session, str) or HEX.fullmatch(session) is None:
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    envelope = validate_archive(envelope, session, envelope.get("generation"))
+    before = value["before"]
+    if before is not None and (
+        not isinstance(before, dict)
+        or set(before) != {"generation", "location"}
+        or before.get("location") not in ("hot", "archive")
+        or not isinstance(before.get("generation"), str)
+        or HEX.fullmatch(before["generation"]) is None
+    ):
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    binding = envelope["binding"]
+    child = home / "workspaces" / binding["workspace"]
+    _, descriptor = load_profile(child, inspect=True)
+    _, parent = load_profile(home, inspect=True)
+    validate_child(home, parent, child, descriptor)
+    archive = home / "archive"
+    if archive.exists() or archive.is_symlink():
+        private_directory(archive)
+    directory = archive / session
+    generation = envelope["generation"]
+    target = directory / (generation + ".json")
+    try:
+        index = archive_index(home, session)
+    except FileNotFoundError:
+        if value["before"] is not None:
+            raise NativeError("RETENTION_CONFLICT") from None
+        index = None
+    after = dict(
+        generation=generation,
+        location="archive" if value["operation"] == "archive" else "hot",
+    )
+    if index != value["before"] and index != after:
+        raise NativeError("RETENTION_CONFLICT")
+    if unpublished and index != before:
+        raise NativeError("RETENTION_CONFLICT")
+    if value["operation"] == "restore":
+        if before != dict(generation=generation, location="archive"):
+            raise NativeError("RETENTION_JOURNAL_INVALID")
+    elif before is None:
+        if "archiveGeneration" in binding:
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+    elif before["location"] != "hot":
+        raise NativeError("RETENTION_JOURNAL_INVALID")
+    if before is not None:
+        archived_record(home, session, before)
+        if (
+            value["operation"] == "archive"
+            and binding.get("archiveGeneration") != before["generation"]
+        ):
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+    with state_lock(child, session, create=False) as (state, _):
+        hot, _ = read_hot_binding(home, session)
+        if value["operation"] == "archive":
+            if (active_request(child) or {}).get("session") == session or (
+                (hot is not None and hot != binding)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index != after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+        elif (
+            (hot is not None and hot != dict(binding, archiveGeneration=generation))
+            or (state is not None and state != envelope["state"])
+            or (
+                index == after
+                and (hot is None or (binding["enrolled"] and state is None))
+            )
+            or (unpublished and (hot is not None or state is not None))
+        ):
+            raise NativeError("RETENTION_CONFLICT")
+        if target.exists() or target.is_symlink() or value["operation"] == "restore":
+            if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
+                raise NativeError("RETENTION_CONFLICT")
+    return envelope, before, child, directory, index, after
+
+
+def publication_candidates(directory, *, limit=LIMIT):
+    for entry in streamed_entries(directory):
+        if entry.name.startswith(".capture-"):
+            body = private_read(entry, limit=limit)
+            value = json.loads(body)
+            if not isinstance(value, dict) or encode(value) != body:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            yield entry, body, value
+
+
+def select_publication(directory, selector, *, limit=LIMIT):
+    selected = None
+    for candidate in publication_candidates(directory, limit=limit):
+        if selector(candidate[2]):
+            if selected is not None and selected[1] != candidate[1]:
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            selected = candidate
+    return selected
+
+
+def publish_candidate(candidate, target, *, limit=LIMIT, before=None):
+    entry, body, _ = candidate
+    if private_read(entry, limit=limit) != body:
+        raise NativeError("PUBLICATION_AMBIGUOUS")
+    if target.exists() or target.is_symlink():
+        existing = private_read(target, limit=limit)
+        if existing == body:
+            entry.unlink()
+        elif before is not None and existing == before:
+            os.replace(entry, target)
+        else:
+            raise NativeError("PUBLICATION_CONFLICT")
+    else:
+        os.replace(entry, target)
+    sync_directory(target.parent)
+
+
+def reconcile_retention(home):
+    journal = home / "retention-journal.json"
+    try:
+        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
+    except FileNotFoundError:
+        if journal.is_symlink():
+            raise NativeError("RETENTION_JOURNAL_INVALID") from None
+        candidate = select_publication(home, lambda value: True, limit=RETENTION_LIMIT)
+        if candidate is None:
+            return
+        validate_retention_journal(home, candidate[2], unpublished=True)
+        publish_candidate(candidate, journal, limit=RETENTION_LIMIT)
+        value = candidate[2]
+    envelope, before, child, directory, index, after = validate_retention_journal(
+        home, value
+    )
+    for _, body, _ in publication_candidates(home, limit=RETENTION_LIMIT):
+        if body != encode(value):
+            raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
+    binding = envelope["binding"]
+    session, generation = binding["session"], envelope["generation"]
+    archive = home / "archive"
+    archive.mkdir(mode=0o700, exist_ok=True)
+    private_directory(archive)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    target = directory / (generation + ".json")
+    binding_path = home / "bindings" / (session + ".json")
+    state_path = child / "capture-state" / (session + ".json")
+    with state_lock(child, session) as (state, _):
+        hot, _ = read_hot_binding(home, session)
+        if value["operation"] == "archive":
+            if (active_request(child) or {}).get("session") == session:
+                raise NativeError("RETENTION_CONFLICT")
+            if (
+                (hot is not None and hot != binding)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index != after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+            if target.exists() or target.is_symlink():
+                if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
+                    raise NativeError("RETENTION_CONFLICT")
+            else:
+                if hot is None:
+                    raise NativeError("RETENTION_CONFLICT")
+                atomic_write(target, encode(envelope), limit=RETENTION_LIMIT)
+            retained_locator(home, session, envelope, create=before is None)
+            atomic_write(directory / "index.json", encode(after), limit=RETENTION_LIMIT)
+            sync_directory(archive)
+            sync_directory(home)
+            binding_path.unlink(missing_ok=True)
+            state_path.unlink(missing_ok=True)
+            sync_directory(binding_path.parent)
+            sync_directory(state_path.parent)
+        else:
+            retained_locator(home, session, envelope)
+            if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
+                raise NativeError("RETENTION_CONFLICT")
+            restored = dict(binding, archiveGeneration=generation)
+            if (
+                (hot is not None and hot != restored)
+                or (state is not None and state != envelope["state"])
+                or (
+                    index == after
+                    and (hot is None or (binding["enrolled"] and state is None))
+                )
+            ):
+                raise NativeError("RETENTION_CONFLICT")
+            if envelope["state"] is not None:
+                atomic_write(state_path, encode(envelope["state"]))
+            atomic_write(binding_path, encode(restored))
+            atomic_write(directory / "index.json", encode(after), limit=RETENTION_LIMIT)
+        expected = {home: (encode(value),), directory: (encode(after),)}
+        if value["operation"] == "archive":
+            expected[directory] += (encode(envelope),)
+            locator = home / "retained-bindings"
+            expected[locator] = (private_read(locator / (session + ".json")),)
+        else:
+            expected[binding_path.parent] = (encode(restored),)
+            if envelope["state"] is not None:
+                expected[state_path.parent] = (encode(envelope["state"]),)
+        clean_retention_temporaries(expected)
+    journal.unlink()
+    sync_directory(home)
+
+
+def transition_retention(home, operation, record, before):
+    reconcile_retention(home)
+    if (home / "retention-journal.json").exists() or (
+        home / "retention-journal.json"
+    ).is_symlink():
+        raise NativeError("RETENTION_JOURNAL_PENDING")
+    value = dict(schemaVersion=1, operation=operation, record=record, before=before)
+    validate_retention_journal(home, value, unpublished=True)
+    atomic_write(
+        home / "retention-journal.json",
+        encode(value),
+        limit=RETENTION_LIMIT,
+    )
+    reconcile_retention(home)
+
+
+def retire_terminal_sessions(home, profile):
+    active = 0
+    for entry in streamed_entries(home / "bindings"):
+        if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+            raise NativeError("SESSION_BINDING_INVALID")
+        binding, _ = read_binding(home, entry.stem, restore=False)
+        child, _ = bound_child(home, profile, binding, inspect=True)
+        if any(
+            p.name.startswith(".capture-")
+            for p in streamed_entries(checked_state_directory(child))
+        ):
+            active += 1
+            continue
+        try:
+            with state_lock(child, entry.stem) as (state, _):
+                if (state is not None and drain_reasons(state)) or (
+                    active_request(child) or {}
+                ).get("session") == entry.stem:
+                    active += 1
+                    continue
+                if binding["enrolled"] and state is None:
+                    raise NativeError("RETENTION_CONFLICT")
+                generation = digest(encode([binding, state]))
+                record = dict(
+                    schemaVersion=1, binding=binding, state=state, generation=generation
+                )
+        except BlockingIOError:
+            active += 1
+            continue
+        transition_retention(home, "archive", record, archive_index(home, entry.stem))
+    return active
+
+
+def bound_child(home, profile, record, *, inspect=False):
+    private_directory(home / "workspaces")
+    child = home / "workspaces" / record["workspace"]
+    child, descriptor = load_profile(child, inspect=inspect)
+    validate_child(home, profile, child, descriptor)
+    if descriptor != child_profile(
+        home, profile, record["project"], record["projectMode"]
+    ):
+        raise NativeError("SESSION_BINDING_INVALID")
+    if record["enrolled"]:
+        index = archive_index(home, record["session"]) if inspect else None
+        if index is not None and index["location"] == "archive":
+            if archived_record(home, record["session"], index)["binding"] != record:
+                raise NativeError("RETENTION_CONFLICT")
+        else:
+            private_read(child / "capture-state" / (record["session"] + ".json"))
+    return child, descriptor
+
+
+def event_workspace(event):
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
+        raise NativeError("PROJECT_ROOT_REQUIRED")
+    directory = Path(cwd).resolve(strict=True)
+    if not directory.is_dir():
+        raise NativeError("PROJECT_ROOT_REQUIRED")
+    try:
+        root = git(
+            directory, "rev-parse", "--show-toplevel", allow_failure=True
+        ).strip()
+    except FileNotFoundError:
+        root = ""
+    return (
+        (str(Path(root).resolve(strict=True)), "git")
+        if root
+        else (str(directory), "directory")
+    )
+
+
+def user_hook_failure(event, code):
+    name = event.get("hook_event_name")
+    message = (
+        "Obsidian capture advisory: "
+        + code
+        + "; pending state retained, no new capture."
+    )
+    if name == "PreToolUse" and event.get("tool_name") in (
+        *CLAUDE_TOOLS,
+        *CLAUDE_TOOLS.values(),
+    ):
+        return {
+            "hookSpecificOutput": dict(
+                hookEventName=name,
+                permissionDecision="deny",
+                permissionDecisionReason=message,
+            )
+        }
+    return context(name, message)
+
+
+def check_user_state(home):
+    if any(p.name != "active.lock" for p in checked_state_directory(home).iterdir()):
+        raise NativeError("USER_STATE_INVALID")
+
+
+def provision_child(home, profile, project, mode):
+    key = workspace_key(project, mode)
+    children = private_directory(home / "workspaces")
+    child = children / key
+    staging = home / "provisioning"
+    staging.mkdir(mode=0o700, exist_ok=True)
+    private_directory(staging)
+    stage = staging / key
+    expected = child_profile(home, profile, project, mode)
+    if child.exists() or child.is_symlink():
+        private_directory(child)
+        if (child / "capture-profile.json").exists():
+            loaded, descriptor = load_profile(child)
+            validate_child(home, profile, loaded, descriptor)
+            return child
+        if (
+            stage.exists()
+            or {p.name for p in child.iterdir()} != {"capture-state"}
+            or any(checked_state_directory(child).iterdir())
+        ):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        os.rename(child, stage)
+    stage.mkdir(mode=0o700, exist_ok=True)
+    private_directory(stage)
+    (stage / "capture-state").mkdir(mode=0o700, exist_ok=True)
+    checked_state_directory(stage)
+    if any((stage / "capture-state").iterdir()) or any(
+        p.name not in ("capture-state", "capture-profile.json")
+        and not p.name.startswith(".capture-")
+        for p in stage.iterdir()
+    ):
+        raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+    descriptor = stage / "capture-profile.json"
+    candidate = select_publication(stage, lambda value: True)
+    if candidate is not None:
+        if candidate[1] != encode(expected):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        publish_candidate(candidate, descriptor)
+        clean_retention_temporaries({stage: (encode(expected),)})
+    if descriptor.exists() or descriptor.is_symlink():
+        if json.loads(private_read(descriptor)) != expected:
+            raise NativeError("CHILD_PROFILE_INVALID")
+    else:
+        atomic_write(descriptor, encode(expected))
+    os.rename(stage, child)
+    for directory in (staging, children):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return child
+
+
+def initial_session_state(profile, session, turn, transcript=None, *, date=None):
+    state = dict(
+        schemaVersion=1,
+        python=profile["python"],
+        session=session,
+        turn=turn,
+        disposition="pending",
+        session_save=session_plan(profile, session, turn, date=date),
+        snapshots={},
+        commits={},
+    )
+    if transcript is not None:
+        state["claude_transcript"] = transcript
+    return state
+
+
+def validate_initial_state(profile, session, state):
+    if not isinstance(state, dict) or not isinstance(state.get("session_save"), dict):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+    turn, transcript = state.get("turn"), state.get("claude_transcript")
+    date = state.get("session_save", {}).get("date")
+    if (
+        not isinstance(turn, str)
+        or HEX.fullmatch(turn) is None
+        or not isinstance(transcript, str)
+        or HEX.fullmatch(transcript) is None
+        or not isinstance(date, str)
+        or datetime.date.fromisoformat(date).isoformat() != date
+        or state != initial_session_state(profile, session, turn, transcript, date=date)
+    ):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+
+
+def continuation_capture(profile, session, state):
+    if (
+        not isinstance(state, dict)
+        or state.get("continuation_requested") is not True
+        or not isinstance(state.get("session_save"), dict)
+    ):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    turn, transcript = state.get("turn"), state.get("claude_transcript")
+    date = state["session_save"].get("date")
+    if (
+        not isinstance(turn, str)
+        or HEX.fullmatch(turn) is None
+        or not isinstance(transcript, str)
+        or HEX.fullmatch(transcript) is None
+        or not isinstance(date, str)
+        or datetime.date.fromisoformat(date).isoformat() != date
+    ):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    expected = initial_session_state(profile, session, turn, transcript, date=date)
+    fields = (
+        "schemaVersion",
+        "python",
+        "session",
+        "turn",
+        "claude_transcript",
+        "session_save",
+    )
+    if any(state.get(key) != expected[key] for key in fields):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    drain_reasons(state)
+
+    def commit_scope(event, metadata):
+        if (
+            not isinstance(event, dict)
+            or not isinstance(metadata, dict)
+            or event.get("repository") != profile["project"]
+            or event.get("schemaVersion") != 1
+            or event.get("event") != "git.commit"
+            or event.get("outcome") != "success"
+            or not isinstance(event.get("commit"), str)
+            or HASH.fullmatch(event["commit"]) is None
+            or metadata.get("hash") != event["commit"]
+        ):
+            raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+
+    for pending in state["commits"].values():
+        commit_scope(pending["event"], pending["metadata"])
+    for snapshot in state["snapshots"].values():
+        cwd = snapshot.get("cwd", profile["project"])
+        if (
+            not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or not Path(cwd).is_relative_to(Path(profile["project"]))
+            or ".." in Path(cwd).parts
+        ):
+            raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+        if snapshot.get("captured") is not None:
+            captured = snapshot["captured"]
+            if not isinstance(captured, list) or len(captured) != 2:
+                raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+            commit_scope(*captured)
+    return digest(encode({key: state[key] for key in fields}))
+
+
+def reconcile_enrollment(home, profile):
+    directory = home / "bindings"
+    candidate = select_publication(directory, lambda value: True)
+    if candidate is not None:
+        record = candidate[2]
+        session = record.get("session")
+        current, path = read_hot_binding(home, session)
+        validate_binding(record, session)
+        child = home / "workspaces" / record["workspace"]
+        _, descriptor = load_profile(child, inspect=True)
+        validate_child(home, profile, child, descriptor)
+        if descriptor != child_profile(
+            home, profile, record["project"], record["projectMode"]
+        ):
+            raise NativeError("SESSION_BINDING_INVALID")
+        with state_lock(child, session) as (state, _):
+            if read_binding(home, session, restore=False)[0] != current:
+                raise NativeError("PUBLICATION_CONFLICT")
+            if current != record:
+                if current is None:
+                    if (
+                        archive_index(home, session) is not None
+                        or "archiveGeneration" in record
+                    ):
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    expected = dict(record, enrolled=False, paused=False)
+                    if state is not None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                elif (
+                    record == dict(current, paused=True) and current["paused"] is False
+                ):
+                    if current["enrolled"] and state is None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    if state is not None:
+                        drain_reasons(state)
+                    expected = dict(current, paused=True)
+                elif (
+                    current["enrolled"]
+                    and current["paused"]
+                    and "continuationCapture" in record
+                ):
+                    expected = dict(
+                        current,
+                        paused=False,
+                        continuationCapture=continuation_capture(
+                            descriptor, session, state
+                        ),
+                    )
+                elif not current["enrolled"] or current["paused"]:
+                    validate_initial_state(descriptor, session, state)
+                    expected = dict(current, enrolled=True, paused=False)
+                    expected.pop("continuationCapture", None)
+                else:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                if record != expected:
+                    raise NativeError("PUBLICATION_CONFLICT")
+            publish_candidate(
+                candidate, path, before=encode(current) if current is not None else None
+            )
+            clean_retention_temporaries({directory: (candidate[1],)})
+    for path in streamed_entries(directory):
+        if path.suffix != ".json" or HEX.fullmatch(path.stem) is None:
+            raise NativeError("SESSION_BINDING_INVALID")
+        record, _ = read_hot_binding(home, path.stem)
+        if record["enrolled"] or record["paused"]:
+            continue
+        if archive_index(home, path.stem) is not None:
+            continue
+        child, descriptor = bound_child(home, profile, record, inspect=True)
+        with state_lock(child, path.stem) as (state, state_path):
+            candidate = select_publication(state_path.parent, lambda value: True)
+            if candidate is not None:
+                validate_initial_state(descriptor, path.stem, candidate[2])
+                if state is not None and state != candidate[2]:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                publish_candidate(candidate, state_path)
+                clean_retention_temporaries({state_path.parent: (candidate[1],)})
+                state = candidate[2]
+            if state is not None:
+                validate_initial_state(descriptor, path.stem, state)
+                atomic_write(path, encode(dict(record, enrolled=True)))
+
+
+def retained_capture_event(home, event):
+    session = digest(identifier(event.get("session_id")).encode())
+    with state_lock(home, session) as (state, _):
+        if state is None:
+            return False
+        normalized = normalize_claude(event, state)
+        name = normalized["hook_event_name"]
+        if name not in ("PreToolUse", "PostToolUse"):
+            return False
+        arguments = normalized.get("tool_input")
+        tool = normalized.get("tool_name")
+        call = normalized.get("tool_use_id")
+        if tool == "mcp__obsidian_write__obsidian_keeper_save":
+            return (
+                bool(state.get("session_request"))
+                and arguments == state["session_request"]
+                and (name == "PreToolUse" or call == state.get("session_call"))
+            )
+        if tool == "mcp__obsidian_write__obsidian_daily_append":
+            return any(
+                pending.get("native_arguments") is not None
+                and arguments == pending["native_arguments"]
+                and (name == "PreToolUse" or call == pending.get("in_flight"))
+                for pending in state["commits"].values()
+            )
+        return False
+
+
+def user_hook(home, profile, event):
+    try:
+        with gate_lock(home, nonblocking=True):
+            check_user_state(home)
+            reconcile_retention(home)
+            reconcile_enrollment(home, profile)
+            session = digest(identifier(event.get("session_id")).encode())
+            hot, _ = read_hot_binding(home, session)
+            index = archive_index(home, session)
+            if (
+                hot is None
+                and index is None
+                and event.get("hook_event_name") == "SessionStart"
+            ):
+                claude_transcript(event)
+                return context(
+                    "SessionStart",
+                    "Obsidian capture awaits UserPromptSubmit; startup does not enroll a session.",
+                )
+            activation = event.get("hook_event_name") == "UserPromptSubmit"
+            if event.get("hook_event_name") == "PreToolUse":
+                if hot is None:
+                    activation = index is not None
+                else:
+                    child = home / "workspaces" / hot["workspace"]
+                    private_directory(child)
+                    with state_lock(child, session) as (state, _):
+                        activation = state is None or not drain_reasons(state)
+            if activation:
+                if event.get("hook_event_name") == "UserPromptSubmit":
+                    normalize_claude(event, None)
+                active = retire_terminal_sessions(home, profile)
+                hot, _ = read_hot_binding(home, session)
+                index = archive_index(home, session)
+                if hot is None and active >= MAX_DRAIN_SESSIONS:
+                    raise NativeError("DRAIN_SESSION_LIMIT")
+            record, path = read_binding(home, session)
+            project, mode = event_workspace(event)
+            key = workspace_key(project, mode)
+            if record is not None and record["workspace"] != key:
+                raise NativeError("SESSION_WORKSPACE_CHANGED")
+            if record is None:
+                if event.get("hook_event_name") != "UserPromptSubmit":
+                    raise NativeError("PROMPT_EVENT_REQUIRED")
+                provision_child(home, profile, project, mode)
+                record = dict(
+                    schemaVersion=1,
+                    session=session,
+                    workspace=key,
+                    project=project,
+                    projectMode=mode,
+                    paused=False,
+                    enrolled=False,
+                )
+                bound_child(home, profile, record)
+                atomic_write(path, encode(record))
+            child, descriptor = bound_child(home, profile, record)
+            if any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            if (
+                record["paused"]
+                and event.get("hook_event_name") != "UserPromptSubmit"
+                and not retained_capture_event(child, event)
+            ):
+                return user_hook_failure(
+                    event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
+                )
+            try:
+                result = claude_output(
+                    engine_hook(child, descriptor, event), event.get("hook_event_name")
+                )
+            except (
+                NativeError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+            ):
+                if event.get("hook_event_name") == "UserPromptSubmit":
+                    record["paused"] = True
+                    atomic_write(path, encode(record))
+                raise
+            if event.get("hook_event_name") == "UserPromptSubmit" and (
+                record["paused"] or not record["enrolled"]
+            ):
+                with state_lock(child, session) as (admitted, _):
+                    if (
+                        admitted is not None
+                        and record["enrolled"]
+                        and record["paused"]
+                        and admitted.get("continuation_requested") is True
+                        and event["prompt"].startswith(
+                            "OBSIDIAN_MCP_CONTINUE:" + admitted["turn"] + "\n"
+                        )
+                        and normalize_claude(event, admitted)["turn_id"]
+                        == admitted["turn"]
+                    ):
+                        record["continuationCapture"] = continuation_capture(
+                            descriptor, session, admitted
+                        )
+                    else:
+                        validate_initial_state(descriptor, session, admitted)
+                        record.pop("continuationCapture", None)
+                    record["paused"] = False
+                    record["enrolled"] = True
+                    atomic_write(path, encode(record))
+            if mode == "directory" and event.get("hook_event_name") in (
+                "SessionStart",
+                "UserPromptSubmit",
+            ):
+                result.setdefault("hookSpecificOutput", {}).setdefault(
+                    "additionalContext", ""
+                )
+                result["hookSpecificOutput"][
+                    "additionalContext"
+                ] += "\nGit unavailable for this workspace; session-only capture, no commit inferred."
+            return result
+    except (
+        NativeError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as error:
+        return user_hook_failure(
+            event,
+            (
+                str(error)
+                if isinstance(error, NativeError)
+                else "USER_CAPTURE_UNAVAILABLE"
+            ),
+        )
+
+
+def inspect_child_records(home, child):
+    with gate_lock(child, nonblocking=True):
+        owner = active_request(child)
+        for entry in streamed_entries(checked_state_directory(child)):
+            if entry.name in (ACTIVE, "active.lock"):
+                continue
+            if (
+                entry.suffix not in (".json", ".lock")
+                or HEX.fullmatch(entry.stem) is None
+            ):
+                raise NativeError("DRAIN_STATE_INVALID")
+            with state_lock(child, entry.stem) as (state, _):
+                if state is not None:
+                    record, _ = read_hot_binding(home, entry.stem)
+                    if (
+                        record is None
+                        or record["workspace"] != child.name
+                        or not record["enrolled"]
+                    ):
+                        raise NativeError("SESSION_BINDING_INVALID")
+                    drain_reasons(state)
+        return owner
+
+
+def inspect_provisioning(home, profile):
+    directory = home / "provisioning"
+    if not directory.exists() and not directory.is_symlink():
+        return
+    for stage in streamed_entries(directory):
+        if HEX.fullmatch(stage.name) is None:
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        private_directory(stage)
+        if any(streamed_entries(checked_state_directory(stage))):
+            raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+        for entry in streamed_entries(stage):
+            if entry.name == "capture-state":
+                continue
+            if entry.name != "capture-profile.json":
+                raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
+            descriptor = json.loads(private_read(entry))
+            mode = project_mode(descriptor)
+            project = descriptor.get("project")
+            if stage.name != workspace_key(
+                project, mode
+            ) or descriptor != child_profile(home, profile, project, mode):
+                raise NativeError("CHILD_PROFILE_INVALID")
+
+
+def unpublished_user_state(home):
+    def pending(directory):
+        return any(
+            entry.name.startswith(".capture-") for entry in streamed_entries(directory)
+        )
+
+    if pending(home) or pending(home / "bindings"):
+        return True
+    for child in streamed_entries(home / "workspaces"):
+        private_directory(child)
+        if pending(checked_state_directory(child)):
+            return True
+    stages = home / "provisioning"
+    if stages.exists() or stages.is_symlink():
+        for stage in streamed_entries(stages):
+            if pending(stage):
+                return True
+    return False
+
+
+def user_drain_status(home, profile):
+    with gate_lock(home, nonblocking=True):
+        check_user_state(home)
+        if unpublished_user_state(home):
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="PUBLICATION_PENDING",
+            )
+        if (home / "retention-journal.json").exists() or (
+            home / "retention-journal.json"
+        ).is_symlink():
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="RETENTION_JOURNAL_PENDING",
+            )
+        inspect_provisioning(home, profile)
+        hot_count = archive_count = workspace_count = unresolved_count = 0
+        sessions = []
+        workspaces = []
+        quiescent = True
+        for entry in streamed_entries(home / "bindings"):
+            if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            record, _ = read_binding(home, entry.stem, restore=False)
+            if record is None:
+                raise NativeError("SESSION_BINDING_INVALID")
+            child, _ = bound_child(home, profile, record, inspect=True)
+            with state_lock(child, entry.stem) as (state, _):
+                reasons = drain_reasons(state) if state is not None else []
+                if record["enrolled"] != (state is not None):
+                    raise NativeError("SESSION_BINDING_INVALID")
+            hot_count += 1
+            if reasons:
+                unresolved_count += 1
+                quiescent = False
+                if len(sessions) < MAX_DRAIN_SESSIONS:
+                    sessions.append(
+                        dict(
+                            session=entry.stem,
+                            workspace=record["workspace"],
+                            unresolved=reasons,
+                        )
+                    )
+        archive = home / "archive"
+        if archive.exists() or archive.is_symlink():
+            for directory in streamed_entries(archive):
+                session = directory.name
+                if HEX.fullmatch(session) is None:
+                    raise NativeError("RETENTION_ARCHIVE_INVALID")
+                index = archive_index(home, session)
+                current = archived_record(home, session, index)
+                bound_child(home, profile, current["binding"], inspect=True)
+                read_binding(home, session, restore=False)
+                for entry in streamed_entries(directory):
+                    if entry.name == "index.json":
+                        continue
+                    if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                        raise NativeError("RETENTION_ARCHIVE_INVALID")
+                    validate_archive(
+                        json.loads(private_read(entry, limit=RETENTION_LIMIT)),
+                        session,
+                        entry.stem,
+                    )
+                if index["location"] == "archive":
+                    archive_count += 1
+        locators = home / "retained-bindings"
+        if locators.exists() or locators.is_symlink():
+            for entry in streamed_entries(locators):
+                if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                    raise NativeError("RETENTION_BINDING_INVALID")
+                index = archive_index(home, entry.stem)
+                if index is None:
+                    raise NativeError("RETENTION_ARCHIVE_MISSING")
+                retained_locator(
+                    home, entry.stem, archived_record(home, entry.stem, index)
+                )
+        for child in streamed_entries(home / "workspaces"):
+            if HEX.fullmatch(child.name) is None:
+                raise NativeError("CHILD_PROFILE_INVALID")
+            child, descriptor = load_profile(child, inspect=True)
+            validate_child(home, profile, child, descriptor)
+            owner = inspect_child_records(home, child)
+            workspace_count += 1
+            if owner is not None:
+                record, _ = read_hot_binding(home, owner["session"])
+                if record is None or record["workspace"] != child.name:
+                    raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
+                quiescent = False
+            if len(workspaces) < MAX_DRAIN_SESSIONS:
+                workspaces.append(dict(workspace=child.name, active_request=owner))
+        return dict(
+            status="inspected",
+            complete=True,
+            quiescent=quiescent,
+            workspace_count=workspace_count,
+            session_count=hot_count + archive_count,
+            hot_session_count=hot_count,
+            archived_session_count=archive_count,
+            unresolved_session_count=unresolved_count,
+            sessions=sessions,
+            workspaces=workspaces,
+            details_truncated=workspace_count > len(workspaces)
+            or unresolved_count > len(sessions),
+            active_request=None,
+        )
+
+
 def checked_state_directory(home):
     directory = home / "capture-state"
     item = directory.lstat()
@@ -476,17 +1738,23 @@ def checked_state_directory(home):
 
 
 @contextmanager
-def state_lock(home, key):
+def state_lock(home, key, *, create=True):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
     fd = os.open(
-        directory / (key + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        directory / (key + ".lock"),
+        (os.O_CREAT if create else 0) | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         path = directory / (key + ".json")
-        state = json.loads(private_read(path)) if path.exists() else None
+        state = (
+            json.loads(private_read(path))
+            if path.exists() or path.is_symlink()
+            else None
+        )
         if state is not None and (
             not isinstance(state, dict)
             or state.get("schemaVersion") != 1
@@ -611,8 +1879,8 @@ def drain_status(home):
             ):
                 raise NativeError("DRAIN_STATE_INVALID")
             keys.add(entry.stem)
-        if len(keys) > MAX_DRAIN_SESSIONS:
-            raise NativeError("DRAIN_SESSION_LIMIT")
+            if len(keys) > MAX_DRAIN_SESSIONS:
+                raise NativeError("DRAIN_SESSION_LIMIT")
         sessions = []
         present = set()
         for key in sorted(keys):
@@ -848,8 +2116,8 @@ def producer_event(root, before):
     return event, consumer["run_producer"](BUNDLE, event, sys.executable)
 
 
-def session_plan(profile, session, turn):
-    date = datetime.date.today().isoformat()
+def session_plan(profile, session, turn, *, date=None):
+    date = date or datetime.date.today().isoformat()
     title = "Session " + digest((session + turn).encode())[:20]
     folder = profile["folder"]
     return dict(
@@ -1219,6 +2487,8 @@ def claude_output(value, name):
 
 
 def hook(home, profile, event):
+    if capture_scope(profile) == "user":
+        return user_hook(home, profile, event)
     if profile["host"] != "claude-plugin":
         return engine_hook(home, profile, event)
     name = event.get("hook_event_name")
@@ -1231,6 +2501,7 @@ def hook(home, profile, event):
         ValueError,
         KeyError,
         TypeError,
+        subprocess.SubprocessError,
     ) as error:
         code = (
             str(error)
@@ -1238,7 +2509,10 @@ def hook(home, profile, event):
             else "HOOK_STATE_OR_EVENT_INVALID"
         )
         message = "Obsidian capture unresolved: " + code
-        if name == "PreToolUse":
+        if name == "PreToolUse" and event.get("tool_name") in (
+            *CLAUDE_TOOLS,
+            *CLAUDE_TOOLS.values(),
+        ):
             return {
                 "hookSpecificOutput": dict(
                     hookEventName=name,
@@ -1246,14 +2520,8 @@ def hook(home, profile, event):
                     permissionDecisionReason=message,
                 )
             }
-        if name == "UserPromptSubmit":
-            return dict(decision="block", reason=message)
         if name == "Stop":
-            return (
-                dict(systemMessage=message)
-                if event.get("stop_hook_active")
-                else dict(decision="block", reason=message)
-            )
+            return dict(systemMessage=message)
         return context(name, message)
 
 
@@ -1325,18 +2593,16 @@ def engine_hook(home, profile, event):
                     and drain_reasons(state)
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
-                state = dict(
-                    schemaVersion=1,
-                    python=profile["python"],
-                    session=session,
-                    turn=turn,
-                    disposition="pending",
-                    session_save=session_plan(profile, session, turn),
-                    snapshots={},
-                    commits={},
+                state = initial_session_state(
+                    profile,
+                    session,
+                    turn,
+                    (
+                        event["claude_transcript"]
+                        if profile["host"] == "claude-plugin"
+                        else None
+                    ),
                 )
-                if profile["host"] == "claude-plugin":
-                    state["claude_transcript"] = event["claude_transcript"]
             atomic_write(path, encode(state))
             return context(
                 name,
@@ -1637,7 +2903,7 @@ def prepare_commit(home, profile, args):
     return result
 
 
-def execute_commit(home, profile, args):
+def execute_commit(home, profile, args, parent_locks=None):
     require_git_profile(profile)
     with state_lock(home, args.session) as (state, path):
         if state is None or args.snapshot not in state["snapshots"]:
@@ -1668,6 +2934,8 @@ def execute_commit(home, profile, args):
                 words.pop(0)
         before["execution_started"] = True
         atomic_write(path, encode(state))
+        if parent_locks is not None:
+            parent_locks.close()
         producer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-commit-event"))
         environment = producer["isolated_environment"]()
         for role in ("AUTHOR", "COMMITTER"):
@@ -1943,7 +3211,8 @@ def main():
     parser.add_argument("--home")
     parser.add_argument("--host", choices=("codex", "claude-plugin"))
     parser.add_argument("--project")
-    parser.add_argument("--project-mode", choices=("git", "directory"), default="git")
+    parser.add_argument("--scope", choices=("project", "user"), default="project")
+    parser.add_argument("--project-mode", choices=("git", "directory"))
     parser.add_argument("--folder")
     parser.add_argument("--daily-folder", default="Daily")
     parser.add_argument("--release-sha256")
@@ -1963,13 +3232,32 @@ def main():
         "--reason", choices=("no_meaningful_work", "user_requested_no_capture")
     )
     args, extra = parser.parse_known_args()
+    with ExitStack() as locks:
+        return dispatch_command(args, extra, locks)
+
+
+def status_result(state, owner):
+    result = json.loads(encode(state)) if state else {"status": "session_unavailable"}
+    result.pop("session_request", None)
+    for pending in result.get("commits", {}).values():
+        pending.pop("request", None)
+        pending.pop("native_arguments", None)
+    result["gate"] = owner
+    return result
+
+
+def dispatch_command(args, extra, locks):
+    if extra and args.operation not in ("run", "capabilities", "attach", "create"):
+        raise NativeError("ARGUMENTS_INVALID")
     if args.operation == "capabilities":
         if extra or not args.release_sha256 or args.home or args.host:
             raise NativeError("CAPABILITIES_ARGUMENTS_INVALID")
         result = capabilities(args.release_sha256)
     elif args.operation in ("create", "attach"):
-        if extra or not all(
-            (args.home, args.project, args.folder, args.release_sha256)
+        if (
+            extra
+            or not all((args.home, args.folder, args.release_sha256))
+            or (args.scope == "project" and not args.project)
         ):
             raise NativeError("CREATE_ARGUMENTS_REQUIRED")
         if args.operation == "create":
@@ -1981,7 +3269,57 @@ def main():
     else:
         if not args.home:
             raise NativeError("HOME_REQUIRED")
-        home, profile = load_profile(args.home)
+        inspection = args.operation in (
+            "profile-status",
+            "drain-status",
+            "status",
+            "request",
+        )
+        home, profile = load_profile(args.home, inspect=inspection)
+        if "parentHome" in profile and args.operation != "profile-status":
+            home, profile = load_profile(
+                profile["parentHome"], parent_only=True, inspect=inspection
+            )
+        scope = capture_scope(profile)
+        if scope == "user" and args.operation not in (
+            "profile-status",
+            "drain-status",
+            "hook",
+        ):
+            locks.enter_context(gate_lock(home, nonblocking=True))
+            if inspection and unpublished_user_state(home):
+                raise NativeError("PUBLICATION_PENDING")
+            if inspection and (home / "retention-journal.json").exists():
+                raise NativeError("RETENTION_JOURNAL_PENDING")
+            if not inspection:
+                reconcile_retention(home)
+                reconcile_enrollment(home, profile)
+            record, _ = read_binding(home, args.session, restore=not inspection)
+            if record is None:
+                raise NativeError("SESSION_BINDING_REQUIRED")
+            index = archive_index(home, args.session)
+            child, descriptor = bound_child(home, profile, record, inspect=inspection)
+            if not inspection and any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
+            if inspection and index is not None and index["location"] == "archive":
+                if project_mode(descriptor) == "directory" and (
+                    args.commit is not None or args.snapshot is not None
+                ):
+                    raise NativeError("DIRECTORY_SESSION_ONLY")
+                state = archived_record(home, args.session, index)["state"]
+                result = (
+                    (state or {}).get(
+                        "session_request", {"status": "request_unavailable"}
+                    )
+                    if args.operation == "request"
+                    else status_result(state, None)
+                )
+                print(json.dumps(result))
+                return 0
+            home, profile = child, descriptor
         mode = project_mode(profile)
         if mode == "directory" and (
             args.operation
@@ -1998,8 +3336,7 @@ def main():
                 apiVersion=1,
                 host=profile["host"],
                 home=str(home),
-                project=profile["project"],
-                projectMode=mode,
+                scope=capture_scope(profile),
                 folder=profile["folder"],
                 daily_folder=profile.get("dailyFolder", "Daily"),
                 release_id=profile["releaseId"],
@@ -2008,10 +3345,16 @@ def main():
                 active=True,
                 ownership_managed=False,
             )
+            if scope == "project":
+                result.update(project=profile["project"], projectMode=mode)
         elif args.operation == "drain-status":
-            result = drain_status(home)
+            result = (
+                user_drain_status(home, profile)
+                if scope == "user"
+                else drain_status(home)
+            )
         elif args.operation == "execute-commit":
-            return execute_commit(home, profile, args)
+            return execute_commit(home, profile, args, locks)
         elif args.operation == "hook":
             result = hook(home, profile, input_json())
         elif args.operation in ("prepare", "retry"):
@@ -2072,16 +3415,7 @@ def main():
                         "session_request", {"status": "request_unavailable"}
                     )
                 else:
-                    result = (
-                        json.loads(encode(state))
-                        if state
-                        else {"status": "session_unavailable"}
-                    )
-                    result.pop("session_request", None)
-                    for pending in result.get("commits", {}).values():
-                        pending.pop("request", None)
-                        pending.pop("native_arguments", None)
-                    result["gate"] = active_request(home)
+                    result = status_result(state, active_request(home))
         elif args.operation == "disable":
             if profile["host"] == "claude-plugin":
                 raise NativeError("PLUGIN_OWNERSHIP_MANAGED_EXTERNALLY")
