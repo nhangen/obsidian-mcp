@@ -3566,6 +3566,344 @@ class UserCaptureTest(NativeCaptureFixture):
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
 
+    def continuation_fixture(self, *, commits=False):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original meaningful work")
+        if commits:
+            path, _, _ = self.pending_commit()
+            self.save(path)
+        else:
+            (path,) = self.state_paths()
+        self.hook("Stop", stop_hook_active=False)
+        frozen = path.read_bytes()
+        self.assertTrue(json.loads(frozen)["continuation_requested"])
+        self.pause_next_prompt()
+        self.assertEqual(path.read_bytes(), frozen)
+        event = self.event(
+            "UserPromptSubmit",
+            prompt="OBSIDIAN_MCP_CONTINUE:"
+            + json.loads(frozen)["turn"]
+            + "\nContinue original capture",
+        )
+        return path, frozen, event
+
+    def interrupted_continuation(self, event):
+        program = """
+import json, os, sys, types
+from pathlib import Path
+script, home, event = sys.argv[1:]
+module = types.ModuleType("continuation_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+replace = module.os.replace
+def crash(source, target):
+    target = Path(target)
+    if target.parent.name == "bindings" and json.loads(Path(source).read_bytes())["paused"] is False:
+        os._exit(73)
+    return replace(source, target)
+module.os.replace = crash
+profile_home, descriptor = module.load_profile(home)
+print(json.dumps(module.hook(profile_home, descriptor, json.loads(event))))
+"""
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                json.dumps(event),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def test_continuation_first_save_completes_original_turn_normally_and_after_marker_crash(
+        self,
+    ):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                self.home = self.directory / (
+                    "interrupted" if interrupted else "normal"
+                )
+                path, frozen, event = self.continuation_fixture()
+                original = json.loads(frozen)
+                self.assertNotIn("session_request", original)
+                if interrupted:
+                    result = self.interrupted_continuation(event)
+                    self.assertEqual(result.returncode, 73, result.stderr)
+                    self.assertEqual(path.read_bytes(), frozen)
+                    (candidate,) = self.home.rglob(".capture-*")
+                    self.assertRegex(
+                        json.loads(candidate.read_bytes())["continuationCapture"],
+                        r"^[0-9a-f]{64}$",
+                    )
+                    self.hook("SessionStart", source="resume")
+                else:
+                    continued = self.hook("UserPromptSubmit", prompt=event["prompt"])
+                    self.assertIn("obsidian_keeper_save", json.dumps(continued))
+                self.assertEqual(path.read_bytes(), frozen)
+                self.assertEqual(list(self.home.rglob(".capture-*")), [])
+                self.save(path)
+                saved = json.loads(path.read_bytes())
+                self.assertEqual(saved["disposition"], "saved")
+                self.assertEqual(saved["turn"], original["turn"])
+                self.assertEqual(saved["session_save"], original["session_save"])
+                self.assertEqual(
+                    saved["session_request"]["idempotency_key"],
+                    original["session_save"]["idempotency_key"],
+                )
+                self.assertTrue(self.drain()["quiescent"])
+
+    def test_continuation_crash_recovery_does_not_strand_unrelated_root(self):
+        path, frozen, event = self.continuation_fixture()
+        result = self.interrupted_continuation(event)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        other = self.directory / "independent-root"
+        other.mkdir()
+        admitted = self.hook(
+            "UserPromptSubmit",
+            session_id="independent",
+            cwd=str(other),
+            prompt="Independent meaningful work",
+        )
+        self.assertIn("obsidian_keeper_save", json.dumps(admitted))
+        self.assertEqual(path.read_bytes(), frozen)
+        self.assertEqual(list(self.home.rglob(".capture-*")), [])
+        self.save(path)
+        self.assertEqual(json.loads(path.read_bytes())["disposition"], "saved")
+        self.assertFalse(self.drain()["quiescent"])
+
+    def test_continuation_marker_accepts_same_turn_commit_progress_with_saved_session(
+        self,
+    ):
+        path, frozen, event = self.continuation_fixture(commits=True)
+        self.assertEqual(json.loads(frozen)["disposition"], "saved")
+        result = self.interrupted_continuation(event)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        (candidate,) = self.home.rglob(".capture-*")
+        held = self.directory / "held-continuation-marker"
+        candidate.rename(held)
+        commit = next(iter(json.loads(frozen)["commits"]))
+        prepared = self.prepare(path, commit)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        changed = path.read_bytes()
+        self.assertNotEqual(changed, frozen)
+        held.rename(candidate)
+        self.hook("SessionStart", source="resume")
+        self.assertEqual(path.read_bytes(), changed)
+        arguments = json.loads(prepared.stdout)["arguments"]
+        call = dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id="continued-commit",
+            tool_input=arguments,
+        )
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.hook(
+            "PostToolUse",
+            **call,
+            tool_response={
+                "structuredContent": ClaudePluginCaptureTest.commit_receipt(
+                    self, arguments
+                )
+            },
+        )
+        saved = json.loads(path.read_bytes())
+        self.assertEqual(saved["commits"][commit]["status"], "committed")
+        self.assertEqual(
+            saved["commits"][commit]["payload_digest"],
+            json.loads(changed)["commits"][commit]["payload_digest"],
+        )
+        self.assertTrue(self.drain()["quiescent"])
+
+    def test_continuation_unpause_accepts_completed_same_turn_progress(self):
+        for recover in (False, True):
+            with self.subTest(recover=recover):
+                self.home = self.directory / ("recover" if recover else "normal")
+                self.project = self.directory / (
+                    "recover-git" if recover else "normal-git"
+                )
+                self.project.mkdir()
+                self.git("init", "-b", "native-fixture")
+                path, frozen, event = self.continuation_fixture(commits=True)
+                result = self.interrupted_continuation(event)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                (candidate,) = self.home.rglob(".capture-*")
+                held = self.directory / "terminal-continuation-marker"
+                candidate.rename(held)
+                commit = next(iter(json.loads(frozen)["commits"]))
+                prepared = self.prepare(path, commit)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                arguments = json.loads(prepared.stdout)["arguments"]
+                call = dict(
+                    tool_name="mcp__obsidian-write__obsidian_daily_append",
+                    tool_use_id="late-commit",
+                    tool_input=arguments,
+                )
+                self.assertEqual(self.hook("PreToolUse", **call), {})
+                self.hook(
+                    "PostToolUse",
+                    **call,
+                    tool_response={
+                        "structuredContent": ClaudePluginCaptureTest.commit_receipt(
+                            self, arguments
+                        )
+                    },
+                )
+                completed = path.read_bytes()
+                state = json.loads(completed)
+                self.assertEqual(state["disposition"], "saved")
+                self.assertEqual(state["commits"][commit]["status"], "committed")
+                self.assertTrue(state["continuation_requested"])
+                binding = self.home / "bindings" / (path.stem + ".json")
+                self.assertTrue(json.loads(binding.read_bytes())["paused"])
+                if recover:
+                    held.rename(candidate)
+                    output = self.hook("SessionStart", source="resume")
+                else:
+                    output = self.hook("UserPromptSubmit", prompt=event["prompt"])
+                self.assertNotIn("CONTINUATION_PUBLICATION_INVALID", json.dumps(output))
+                self.assertFalse(json.loads(binding.read_bytes())["paused"])
+                self.assertEqual(path.read_bytes(), completed)
+                self.assertEqual(list(self.home.rglob(".capture-*")), [])
+                self.assertTrue(self.drain()["quiescent"])
+
+    def test_stale_continuation_marker_cannot_authorize_another_turn(self):
+        path, frozen, event = self.continuation_fixture()
+        result = self.interrupted_continuation(event)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        (candidate,) = self.home.rglob(".capture-*")
+        held = self.directory / "old-turn-marker"
+        candidate.rename(held)
+        self.hook("UserPromptSubmit", prompt=event["prompt"])
+        self.save(path)
+        self.transcript.write_text(
+            self.transcript.read_text() + '{"type":"user","uuid":"meaningful-B"}\n'
+        )
+        self.hook("UserPromptSubmit", prompt="Different meaningful turn B")
+        self.hook("Stop", stop_hook_active=False)
+        self.pause_next_prompt()
+        before = path.read_bytes()
+        self.assertNotEqual(json.loads(before)["turn"], json.loads(frozen)["turn"])
+        held.rename(candidate)
+        binding = self.home / "bindings" / (path.stem + ".json")
+        before_binding = binding.read_bytes()
+        output = self.hook("SessionStart", source="resume")
+        self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(binding.read_bytes(), before_binding)
+        self.assertTrue(candidate.exists())
+
+    def test_continuation_recovery_preserves_payload_retry_and_receipt_guards(self):
+        for outcome in ("partial", "conflict", "mismatched"):
+            with self.subTest(outcome=outcome):
+                self.home = self.directory / outcome
+                path, _, event = self.continuation_fixture()
+                result = self.interrupted_continuation(event)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.hook("SessionStart", source="resume")
+                changes = (
+                    {"path": "Other/forged.md"}
+                    if outcome == "mismatched"
+                    else {
+                        "error_code": outcome.upper(),
+                        "retryable": True,
+                        "recovery": {"required": True, "action": "inspect"},
+                    }
+                )
+                self.save(
+                    path,
+                    status="committed" if outcome == "mismatched" else outcome,
+                    receipt_changes=changes,
+                )
+                pending = json.loads(path.read_bytes())
+                self.assertEqual(pending["disposition"], "pending")
+                self.assertTrue(pending["session_recovery"])
+                frozen = path.read_bytes()
+                arguments = self.session_arguments(path)
+                for payload in (arguments, dict(arguments, body="Different work")):
+                    denied = self.hook(
+                        "PreToolUse",
+                        tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                        tool_use_id="unreviewed",
+                        tool_input=payload,
+                    )
+                    self.assertEqual(
+                        denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                    )
+                self.assertEqual(path.read_bytes(), frozen)
+                retry = self.cli(
+                    "retry",
+                    "--home",
+                    str(self.home),
+                    "--session",
+                    path.stem,
+                    "--payload-sha256",
+                    pending["session_payload_digest"],
+                    "--verification",
+                    "authoritative-path-inspected",
+                )
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertEqual(json.loads(retry.stdout), arguments)
+                self.save(path, call="reviewed")
+                self.assertEqual(json.loads(path.read_bytes())["disposition"], "saved")
+                self.assertTrue(self.drain()["quiescent"])
+
+    def test_continuation_marker_rejects_changed_capture_scope_or_missing_witness(self):
+        for damage in (
+            "plan",
+            "transcript",
+            "session",
+            "python",
+            "commit_scope",
+            "missing_witness",
+        ):
+            with self.subTest(damage=damage):
+                self.home = self.directory / damage
+                path, _, event = self.continuation_fixture(
+                    commits=damage == "commit_scope"
+                )
+                result = self.interrupted_continuation(event)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                (candidate,) = self.home.rglob(".capture-*")
+                state = json.loads(path.read_bytes())
+                if damage == "missing_witness":
+                    record = json.loads(candidate.read_bytes())
+                    record.pop("continuationCapture")
+                    candidate.write_bytes(
+                        json.dumps(
+                            record, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    )
+                else:
+                    if damage == "plan":
+                        state["session_save"]["folder"] = "Other"
+                    elif damage == "transcript":
+                        state["claude_transcript"] = "f" * 64
+                    elif damage == "session":
+                        state["session"] = "f" * 64
+                    elif damage == "python":
+                        state["python"] = "/untrusted/python"
+                    else:
+                        next(iter(state["commits"].values()))["event"]["repository"] = (
+                            str(self.directory / "other")
+                        )
+                    path.write_bytes(
+                        json.dumps(
+                            state, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    )
+                frozen = path.read_bytes()
+                binding = self.home / "bindings" / (path.stem + ".json")
+                before_binding = binding.read_bytes()
+                output = self.hook("SessionStart", source="resume")
+                self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+                self.assertEqual(path.read_bytes(), frozen)
+                self.assertEqual(binding.read_bytes(), before_binding)
+                self.assertTrue(candidate.exists())
+
     def unpublished_publication(self, phase):
         self.configure()
         if phase == "journal":

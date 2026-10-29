@@ -512,7 +512,14 @@ bytes must exactly match the expected parent-pinned descriptor in empty private
 staging. Enrollment recovery accepts only the expected initial binding, an exact
 initial-state plan with no established conflicting state, or a verified binding
 marker transition. A paused-only marker may only restrict an existing binding;
-clearing pause or completing enrollment requires the persisted initial state.
+initial enrollment and new-turn unpause still require the persisted initial state.
+An accepted explicit continuation can unpause an enrolled binding so the retained
+turn can make its first save. Its `continuationCapture` marker binds recovery to
+the existing session, turn, transcript, and canonical capture plan, with validated
+scope and a pending continuation request. Same-turn commit progress does not
+invalidate that witness, including completion by matching receipts; a stale marker
+from another turn cannot authorize recovery.
+Recovery publishes only the binding and leaves pending state bytes unchanged.
 Recovered pending work is never replaced by a later prompt. Partial, conflicting,
 symlinked, and hardlinked intents remain preserved and fail closed. Inspection
 does not recover or delete intents and never reports complete drain while any

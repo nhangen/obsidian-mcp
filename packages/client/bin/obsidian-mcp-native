@@ -595,7 +595,7 @@ def read_hot_binding(home, session):
 def validate_binding(record, session):
     if (
         not isinstance(record, dict)
-        or set(record) - {"archiveGeneration"}
+        or set(record) - {"archiveGeneration", "continuationCapture"}
         != {
             "schemaVersion",
             "session",
@@ -617,6 +617,14 @@ def validate_binding(record, session):
             and (
                 not isinstance(record["archiveGeneration"], str)
                 or HEX.fullmatch(record["archiveGeneration"]) is None
+            )
+        )
+        or (
+            "continuationCapture" in record
+            and (
+                record.get("enrolled") is not True
+                or not isinstance(record["continuationCapture"], str)
+                or HEX.fullmatch(record["continuationCapture"]) is None
             )
         )
         or record.get("workspace")
@@ -1231,6 +1239,70 @@ def validate_initial_state(profile, session, state):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
 
 
+def continuation_capture(profile, session, state):
+    if (
+        not isinstance(state, dict)
+        or state.get("continuation_requested") is not True
+        or not isinstance(state.get("session_save"), dict)
+    ):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    turn, transcript = state.get("turn"), state.get("claude_transcript")
+    date = state["session_save"].get("date")
+    if (
+        not isinstance(turn, str)
+        or HEX.fullmatch(turn) is None
+        or not isinstance(transcript, str)
+        or HEX.fullmatch(transcript) is None
+        or not isinstance(date, str)
+        or datetime.date.fromisoformat(date).isoformat() != date
+    ):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    expected = initial_session_state(profile, session, turn, transcript, date=date)
+    fields = (
+        "schemaVersion",
+        "python",
+        "session",
+        "turn",
+        "claude_transcript",
+        "session_save",
+    )
+    if any(state.get(key) != expected[key] for key in fields):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+    drain_reasons(state)
+
+    def commit_scope(event, metadata):
+        if (
+            not isinstance(event, dict)
+            or not isinstance(metadata, dict)
+            or event.get("repository") != profile["project"]
+            or event.get("schemaVersion") != 1
+            or event.get("event") != "git.commit"
+            or event.get("outcome") != "success"
+            or not isinstance(event.get("commit"), str)
+            or HASH.fullmatch(event["commit"]) is None
+            or metadata.get("hash") != event["commit"]
+        ):
+            raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+
+    for pending in state["commits"].values():
+        commit_scope(pending["event"], pending["metadata"])
+    for snapshot in state["snapshots"].values():
+        cwd = snapshot.get("cwd", profile["project"])
+        if (
+            not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or not Path(cwd).is_relative_to(Path(profile["project"]))
+            or ".." in Path(cwd).parts
+        ):
+            raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+        if snapshot.get("captured") is not None:
+            captured = snapshot["captured"]
+            if not isinstance(captured, list) or len(captured) != 2:
+                raise NativeError("CONTINUATION_PUBLICATION_INVALID")
+            commit_scope(*captured)
+    return digest(encode({key: state[key] for key in fields}))
+
+
 def reconcile_enrollment(home, profile):
     directory = home / "bindings"
     candidate = select_publication(directory, lambda value: True)
@@ -1267,9 +1339,22 @@ def reconcile_enrollment(home, profile):
                     if state is not None:
                         drain_reasons(state)
                     expected = dict(current, paused=True)
+                elif (
+                    current["enrolled"]
+                    and current["paused"]
+                    and "continuationCapture" in record
+                ):
+                    expected = dict(
+                        current,
+                        paused=False,
+                        continuationCapture=continuation_capture(
+                            descriptor, session, state
+                        ),
+                    )
                 elif not current["enrolled"] or current["paused"]:
                     validate_initial_state(descriptor, session, state)
                     expected = dict(current, enrolled=True, paused=False)
+                    expected.pop("continuationCapture", None)
                 else:
                     raise NativeError("PUBLICATION_CONFLICT")
                 if record != expected:
@@ -1419,9 +1504,27 @@ def user_hook(home, profile, event):
             if event.get("hook_event_name") == "UserPromptSubmit" and (
                 record["paused"] or not record["enrolled"]
             ):
-                record["paused"] = False
-                record["enrolled"] = True
-                atomic_write(path, encode(record))
+                with state_lock(child, session) as (admitted, _):
+                    if (
+                        admitted is not None
+                        and record["enrolled"]
+                        and record["paused"]
+                        and admitted.get("continuation_requested") is True
+                        and event["prompt"].startswith(
+                            "OBSIDIAN_MCP_CONTINUE:" + admitted["turn"] + "\n"
+                        )
+                        and normalize_claude(event, admitted)["turn_id"]
+                        == admitted["turn"]
+                    ):
+                        record["continuationCapture"] = continuation_capture(
+                            descriptor, session, admitted
+                        )
+                    else:
+                        validate_initial_state(descriptor, session, admitted)
+                        record.pop("continuationCapture", None)
+                    record["paused"] = False
+                    record["enrolled"] = True
+                    atomic_write(path, encode(record))
             if mode == "directory" and event.get("hook_event_name") in (
                 "SessionStart",
                 "UserPromptSubmit",
