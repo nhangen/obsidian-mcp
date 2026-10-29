@@ -24,6 +24,10 @@ not activate writers; the plugin separately owns migration and admission gates.
 Attached Claude commit capture uses canonical MCP arguments directly, with bounded
 Pre-hook preparation and immutable retries. It needs no Bash stdin helper grant;
 existing MCP tool authorization and recovery checks still apply.
+Claude attach can snapshot a private exact-repository commit route map once with
+`--commit-routes /absolute/private/routes.json`; user-scope children inherit it.
+See [commit route policy](packages/client/README.md#commit-route-policy) for the
+bounded format, frozen-target behavior, and host limits.
 Explicit attached Claude profiles can opt into `--project-mode directory` for
 session-only non-Git workspaces. Git remains the default and is required for
 commit capture. See the [directory-profile boundary](packages/client/README.md#explicit-directory-session-profiles);

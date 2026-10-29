@@ -6,6 +6,7 @@ import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +26,8 @@ BRIDGE_GRACE = 2.0
 BRIDGE_OUTPUT_LIMIT = 262144
 BRIDGE_LINE_LIMIT = 65536
 FILE_LIMIT = 1048576
+ROUTES_LIMIT = 65536
+ROUTES_COUNT = 128
 HASH_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 TIME_PATTERN = re.compile(r"\d{2}:\d{2}\Z")
@@ -442,13 +445,108 @@ def validate_metadata(metadata, event):
         raise CaptureError("EVENT_REJECTED") from None
 
 
-def capture_target(metadata):
+def validate_capture_path(value):
+    if (
+        not bounded_utf8(value, 1024, allow_empty=False)
+        or value != value.strip()
+        or not value.endswith(".md")
+        or len(value.rsplit("/", 1)[-1]) <= 3
+        or any(ord(c) < 32 or ord(c) == 127 for c in value)
+        or any(c in value for c in "\\:{}")
+        or any(p in ("", ".", "..") for p in value.split("/"))
+    ):
+        raise CaptureError("COMMIT_ROUTES_INVALID")
+    return value
+
+
+def validate_commit_routes(routes):
+    if not isinstance(routes, dict) or len(routes) > ROUTES_COUNT:
+        raise CaptureError("COMMIT_ROUTES_INVALID")
+    for repository, template in routes.items():
+        if (
+            not isinstance(repository, str)
+            or ORG_REPO_PATTERN.fullmatch(repository) is None
+            or not isinstance(template, str)
+        ):
+            raise CaptureError("COMMIT_ROUTES_INVALID")
+        validate_capture_path(template.replace("{date}", "2000-01-01"))
+    try:
+        if len(json.dumps(routes).encode()) > ROUTES_LIMIT:
+            raise CaptureError("COMMIT_ROUTES_INVALID")
+    except UnicodeEncodeError:
+        raise CaptureError("COMMIT_ROUTES_INVALID") from None
+    return dict(routes)
+
+
+def read_commit_routes(path):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise CaptureError("COMMIT_ROUTES_INVALID")
+            result[key] = value
+        return result
+
+    try:
+        path = Path(path)
+        if not path.is_absolute() or any(p in (".", "..") for p in path.parts):
+            raise CaptureError("COMMIT_ROUTES_INVALID")
+        directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in path.parts[1:-1]:
+                child = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
+                )
+                os.close(directory)
+                directory = child
+            fd = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+            )
+        finally:
+            os.close(directory)
+        with os.fdopen(fd, "rb") as stream:
+            item = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(item.st_mode)
+                or item.st_uid != os.getuid()
+                or item.st_nlink != 1
+                or stat.S_IMODE(item.st_mode) not in (0o400, 0o600)
+                or item.st_size > ROUTES_LIMIT
+            ):
+                raise CaptureError("COMMIT_ROUTES_INVALID")
+            raw = stream.read(ROUTES_LIMIT + 1)
+        if len(raw) > ROUTES_LIMIT:
+            raise CaptureError("COMMIT_ROUTES_INVALID")
+        return validate_commit_routes(json.loads(raw, object_pairs_hook=unique))
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise CaptureError("COMMIT_ROUTES_INVALID") from None
+
+
+def capture_target(metadata, routes=None):
+    routes = validate_commit_routes({} if routes is None else routes)
     repository = metadata["org_repo"]
-    return f"Projects/Development/{repository}/{metadata['date']}.md"
+    date = metadata["date"]
+    if (
+        not isinstance(repository, str)
+        or ORG_REPO_PATTERN.fullmatch(repository) is None
+        or not isinstance(date, str)
+        or DATE_PATTERN.fullmatch(date) is None
+    ):
+        raise CaptureError("COMMIT_ROUTES_INVALID")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        raise CaptureError("COMMIT_ROUTES_INVALID") from None
+    template = routes.get(repository, f"Projects/Development/{repository}/{{date}}.md")
+    return validate_capture_path(template.replace("{date}", date))
 
 
-def capture_arguments(metadata, context):
-    target = capture_target(metadata)
+def capture_arguments(metadata, context, *, routes=None, target_path=None):
+    target = (
+        capture_target(metadata, routes)
+        if target_path is None
+        else validate_capture_path(target_path)
+    )
     commit_hash = metadata["hash"]
     key_digest = hashlib.sha256(
         f"{metadata['org_repo']}\0{commit_hash}".encode("utf-8")
