@@ -452,6 +452,10 @@ staging resumes, while conflicting leftovers remain preserved for inspection.
 
 Retained lookups validate the complete predecessor-generation lineage, including
 the first-generation locator; missing or corrupt intermediate records fail closed.
+Journal reconciliation removes only private temporary files in the current
+transition's directories whose bytes exactly match its expected publications,
+before clearing the journal. Ambiguous temporary data remains preserved and recovery
+stays incomplete.
 
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new

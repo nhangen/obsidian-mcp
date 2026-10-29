@@ -4086,6 +4086,102 @@ class UserCaptureTest(NativeCaptureFixture):
         self.assertEqual(old.returncode, 0, old.stderr)
         self.assertEqual(json.loads(old.stdout)["turn"], json.loads(original)["turn"])
 
+    def test_abrupt_retention_publication_exit_cleans_only_known_temporary_bytes(self):
+        for phase in (
+            "archive-record",
+            "archive-index",
+            "archive-locator",
+            "restore-state",
+            "restore-binding",
+            "restore-index",
+            "ambiguous",
+        ):
+            with self.subTest(phase=phase):
+                self.home = self.directory / phase
+                self.configure()
+                path = self.terminal_session()
+                original = path.read_bytes()
+                restore = phase.startswith("restore")
+                if restore:
+                    self.hook("UserPromptSubmit", session_id="other", prompt="Other")
+                target_session = "session-1" if restore else "other"
+                program = """
+import json, os, sys, types
+from pathlib import Path
+script, profile, phase, session, event = sys.argv[1:]
+module = types.ModuleType("crash_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+original = module.os.replace
+def crash(source, target):
+    target = Path(target)
+    wanted = (
+        (phase in ("archive-index", "restore-index", "ambiguous") and target.name == "index.json")
+        or (phase == "archive-record" and target.parent.name == session and target.name != "index.json")
+        or (phase == "archive-locator" and target.parent.name == "retained-bindings")
+        or (phase == "restore-state" and target.parent.name == "capture-state" and target.stem == session)
+        or (phase == "restore-binding" and target.parent.name == "bindings")
+    )
+    if wanted:
+        os._exit(73)
+    return original(source, target)
+module.os.replace = crash
+home, descriptor = module.load_profile(profile)
+module.hook(home, descriptor, json.loads(event))
+"""
+                crashed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        program,
+                        str(self.bundle / "bin/obsidian-mcp-native"),
+                        str(self.home),
+                        phase,
+                        path.stem,
+                        json.dumps(
+                            self.event(
+                                "SessionStart" if restore else "UserPromptSubmit",
+                                session_id=target_session,
+                                prompt="Other",
+                                source="resume",
+                            )
+                        ),
+                    ],
+                    env=self.environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(crashed.returncode, 73, crashed.stderr)
+                leftovers = list(self.home.rglob(".capture-*"))
+                self.assertTrue(leftovers)
+                self.assertTrue((self.home / "retention-journal.json").exists())
+                if phase == "ambiguous":
+                    leftovers[0].write_bytes(b"preserve ambiguous fixture")
+                resumed = self.hook(
+                    "SessionStart", session_id=target_session, source="resume"
+                )
+                if phase == "ambiguous":
+                    self.assertEqual(
+                        leftovers[0].read_bytes(), b"preserve ambiguous fixture"
+                    )
+                    self.assertTrue((self.home / "retention-journal.json").exists())
+                    self.assertFalse(self.drain()["quiescent"])
+                else:
+                    self.assertEqual(
+                        list(self.home.rglob(".capture-*")), [], json.dumps(resumed)
+                    )
+                    self.assertFalse((self.home / "retention-journal.json").exists())
+                    inspected = self.cli(
+                        "status", "--home", str(self.home), "--session", path.stem
+                    )
+                    self.assertEqual(inspected.returncode, 0, inspected.stderr)
+                    self.assertEqual(
+                        json.loads(inspected.stdout)["turn"],
+                        json.loads(original)["turn"],
+                    )
+                    self.assertTrue(self.drain()["complete"])
+
     def test_archive_journal_conflict_and_missing_archive_never_fresh_enroll(self):
         self.configure()
         path = self.terminal_session()

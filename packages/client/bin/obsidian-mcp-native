@@ -784,6 +784,17 @@ def read_binding(home, session, *, restore=True):
     return archived["binding"], path
 
 
+def clean_retention_temporaries(expected):
+    for directory, bodies in expected.items():
+        for entry in streamed_entries(directory):
+            if not entry.name.startswith(".capture-"):
+                continue
+            if private_read(entry) not in bodies:
+                raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
+            entry.unlink()
+        sync_directory(directory)
+
+
 def reconcile_retention(home):
     journal = home / "retention-journal.json"
     try:
@@ -898,6 +909,16 @@ def reconcile_retention(home):
                 atomic_write(state_path, encode(envelope["state"]))
             atomic_write(binding_path, encode(restored))
             atomic_write(directory / "index.json", encode(after))
+        expected = {home: (encode(value),), directory: (encode(after),)}
+        if value["operation"] == "archive":
+            expected[directory] += (encode(envelope),)
+            locator = home / "retained-bindings"
+            expected[locator] = (private_read(locator / (session + ".json")),)
+        else:
+            expected[binding_path.parent] = (encode(restored),)
+            if envelope["state"] is not None:
+                expected[state_path.parent] = (encode(envelope["state"]),)
+        clean_retention_temporaries(expected)
     journal.unlink()
     sync_directory(home)
 
