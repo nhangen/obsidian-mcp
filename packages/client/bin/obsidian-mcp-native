@@ -1043,6 +1043,12 @@ def retire_terminal_sessions(home, profile):
             raise NativeError("SESSION_BINDING_INVALID")
         binding, _ = read_binding(home, entry.stem, restore=False)
         child, _ = bound_child(home, profile, binding, inspect=True)
+        if any(
+            p.name.startswith(".capture-")
+            for p in streamed_entries(checked_state_directory(child))
+        ):
+            active += 1
+            continue
         try:
             with state_lock(child, entry.stem) as (state, _):
                 if (state is not None and drain_reasons(state)) or (
@@ -1182,6 +1188,109 @@ def provision_child(home, profile, project, mode):
     return child
 
 
+def initial_session_state(profile, session, turn, transcript=None, *, date=None):
+    state = dict(
+        schemaVersion=1,
+        python=profile["python"],
+        session=session,
+        turn=turn,
+        disposition="pending",
+        session_save=session_plan(profile, session, turn, date=date),
+        snapshots={},
+        commits={},
+    )
+    if transcript is not None:
+        state["claude_transcript"] = transcript
+    return state
+
+
+def validate_initial_state(profile, session, state):
+    if not isinstance(state, dict) or not isinstance(state.get("session_save"), dict):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+    turn, transcript = state.get("turn"), state.get("claude_transcript")
+    date = state.get("session_save", {}).get("date")
+    if (
+        not isinstance(turn, str)
+        or HEX.fullmatch(turn) is None
+        or not isinstance(transcript, str)
+        or HEX.fullmatch(transcript) is None
+        or not isinstance(date, str)
+        or datetime.date.fromisoformat(date).isoformat() != date
+        or state != initial_session_state(profile, session, turn, transcript, date=date)
+    ):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
+
+
+def reconcile_enrollment(home, profile):
+    directory = home / "bindings"
+    candidate = select_publication(directory, lambda value: True)
+    if candidate is not None:
+        record = candidate[2]
+        session = record.get("session")
+        current, path = read_hot_binding(home, session)
+        validate_binding(record, session)
+        child = home / "workspaces" / record["workspace"]
+        _, descriptor = load_profile(child, inspect=True)
+        validate_child(home, profile, child, descriptor)
+        if descriptor != child_profile(
+            home, profile, record["project"], record["projectMode"]
+        ):
+            raise NativeError("SESSION_BINDING_INVALID")
+        with state_lock(child, session) as (state, _):
+            if read_binding(home, session, restore=False)[0] != current:
+                raise NativeError("PUBLICATION_CONFLICT")
+            if current != record:
+                if current is None:
+                    if (
+                        archive_index(home, session) is not None
+                        or "archiveGeneration" in record
+                    ):
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    expected = dict(record, enrolled=False, paused=False)
+                    if state is not None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                elif (
+                    record == dict(current, paused=True) and current["paused"] is False
+                ):
+                    if current["enrolled"] and state is None:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    if state is not None:
+                        drain_reasons(state)
+                    expected = dict(current, paused=True)
+                elif not current["enrolled"] or current["paused"]:
+                    validate_initial_state(descriptor, session, state)
+                    expected = dict(current, enrolled=True, paused=False)
+                else:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                if record != expected:
+                    raise NativeError("PUBLICATION_CONFLICT")
+            publish_candidate(
+                candidate, path, before=encode(current) if current is not None else None
+            )
+            clean_retention_temporaries({directory: (candidate[1],)})
+    for path in streamed_entries(directory):
+        if path.suffix != ".json" or HEX.fullmatch(path.stem) is None:
+            raise NativeError("SESSION_BINDING_INVALID")
+        record, _ = read_hot_binding(home, path.stem)
+        if record["enrolled"] or record["paused"]:
+            continue
+        if archive_index(home, path.stem) is not None:
+            continue
+        child, descriptor = bound_child(home, profile, record, inspect=True)
+        with state_lock(child, path.stem) as (state, state_path):
+            candidate = select_publication(state_path.parent, lambda value: True)
+            if candidate is not None:
+                validate_initial_state(descriptor, path.stem, candidate[2])
+                if state is not None and state != candidate[2]:
+                    raise NativeError("PUBLICATION_CONFLICT")
+                publish_candidate(candidate, state_path)
+                clean_retention_temporaries({state_path.parent: (candidate[1],)})
+                state = candidate[2]
+            if state is not None:
+                validate_initial_state(descriptor, path.stem, state)
+                atomic_write(path, encode(dict(record, enrolled=True)))
+
+
 def retained_capture_event(home, event):
     session = digest(identifier(event.get("session_id")).encode())
     with state_lock(home, session) as (state, _):
@@ -1215,6 +1324,7 @@ def user_hook(home, profile, event):
         with gate_lock(home, nonblocking=True):
             check_user_state(home)
             reconcile_retention(home)
+            reconcile_enrollment(home, profile)
             session = digest(identifier(event.get("session_id")).encode())
             hot, _ = read_hot_binding(home, session)
             index = archive_index(home, session)
@@ -1266,6 +1376,11 @@ def user_hook(home, profile, event):
                 bound_child(home, profile, record)
                 atomic_write(path, encode(record))
             child, descriptor = bound_child(home, profile, record)
+            if any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
             if (
                 record["paused"]
                 and event.get("hook_event_name") != "UserPromptSubmit"
@@ -1898,8 +2013,8 @@ def producer_event(root, before):
     return event, consumer["run_producer"](BUNDLE, event, sys.executable)
 
 
-def session_plan(profile, session, turn):
-    date = datetime.date.today().isoformat()
+def session_plan(profile, session, turn, *, date=None):
+    date = date or datetime.date.today().isoformat()
     title = "Session " + digest((session + turn).encode())[:20]
     folder = profile["folder"]
     return dict(
@@ -2375,18 +2490,16 @@ def engine_hook(home, profile, event):
                     and drain_reasons(state)
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
-                state = dict(
-                    schemaVersion=1,
-                    python=profile["python"],
-                    session=session,
-                    turn=turn,
-                    disposition="pending",
-                    session_save=session_plan(profile, session, turn),
-                    snapshots={},
-                    commits={},
+                state = initial_session_state(
+                    profile,
+                    session,
+                    turn,
+                    (
+                        event["claude_transcript"]
+                        if profile["host"] == "claude-plugin"
+                        else None
+                    ),
                 )
-                if profile["host"] == "claude-plugin":
-                    state["claude_transcript"] = event["claude_transcript"]
             atomic_write(path, encode(state))
             return context(
                 name,
@@ -3077,11 +3190,17 @@ def dispatch_command(args, extra, locks):
                 raise NativeError("RETENTION_JOURNAL_PENDING")
             if not inspection:
                 reconcile_retention(home)
+                reconcile_enrollment(home, profile)
             record, _ = read_binding(home, args.session, restore=not inspection)
             if record is None:
                 raise NativeError("SESSION_BINDING_REQUIRED")
             index = archive_index(home, args.session)
             child, descriptor = bound_child(home, profile, record, inspect=inspection)
+            if not inspection and any(
+                p.name.startswith(".capture-")
+                for p in streamed_entries(checked_state_directory(child))
+            ):
+                raise NativeError("PUBLICATION_AMBIGUOUS")
             if inspection and index is not None and index["location"] == "archive":
                 if project_mode(descriptor) == "directory" and (
                     args.commit is not None or args.snapshot is not None

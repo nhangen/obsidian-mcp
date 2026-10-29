@@ -459,16 +459,20 @@ stays incomplete. Archive/journal envelopes have a separate fixed serialization
 bound allowing both accepted components and canonical-encoding overhead; active
 state and hook input retain their 262,144-byte limit. Payloads are never truncated.
 
-Recovery also covers a fully written private intent left before journal publication.
-An unpublished journal must pass the same identity, ancestry, index, binding, and
-state checks as a published journal before promotion, ahead of another transition.
-Partial, conflicting, symlinked, and hardlinked intents remain preserved and fail
-closed. Inspection does not recover or delete intents and never reports complete
-drain while any publication remains pending.
-
-Staged descriptor recovery additionally requires exact expected parent-pinned
-bytes, private files and directories, and empty validated staging state. Unknown
-or conflicting staging data is retained, never broadly removed.
+Recovery also covers a fully written private intent left before journal,
+staged-descriptor, or first-enrollment publication. An unpublished journal must
+pass the same identity, ancestry, index, binding, and state checks as a published
+journal before it is promoted, ahead of another transition. Staged descriptor
+bytes must exactly match the expected parent-pinned descriptor in empty private
+staging. Enrollment recovery accepts only the expected initial binding, an exact
+initial-state plan with no established conflicting state, or a verified binding
+marker transition. A paused-only marker may only restrict an existing binding;
+clearing pause or completing enrollment requires the persisted initial state.
+Recovered pending work is never replaced by a later prompt. Partial, conflicting,
+symlinked, and hardlinked intents remain preserved and fail closed. Inspection
+does not recover or delete intents and never reports complete drain while any
+publication remains pending. Other state updates are not promoted from schema
+alone; ambiguous leftovers retain evidence and require inspection.
 
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new

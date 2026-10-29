@@ -3629,7 +3629,14 @@ module.hook(profile_home, descriptor, json.loads(event))
         return temporary, original, frozen
 
     def test_unpublished_first_publications_recover_before_unrelated_transition(self):
-        for phase in ("journal", "descriptor"):
+        for phase in (
+            "journal",
+            "descriptor",
+            "binding",
+            "state",
+            "enrolled",
+            "paused",
+        ):
             with self.subTest(phase=phase):
                 self.home = self.directory / phase
                 temporary, original, frozen = self.unpublished_publication(phase)
@@ -3695,7 +3702,14 @@ module.hook(profile_home, descriptor, json.loads(event))
                 self.assertTrue(self.drain()["complete"])
 
     def test_unpublished_publication_unsafe_or_conflicting_bytes_remain_preserved(self):
-        for phase in ("journal", "descriptor"):
+        for phase in (
+            "journal",
+            "descriptor",
+            "binding",
+            "state",
+            "enrolled",
+            "paused",
+        ):
             for damage in ("partial", "conflict", "symlink", "hardlink"):
                 with self.subTest(phase=phase, damage=damage):
                     self.home = self.directory / (phase + "-" + damage)
@@ -3739,6 +3753,73 @@ module.hook(profile_home, descriptor, json.loads(event))
                         inspected.returncode != 0
                         or not json.loads(inspected.stdout)["quiescent"]
                     )
+
+    def test_recovered_initial_state_preserves_old_prompt_and_refuses_established_state_replacement(
+        self,
+    ):
+        for established in (False, True):
+            with self.subTest(established=established):
+                self.home = self.directory / (
+                    "established" if established else "pending"
+                )
+                temporary, _, _ = self.unpublished_publication("state")
+                intended = json.loads(temporary.read_bytes())
+                if established:
+                    held = self.directory / "preserved-initial-intent"
+                    temporary.rename(held)
+                    self.hook("UserPromptSubmit", prompt="Established different work")
+                    held.rename(temporary)
+                (path,) = (
+                    self.state_paths()
+                    if established
+                    else list((self.home / "workspaces").glob("*/capture-state/*.lock"))
+                )
+                path = path.with_suffix(".json")
+                frozen = path.read_bytes() if established else None
+                self.transcript.write_text(
+                    self.transcript.read_text()
+                    + '{"type":"user","uuid":"changed-prompt"}\n'
+                )
+                output = self.hook("UserPromptSubmit", prompt="New unrelated prompt")
+                self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+                if established:
+                    self.assertEqual(path.read_bytes(), frozen)
+                    self.assertTrue(temporary.exists())
+                else:
+                    self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+                    self.assertEqual(json.loads(path.read_bytes()), intended)
+                    self.assertFalse(temporary.exists())
+                    skipped = self.cli(
+                        "skip",
+                        "--home",
+                        str(self.home),
+                        "--session",
+                        path.stem,
+                        "--turn",
+                        intended["turn"],
+                        "--reason",
+                        "no_meaningful_work",
+                    )
+                    self.assertEqual(skipped.returncode, 0, skipped.stderr)
+                    resumed = self.hook(
+                        "UserPromptSubmit", prompt="New unrelated prompt"
+                    )
+                    self.assertIn("obsidian_keeper_save", json.dumps(resumed))
+
+    def test_binding_publication_cannot_bypass_missing_retained_ancestry(self):
+        temporary, original, _ = self.unpublished_publication("paused")
+        binding_path = self.home / "bindings" / (original.stem + ".json")
+        before = json.loads(binding_path.read_bytes())
+        before["archiveGeneration"] = "f" * 64
+        candidate = json.loads(temporary.read_bytes())
+        candidate["archiveGeneration"] = "f" * 64
+        native = self.load_native()
+        binding_path.write_bytes(native.encode(before))
+        temporary.write_bytes(native.encode(candidate))
+        output = self.hook("UserPromptSubmit", prompt="Next ordinary prompt")
+        self.assertNotIn("obsidian_keeper_save", json.dumps(output))
+        self.assertEqual(json.loads(binding_path.read_bytes()), before)
+        self.assertTrue(temporary.exists())
 
     def test_busy_executor_does_not_block_other_workspace_commit_or_admission(self):
         self.configure()
