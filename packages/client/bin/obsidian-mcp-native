@@ -682,13 +682,35 @@ def validate_archive(value, session, generation):
 
 def archived_record(home, session, index):
     generation = index["generation"]
-    value = json.loads(
-        private_read(home / "archive" / session / (generation + ".json"))
-    )
-    return validate_archive(value, session, generation)
+    directory = home / "archive" / session
+
+    def read_generation(key):
+        value = validate_archive(
+            json.loads(private_read(directory / (key + ".json"))),
+            session,
+            key,
+        )
+        return value
+
+    current = value = read_generation(generation)
+    checkpoint, distance, power = generation, 0, 1
+    while predecessor := value["binding"].get("archiveGeneration"):
+        if predecessor == checkpoint:
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+        value = read_generation(predecessor)
+        if any(
+            value["binding"][key] != current["binding"][key]
+            for key in ("session", "workspace", "project", "projectMode")
+        ):
+            raise NativeError("RETENTION_LINEAGE_INVALID")
+        distance += 1
+        if distance == power:
+            checkpoint, distance, power = predecessor, 0, power * 2
+    retained_locator(home, session, current, first_generation=value["generation"])
+    return current
 
 
-def retained_locator(home, session, envelope, *, create=False):
+def retained_locator(home, session, envelope, *, create=False, first_generation=None):
     directory = home / "retained-bindings"
     if create:
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -712,10 +734,20 @@ def retained_locator(home, session, envelope, *, create=False):
         or value.get("workspace") != envelope["binding"]["workspace"]
         or not isinstance(value.get("firstGeneration"), str)
         or HEX.fullmatch(value["firstGeneration"]) is None
+        or (
+            first_generation is not None
+            and value["firstGeneration"] != first_generation
+        )
     ):
         raise NativeError("RETENTION_BINDING_INVALID")
     first = home / "archive" / session / (value["firstGeneration"] + ".json")
-    validate_archive(json.loads(private_read(first)), session, value["firstGeneration"])
+    first_record = validate_archive(
+        json.loads(private_read(first)),
+        session,
+        value["firstGeneration"],
+    )
+    if "archiveGeneration" in first_record["binding"]:
+        raise NativeError("RETENTION_LINEAGE_INVALID")
 
 
 def read_binding(home, session, *, restore=True):
@@ -810,6 +842,13 @@ def reconcile_retention(home):
     )
     if index != value["before"] and index != after:
         raise NativeError("RETENTION_CONFLICT")
+    if before is not None:
+        archived_record(home, session, before)
+        if (
+            value["operation"] == "archive"
+            and binding.get("archiveGeneration") != before["generation"]
+        ):
+            raise NativeError("RETENTION_LINEAGE_INVALID")
     binding_path = home / "bindings" / (session + ".json")
     state_path = child / "capture-state" / (session + ".json")
     with state_lock(child, session) as (state, _):

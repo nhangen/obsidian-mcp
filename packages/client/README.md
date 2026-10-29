@@ -450,6 +450,9 @@ project. Child creation stages its complete private descriptor and empty state
 directory outside `workspaces` before atomic publication; unambiguous interrupted
 staging resumes, while conflicting leftovers remain preserved for inspection.
 
+Retained lookups validate the complete predecessor-generation lineage, including
+the first-generation locator; missing or corrupt intermediate records fail closed.
+
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
 capture for that session instead of erasing the old turn or attributing new work

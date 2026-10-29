@@ -3923,6 +3923,56 @@ class UserCaptureTest(NativeCaptureFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         return path
 
+    def test_missing_or_corrupt_intermediate_generation_refuses_every_retained_path(
+        self,
+    ):
+        for damage in ("missing", "corrupt", "cross-session", "cycle"):
+            with self.subTest(damage=damage):
+                self.home = self.directory / damage
+                self.configure()
+                for number in range(3):
+                    self.transcript.write_text(
+                        self.transcript.read_text()
+                        + json.dumps({"type": "user", "uuid": f"{damage}-{number}"})
+                        + "\n"
+                    )
+                    path = self.terminal_session()
+                    self.hook(
+                        "UserPromptSubmit", session_id=f"other-{number}", prompt="Other"
+                    )
+                directory = self.home / "archive" / path.stem
+                current = json.loads((directory / "index.json").read_text())[
+                    "generation"
+                ]
+                latest = json.loads((directory / (current + ".json")).read_text())
+                middle = directory / (latest["binding"]["archiveGeneration"] + ".json")
+                if damage == "missing":
+                    middle.unlink()
+                elif damage == "corrupt":
+                    middle.write_text("{")
+                else:
+                    record = json.loads(middle.read_text())
+                    if damage == "cross-session":
+                        record["binding"]["session"] = self.session_key(
+                            "another-session"
+                        )
+                    else:
+                        record["binding"]["archiveGeneration"] = middle.stem
+                    middle.write_text(json.dumps(record))
+                before = {str(p): p.read_bytes() for p in self.home.rglob("*.json")}
+                for operation in ("status", "request", "drain-status"):
+                    arguments = (
+                        [] if operation == "drain-status" else ["--session", path.stem]
+                    )
+                    refused = self.cli(operation, "--home", str(self.home), *arguments)
+                    self.assertEqual(refused.returncode, 64, operation + refused.stdout)
+                resumed = self.hook("SessionStart", source="resume")
+                self.assertNotIn("obsidian_keeper_save", json.dumps(resumed))
+                self.assertFalse(path.exists())
+                self.assertEqual(
+                    {str(p): p.read_bytes() for p in self.home.rglob("*.json")}, before
+                )
+
     def test_session_start_does_not_enroll_or_consume_admission(self):
         self.configure()
         for session in ("startup-one", "startup-two"):
