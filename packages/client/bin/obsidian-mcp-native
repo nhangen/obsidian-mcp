@@ -654,6 +654,34 @@ def check_user_state(home):
         raise NativeError("USER_STATE_INVALID")
 
 
+def retained_capture_event(home, event):
+    session = digest(identifier(event.get("session_id")).encode())
+    with state_lock(home, session) as (state, _):
+        if state is None:
+            return False
+        normalized = normalize_claude(event, state)
+        name = normalized["hook_event_name"]
+        if name not in ("PreToolUse", "PostToolUse"):
+            return False
+        arguments = normalized.get("tool_input")
+        tool = normalized.get("tool_name")
+        call = normalized.get("tool_use_id")
+        if tool == "mcp__obsidian_write__obsidian_keeper_save":
+            return (
+                bool(state.get("session_request"))
+                and arguments == state["session_request"]
+                and (name == "PreToolUse" or call == state.get("session_call"))
+            )
+        if tool == "mcp__obsidian_write__obsidian_daily_append":
+            return any(
+                pending.get("native_arguments") is not None
+                and arguments == pending["native_arguments"]
+                and (name == "PreToolUse" or call == pending.get("in_flight"))
+                for pending in state["commits"].values()
+            )
+        return False
+
+
 def user_hook(home, profile, event):
     try:
         with gate_lock(home, nonblocking=True):
@@ -703,7 +731,11 @@ def user_hook(home, profile, event):
                 bound_child(home, profile, record)
                 atomic_write(path, encode(record))
             child, descriptor = bound_child(home, profile, record)
-            if record["paused"] and event.get("hook_event_name") != "UserPromptSubmit":
+            if (
+                record["paused"]
+                and event.get("hook_event_name") != "UserPromptSubmit"
+                and not retained_capture_event(child, event)
+            ):
                 return user_hook_failure(
                     event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
                 )

@@ -3566,6 +3566,92 @@ class UserCaptureTest(NativeCaptureFixture):
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
 
+    def pause_next_prompt(self):
+        self.transcript.write_text(
+            self.transcript.read_text() + '{"type":"user","uuid":"next"}\n'
+        )
+        output = self.hook("UserPromptSubmit", prompt="Next ordinary prompt")
+        self.assertNotIn("decision", output)
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+
+    def test_paused_session_accepts_only_frozen_reviewed_retry_and_matching_receipt(
+        self,
+    ):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        path = self.state_paths()[0]
+        self.save(
+            path,
+            status="partial",
+            receipt_changes={
+                "recovery": {"required": True, "action": "inspect"},
+                "error_code": "PARTIAL",
+                "retryable": True,
+            },
+        )
+        original = path.read_bytes()
+        self.pause_next_prompt()
+        self.assertEqual(path.read_bytes(), original)
+        args = self.session_arguments(path)
+        call = dict(
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="reviewed",
+            tool_input=args,
+        )
+        self.assertEqual(
+            self.hook("PreToolUse", **call)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        state = json.loads(original)
+        retry = self.cli(
+            "retry",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--payload-sha256",
+            state["session_payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout), args)
+        changed = self.hook(
+            "PreToolUse", **dict(call, tool_input=dict(args, body="New work"))
+        )
+        self.assertEqual(changed["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.save(path, call="reviewed")
+        self.assertEqual(json.loads(path.read_text())["disposition"], "saved")
+        self.hook("UserPromptSubmit", prompt="Next ordinary prompt")
+        self.assertNotEqual(json.loads(path.read_text())["turn"], state["turn"])
+
+    def test_paused_session_observes_exact_late_receipt_without_new_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        path = self.state_paths()[0]
+        args = self.session_arguments(path)
+        plan = json.loads(path.read_text())["session_save"]
+        call = dict(
+            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+            tool_use_id="late",
+            tool_input=args,
+        )
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.pause_next_prompt()
+        receipt = dict(
+            status="committed",
+            request_id="late-fixture",
+            idempotency_key=args["idempotency_key"],
+            path=plan["path"],
+            affected_paths=[plan["path"], plan["index"], plan["daily"]],
+            warnings=[],
+            recovery={"required": False, "action": ""},
+            error_code=None,
+            retryable=False,
+        )
+        self.hook("PostToolUse", **call, tool_response={"structuredContent": receipt})
+        self.assertEqual(json.loads(path.read_text())["disposition"], "saved")
+
     def setUp(self):
         super().setUp()
         self.transcript = self.directory / "conversation.jsonl"
