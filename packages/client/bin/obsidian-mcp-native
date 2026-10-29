@@ -29,6 +29,8 @@ BUNDLE = Path(__file__).resolve().parent.parent
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
+# Two accepted JSON components may expand when Unicode is canonicalized.
+RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
 CLAUDE_PRODUCER_TIMEOUT = 3.0
 COMMIT_CONTEXT_TEMPLATE = (
@@ -101,7 +103,7 @@ def identifier(value):
     return value
 
 
-def private_read(path):
+def private_read(path, *, limit=LIMIT):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         item = os.fstat(stream.fileno())
@@ -112,14 +114,14 @@ def private_read(path):
             or stat.S_IMODE(item.st_mode) != 0o600
         ):
             raise NativeError("PRIVATE_FILE_INVALID")
-        value = stream.read(LIMIT + 1)
-    if len(value) > LIMIT:
+        value = stream.read(limit + 1)
+    if len(value) > limit:
         raise NativeError("STATE_TOO_LARGE")
     return value
 
 
-def atomic_write(path, value):
-    if len(value) > LIMIT:
+def atomic_write(path, value, *, limit=LIMIT):
+    if len(value) > limit:
         raise NativeError("STATE_TOO_LARGE")
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".capture-")
     try:
@@ -637,7 +639,7 @@ def archive_index(home, session):
         return None
     private_directory(home / "archive")
     private_directory(directory)
-    index = json.loads(private_read(directory / "index.json"))
+    index = json.loads(private_read(directory / "index.json", limit=RETENTION_LIMIT))
     if (
         not isinstance(index, dict)
         or set(index) != {"generation", "location"}
@@ -686,7 +688,9 @@ def archived_record(home, session, index):
 
     def read_generation(key):
         value = validate_archive(
-            json.loads(private_read(directory / (key + ".json"))),
+            json.loads(
+                private_read(directory / (key + ".json"), limit=RETENTION_LIMIT)
+            ),
             session,
             key,
         )
@@ -742,7 +746,7 @@ def retained_locator(home, session, envelope, *, create=False, first_generation=
         raise NativeError("RETENTION_BINDING_INVALID")
     first = home / "archive" / session / (value["firstGeneration"] + ".json")
     first_record = validate_archive(
-        json.loads(private_read(first)),
+        json.loads(private_read(first, limit=RETENTION_LIMIT)),
         session,
         value["firstGeneration"],
     )
@@ -789,7 +793,7 @@ def clean_retention_temporaries(expected):
         for entry in streamed_entries(directory):
             if not entry.name.startswith(".capture-"):
                 continue
-            if private_read(entry) not in bodies:
+            if private_read(entry, limit=RETENTION_LIMIT) not in bodies:
                 raise NativeError("RETENTION_TEMPORARY_AMBIGUOUS")
             entry.unlink()
         sync_directory(directory)
@@ -798,7 +802,7 @@ def clean_retention_temporaries(expected):
 def reconcile_retention(home):
     journal = home / "retention-journal.json"
     try:
-        value = json.loads(private_read(journal))
+        value = json.loads(private_read(journal, limit=RETENTION_LIMIT))
     except FileNotFoundError:
         if journal.is_symlink():
             raise NativeError("RETENTION_JOURNAL_INVALID") from None
@@ -877,14 +881,14 @@ def reconcile_retention(home):
             ):
                 raise NativeError("RETENTION_CONFLICT")
             if target.exists() or target.is_symlink():
-                if private_read(target) != encode(envelope):
+                if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
                     raise NativeError("RETENTION_CONFLICT")
             else:
                 if hot is None:
                     raise NativeError("RETENTION_CONFLICT")
-                atomic_write(target, encode(envelope))
+                atomic_write(target, encode(envelope), limit=RETENTION_LIMIT)
             retained_locator(home, session, envelope, create=before is None)
-            atomic_write(directory / "index.json", encode(after))
+            atomic_write(directory / "index.json", encode(after), limit=RETENTION_LIMIT)
             sync_directory(archive)
             sync_directory(home)
             binding_path.unlink(missing_ok=True)
@@ -893,7 +897,7 @@ def reconcile_retention(home):
             sync_directory(state_path.parent)
         else:
             retained_locator(home, session, envelope)
-            if private_read(target) != encode(envelope):
+            if private_read(target, limit=RETENTION_LIMIT) != encode(envelope):
                 raise NativeError("RETENTION_CONFLICT")
             restored = dict(binding, archiveGeneration=generation)
             if (
@@ -908,7 +912,7 @@ def reconcile_retention(home):
             if envelope["state"] is not None:
                 atomic_write(state_path, encode(envelope["state"]))
             atomic_write(binding_path, encode(restored))
-            atomic_write(directory / "index.json", encode(after))
+            atomic_write(directory / "index.json", encode(after), limit=RETENTION_LIMIT)
         expected = {home: (encode(value),), directory: (encode(after),)}
         if value["operation"] == "archive":
             expected[directory] += (encode(envelope),)
@@ -933,6 +937,7 @@ def transition_retention(home, operation, record, before):
         encode(
             dict(schemaVersion=1, operation=operation, record=record, before=before)
         ),
+        limit=RETENTION_LIMIT,
     )
     reconcile_retention(home)
 
@@ -1324,7 +1329,9 @@ def user_drain_status(home, profile):
                     if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
                         raise NativeError("RETENTION_ARCHIVE_INVALID")
                     validate_archive(
-                        json.loads(private_read(entry)), session, entry.stem
+                        json.loads(private_read(entry, limit=RETENTION_LIMIT)),
+                        session,
+                        entry.stem,
                     )
                 if index["location"] == "archive":
                     archive_count += 1

@@ -455,7 +455,9 @@ the first-generation locator; missing or corrupt intermediate records fail close
 Journal reconciliation removes only private temporary files in the current
 transition's directories whose bytes exactly match its expected publications,
 before clearing the journal. Ambiguous temporary data remains preserved and recovery
-stays incomplete.
+stays incomplete. Archive/journal envelopes have a separate fixed serialization
+bound allowing both accepted components and canonical-encoding overhead; active
+state and hook input retain their 262,144-byte limit. Payloads are never truncated.
 
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new

@@ -3981,6 +3981,79 @@ class UserCaptureTest(NativeCaptureFixture):
         self.assertEqual(list((self.home / "bindings").iterdir()), [])
         self.assertEqual(list((self.home / "workspaces").iterdir()), [])
 
+    def test_near_limit_saved_payload_archives_and_restores_without_truncation(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Work")
+        path = self.state_paths()[0]
+        self.save(path)
+        native = self.load_native()
+        baseline = json.loads(path.read_text())
+        self.transcript.write_text(
+            self.transcript.read_text() + '{"type":"user","uuid":"large"}\n'
+        )
+        self.hook("UserPromptSubmit", prompt="Large work")
+        arguments = self.session_arguments(path)
+        arguments["body"] = "x" * (
+            native.LIMIT - 64 - len(native.encode(baseline)) + len(arguments["body"])
+        )
+        with mock.patch.object(self, "session_arguments", return_value=arguments):
+            self.save(path)
+        original = json.loads(path.read_text())
+        self.assertEqual(original["disposition"], "saved")
+        self.assertGreater(len(native.encode(original)), native.LIMIT - 256)
+        self.assertLessEqual(len(path.read_bytes()), native.LIMIT)
+        fresh = self.directory / "independent"
+        fresh.mkdir()
+        admitted = self.hook(
+            "UserPromptSubmit",
+            cwd=str(fresh),
+            session_id="independent",
+            prompt="Other work",
+        )
+        self.assertIn("obsidian_keeper_save", json.dumps(admitted))
+        self.assertFalse(path.exists())
+        state = self.cli("status", "--home", str(self.home), "--session", path.stem)
+        self.assertEqual(state.returncode, 0, state.stderr)
+        self.assertEqual(json.loads(state.stdout)["disposition"], "saved")
+        self.hook("SessionStart", source="resume")
+        self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_retention_bound_covers_two_accepted_unicode_components_but_not_unbounded_data(
+        self,
+    ):
+        native = self.load_native()
+        component = self.directory / "accepted-component.json"
+        raw = ('{"text":"' + "é" * 131000 + '"}').encode()
+        native.atomic_write(component, raw)
+        accepted = json.loads(native.private_read(component))
+        journal = self.directory / "retention-envelope.json"
+        body = native.encode(
+            {
+                "schemaVersion": 1,
+                "record": {"binding": accepted, "state": accepted},
+                "before": {"generation": "f" * 64, "location": "hot"},
+                "operation": "archive",
+            }
+        )
+        self.assertGreater(len(body), 2 * 262144)
+        with self.assertRaisesRegex(native.NativeError, "STATE_TOO_LARGE"):
+            native.atomic_write(journal, body)
+        native.atomic_write(journal, body, limit=native.RETENTION_LIMIT)
+        self.assertEqual(
+            json.loads(native.private_read(journal, limit=native.RETENTION_LIMIT))[
+                "record"
+            ]["state"]["text"],
+            "é" * 131000,
+        )
+        with self.assertRaisesRegex(native.NativeError, "STATE_TOO_LARGE"):
+            native.private_read(journal)
+        with self.assertRaisesRegex(native.NativeError, "STATE_TOO_LARGE"):
+            native.atomic_write(
+                journal,
+                b"x" * (native.RETENTION_LIMIT + 1),
+                limit=native.RETENTION_LIMIT,
+            )
+
     def test_terminal_history_exceeds_256_and_exact_session_resumes(self):
         self.configure()
         native = self.load_native()
@@ -4064,10 +4137,10 @@ class UserCaptureTest(NativeCaptureFixture):
         home, profile = native.load_profile(self.home)
         real_write = native.atomic_write
 
-        def interrupt_index(target, body):
+        def interrupt_index(target, body, **options):
             if target.name == "index.json":
                 raise OSError("fixture interrupted archive")
-            return real_write(target, body)
+            return real_write(target, body, **options)
 
         with mock.patch.object(native, "atomic_write", side_effect=interrupt_index):
             native.hook(
@@ -4189,10 +4262,10 @@ module.hook(home, descriptor, json.loads(event))
         home, profile = native.load_profile(self.home)
         real_write = native.atomic_write
 
-        def interrupt_index(target, body):
+        def interrupt_index(target, body, **options):
             if target.name == "index.json":
                 raise OSError("fixture interrupted archive")
-            return real_write(target, body)
+            return real_write(target, body, **options)
 
         with mock.patch.object(native, "atomic_write", side_effect=interrupt_index):
             native.hook(
@@ -4240,8 +4313,8 @@ module.hook(home, descriptor, json.loads(event))
                 real_write, real_unlink = native.atomic_write, Path.unlink
                 interrupted = []
 
-                def write_boundary(target, body):
-                    real_write(target, body)
+                def write_boundary(target, body, **options):
+                    real_write(target, body, **options)
                     wanted = (
                         (phase.endswith("index") and target.name == "index.json")
                         or (phase == "restore-state" and target == path)
