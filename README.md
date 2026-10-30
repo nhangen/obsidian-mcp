@@ -13,7 +13,30 @@ prepares the first standalone release without reusing the imported `0.2.0` versi
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
-## Portable clients
+## Server and plugin client
+
+This repository owns the independent server and reusable transport/capture
+runtime. The existing cross-app [Obsidian plugin](https://github.com/nhangen/claude-obsidian-plugin)
+is the user-facing client for supported hosts, including Claude Code and Codex.
+The intended normal path is to install the plugin and connect it to a server;
+the plugin should verify and manage compatible runtime dependencies rather than
+require users to install a third product. The private llm-tools harness is not
+required by either product.
+
+Unified plugin onboarding is still tracked in
+[plugin #254](https://github.com/nhangen/claude-obsidian-plugin/issues/254).
+Current host capabilities differ: Claude plugin hooks can delegate to this
+runtime after an explicit writer handoff; the packaged Codex plugin currently
+provides legacy commit capture, while native MCP capture requires a separately
+configured and verified profile. Direct OpenCode connections support MCP tools,
+not automatic capture parity. Model choice does not add missing host hooks.
+These boundaries must not be mistaken for completed cross-host onboarding.
+
+The server remains usable through standard MCP without the plugin. Direct
+runtime installation remains an advanced integration and compatibility route;
+it is not a required extra installation for the intended plugin experience.
+
+## Shared runtime for integrations
 
 The standalone server release is [mcp-v0.2.1](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.1).
 The public portable client source is in [`packages/client`](packages/client/README.md),
