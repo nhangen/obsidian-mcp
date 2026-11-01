@@ -289,6 +289,17 @@ class ManagedExportTest(unittest.TestCase):
                 with self.assertRaisesRegex(exporter["ExportError"], "OUTPUT_INVALID"):
                     exporter["output_parent"](output, self.bundle)
 
+    def test_case_alias_cannot_export_inside_verified_bundle(self):
+        source = self.directory / "source"
+        shutil.copytree(self.bundle, source)
+        alias = source.with_name("SOURCE")
+        if not alias.exists():
+            self.skipTest("filesystem is case sensitive")
+        for bundle, output in ((alias, source / "export"), (source, alias / "export")):
+            with self.subTest(bundle=bundle, output=output):
+                self.rejected(self.cli("--output", output, bundle=bundle), "OUTPUT_INVALID")
+                self.assertFalse(output.exists())
+
     def test_outputs_refuse_unsafe_parents_checkouts_and_existing_leaves(self):
         unsafe = self.directory / "unsafe"
         unsafe.mkdir()
