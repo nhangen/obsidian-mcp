@@ -5505,8 +5505,9 @@ module.hook(home, descriptor, json.loads(event))
                 self.cli("drain-status", "--home", str(self.home)).returncode, 64
             )
         (self.home / "bindings" / (self.session_key("session-1") + ".json")).unlink()
-        output = self.hook("Stop", session_id="unbound", stop_hook_active=False)
-        self.assertNotIn("decision", output)
+        for active in (False, True):
+            output = self.hook("Stop", session_id="unbound", stop_hook_active=active)
+            self.assertEqual(set(output), {"systemMessage"})
         self.assertEqual(
             self.cli("drain-status", "--home", str(self.home)).returncode, 64
         )
