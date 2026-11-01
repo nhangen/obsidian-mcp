@@ -104,6 +104,12 @@ def data_path(value):
     return Path(value)
 
 
+def system_path(path):
+    parts = tuple(part.casefold() for part in path.parts)
+    return (parts[1] in {"etc", "opt", "usr", "bin", "sbin", "system", "root", "library", "applications"}
+            or parts[1:3] == ("private", "etc"))
+
+
 def validate_plan(plan, release_id):
     keys = {"schemaVersion", "host", "scope", "targetUid", "project", "profileHome",
             "managedDir", "bundlePath", "pythonPath", "pythonVersion"}
@@ -119,7 +125,7 @@ def validate_plan(plan, release_id):
         fail("PLAN_INVALID")
     for field in ("project", "profileHome"):
         path = data_path(plan[field])
-        if path.parts[1] in {"etc", "opt", "usr", "bin", "sbin", "System", "root"}:
+        if system_path(path):
             fail("PLAN_INVALID")
     if plan["project"] == plan["profileHome"]:
         fail("PLAN_INVALID")
@@ -200,7 +206,7 @@ def output_parent(output, source):
     if (not path.is_absolute() or str(path) != output or ".." in path.parts
             or any(ord(char) < 32 or ord(char) == 127 for char in output)
             or len(output) > 4096 or len(path.parts) < 3
-            or path.parts[1] in {"etc", "opt", "usr", "bin", "sbin", "System", "root"}):
+            or system_path(path)):
         fail("OUTPUT_INVALID")
     for protected in (BUNDLE, source):
         if path == protected or protected in path.parents:

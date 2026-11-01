@@ -12,6 +12,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPORT = ROOT / "packages/client/bin/obsidian-mcp-managed-export"
@@ -161,6 +162,7 @@ class ManagedExportTest(unittest.TestCase):
                            ("pythonPath", "/home/user/python3"), ("managedDir", "/tmp/hooks"),
                            ("bundlePath", "/opt/obsidian-mcp/wrong"), ("project", "relative"),
                            ("project", "/home/user/../project"), ("project", "/"),
+                           ("project", "/private/etc/project"), ("profileHome", "/Library/profile"),
                            ("profileHome", "/tmp/a\nSECRET_INPUT_CANARY"),
                            ("credential", "SECRET_INPUT_CANARY")]:
             with self.subTest(key=key, value=value):
@@ -277,6 +279,15 @@ class ManagedExportTest(unittest.TestCase):
         self.assertEqual(before, {p.relative_to(source).as_posix(): p.read_bytes()
                                   for p in source.rglob("*") if p.is_file()})
         self.assertEqual(self.cli(bundle=source).returncode, 0)
+
+    def test_system_roots_reject_before_any_filesystem_access(self):
+        exporter = runpy.run_path(str(EXPORT))
+        for output in ("/private/etc/export", "/Library/export", "/Applications/export",
+                       "/etc/export", "/usr/local/export", "/System/export",
+                       "/PRIVATE/EtC/export", "/LIBRARY/export"):
+            with self.subTest(output=output), patch("os.open", side_effect=AssertionError("host access forbidden")):
+                with self.assertRaisesRegex(exporter["ExportError"], "OUTPUT_INVALID"):
+                    exporter["output_parent"](output, self.bundle)
 
     def test_outputs_refuse_unsafe_parents_checkouts_and_existing_leaves(self):
         unsafe = self.directory / "unsafe"
