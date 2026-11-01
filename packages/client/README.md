@@ -529,7 +529,7 @@ alone; ambiguous leftovers retain evidence and require inspection.
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
 capture for that session instead of erasing the old turn or attributing new work
-to it. Unrelated Bash commands proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores `StopFailure` output, so that event returns nothing and writes the advisory to stderr, which Claude Code shows in its debug log. An unexpected exception reports its class (for example `USER_CAPTURE_UNAVAILABLE (KeyError)`), never its text, and refusals still write nothing. Frozen
+to it. Unrelated Bash commands proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores `StopFailure` output, so that event returns nothing and the capture state is kept; the next prompt reports it. An unexpected exception reports its class (for example `USER_CAPTURE_UNAVAILABLE (KeyError)`), never its text, and refusals still write nothing. Frozen
 requests and matching late receipts still reach the existing validators: partial
 or ambiguous writes need the existing authoritative `retry` review, and changed
 payloads or unprepared new captures remain denied. Resolve the original state,

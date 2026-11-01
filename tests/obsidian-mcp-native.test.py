@@ -3060,13 +3060,57 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             json.loads(path.read_text())["session_save"]["daily"].startswith("Daily/")
         )
 
+    def test_unexpected_plugin_hook_error_reports_its_class_and_stop_failure_is_silent(self):
+        self.start()
+        program = """
+import json, sys, types
+from pathlib import Path
+script, profile, events = sys.argv[1:]
+module = types.ModuleType("error_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+def broken(*args, **kwargs):
+    raise KeyError("PRIVATE-KEY-DETAIL")
+module.engine_hook = broken
+home, descriptor = module.load_profile(profile)
+print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)]))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                json.dumps(
+                    [
+                        self.event("UserPromptSubmit", prompt="more"),
+                        self.event("StopFailure", error="rate_limit"),
+                    ]
+                ),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt, failure = json.loads(result.stdout)
+        self.assertIn(
+            "HOOK_STATE_OR_EVENT_INVALID (KeyError)",
+            prompt["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertEqual(failure, {})
+        self.assertIn("HOOK_STATE_OR_EVENT_INVALID (KeyError)", result.stderr)
+        self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
     def test_stop_failure_and_continuation_never_invent_a_prompt_occurrence(self):
         path = self.start()
         before = path.read_bytes()
         failure = self.hook(
             "StopFailure", error="rate_limit", error_details="PRIVATE-DETAILS"
         )
-        self.assertNotIn("decision", failure)
+        self.assertEqual(failure, {})
         self.assertEqual(path.read_bytes(), before)
         self.assertNotIn("PRIVATE-DETAILS", json.dumps(failure))
         stopped = self.hook("Stop", stop_hook_active=False)
