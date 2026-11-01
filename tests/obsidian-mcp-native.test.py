@@ -5257,8 +5257,10 @@ module.hook(home, descriptor, json.loads(event))
         )
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(path.read_bytes(), before)
-        stopped = self.hook("Stop", stop_hook_active=False)
-        self.assertNotIn("decision", stopped)
+        for active in (False, True):
+            stopped = self.hook("Stop", stop_hook_active=active)
+            self.assertEqual(set(stopped), {"systemMessage"})
+            self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", stopped["systemMessage"])
         self.assertFalse(self.drain()["quiescent"])
         old = json.loads(before)
         skipped = self.cli(
