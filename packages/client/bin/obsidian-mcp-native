@@ -1143,7 +1143,7 @@ def user_hook_failure(event, code):
                 permissionDecisionReason=message,
             )
         }
-    if name in ("Stop", "SubagentStop"):
+    if name == "Stop":
         return dict(systemMessage=message)
     return context(name, message)
 
