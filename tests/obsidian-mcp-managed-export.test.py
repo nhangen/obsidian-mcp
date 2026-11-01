@@ -264,6 +264,20 @@ class ManagedExportTest(unittest.TestCase):
                 self.rejected(self.cli("--output", output), "OUTPUT_INVALID")
                 self.assertFalse(output.exists())
 
+    def test_source_alias_cannot_export_inside_verified_bundle(self):
+        source = self.directory / "source"
+        shutil.copytree(self.bundle, source)
+        walk = self.directory / "walk"
+        walk.mkdir()
+        alias = walk / ".." / "source"
+        before = {p.relative_to(source).as_posix(): p.read_bytes()
+                  for p in source.rglob("*") if p.is_file()}
+        self.rejected(self.cli("--output", source / "export", bundle=alias), "OUTPUT_INVALID")
+        self.assertFalse((source / "export").exists())
+        self.assertEqual(before, {p.relative_to(source).as_posix(): p.read_bytes()
+                                  for p in source.rglob("*") if p.is_file()})
+        self.assertEqual(self.cli(bundle=source).returncode, 0)
+
     def test_outputs_refuse_unsafe_parents_checkouts_and_existing_leaves(self):
         unsafe = self.directory / "unsafe"
         unsafe.mkdir()

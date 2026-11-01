@@ -260,6 +260,7 @@ def main():
     try:
         source = Path(args.bundle).absolute()
         metadata = installer["verify_source"](source, args.release_sha256)[0]
+        source = source.resolve(strict=True)
     except (installer["InstallError"], OSError, ValueError, TypeError, KeyError, RecursionError):
         fail("BUNDLE_UNTRUSTED")
     plan = validate_plan(parse_json(private_read(args.plan)), metadata["releaseId"])
