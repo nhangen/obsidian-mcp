@@ -4802,16 +4802,18 @@ module.hook(profile_home, descriptor, json.loads(event))
             invalid = (
                 {"body": ""},
                 {"body": "x" * 65537},
-                {"body": "x" * 65535 + "\U0001f600"},
+                {"body": "x" * 65536 + "\U0001f600"},
                 {"resolved": 1},
                 {"resolved": "true"},
                 {"links": "not-an-array"},
                 {"links": [1]},
                 {"links": ["link"] * 21},
                 {"links": ["x" * 2049]},
+                {"links": ["\U0001f600" * 2049]},
                 {"links": ["bad\nlink"]},
                 {"type": None},
                 {"type": "x" * 101},
+                {"type": "\U0001f600" * 101},
                 {"type": "bad\ntype"},
                 {"request_id": "bad key"},
                 {"unknown": True},
@@ -4828,7 +4830,12 @@ module.hook(profile_home, descriptor, json.loads(event))
                         denied["hookSpecificOutput"]["permissionDecision"], "deny"
                     )
                     self.assertEqual(path.read_bytes(), before)
-            arguments.update(type="session", links=["x" * 2048], request_id="valid-id")
+            arguments.update(
+                body="x" * 65535 + "\U0001f600",
+                type="\U0001f600" * 100,
+                links=["\U0001f600" * 2048],
+                request_id="valid-id",
+            )
             self.assertEqual(
                 self.hook(
                     "PreToolUse",
@@ -5028,9 +5035,11 @@ module.hook(profile_home, descriptor, json.loads(event))
         )
         self.hook("UserPromptSubmit", prompt="Large work")
         arguments = self.session_arguments(path)
-        arguments["body"] = "x" * (
+        budget = (
             native.LIMIT - 64 - len(native.encode(baseline)) + len(arguments["body"])
         )
+        arguments["body"] = "é" * (budget // 6)
+        self.assertLessEqual(len(arguments["body"]), 65536)
         with mock.patch.object(self, "session_arguments", return_value=arguments):
             self.save(path)
         original = json.loads(path.read_text())

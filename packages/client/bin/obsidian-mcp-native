@@ -2249,7 +2249,7 @@ def keeper_arguments_valid(arguments):
     def text_matches(value, field):
         if not isinstance(value, str):
             return False
-        length = len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+        length = len(value)
         return field.get("minLength", 0) <= length <= field.get(
             "maxLength", LIMIT
         ) and (
