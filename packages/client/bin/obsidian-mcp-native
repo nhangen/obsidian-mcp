@@ -1492,15 +1492,7 @@ def user_hook(home, profile, event):
                 result = claude_output(
                     engine_hook(child, descriptor, event), event.get("hook_event_name")
                 )
-            except (
-                NativeError,
-                OSError,
-                RuntimeError,
-                ValueError,
-                KeyError,
-                TypeError,
-                subprocess.SubprocessError,
-            ):
+            except Exception:
                 if event.get("hook_event_name") == "UserPromptSubmit":
                     record["paused"] = True
                     atomic_write(path, encode(record))
@@ -1540,15 +1532,7 @@ def user_hook(home, profile, event):
                     "additionalContext"
                 ] += "\nGit unavailable for this workspace; session-only capture, no commit inferred."
             return result
-    except (
-        NativeError,
-        OSError,
-        RuntimeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        subprocess.SubprocessError,
-    ) as error:
+    except Exception as error:
         return user_hook_failure(
             event,
             (
@@ -2539,15 +2523,7 @@ def hook(home, profile, event):
     name = event.get("hook_event_name")
     try:
         return claude_output(engine_hook(home, profile, event), name)
-    except (
-        NativeError,
-        OSError,
-        RuntimeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        subprocess.SubprocessError,
-    ) as error:
+    except Exception as error:
         code = (
             str(error)
             if isinstance(error, NativeError)

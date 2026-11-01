@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 import os
 import re
@@ -167,6 +168,97 @@ class NativeCaptureFixture(unittest.TestCase):
         module.__file__ = str(script)
         exec(compile(script.read_text(), str(script), "exec"), module.__dict__)
         return module
+
+    def assert_hook_exception_boundaries(self, target, code, *, binding=None):
+        native = self.load_native()
+        home, descriptor = native.load_profile(str(self.home))
+        path = self.state_paths()[0]
+        before = path.read_bytes()
+        bound = binding.read_bytes() if binding else None
+        events = [
+            self.event(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="ordinary",
+                tool_input={"command": "pwd"},
+            ),
+            *(
+                self.event(
+                    "PreToolUse", tool_name=tool, tool_use_id="write", tool_input={}
+                )
+                for tool in (
+                    "mcp__obsidian-write__obsidian_keeper_save",
+                    "mcp__obsidian-write__obsidian_daily_append",
+                    "mcp__obsidian_write__obsidian_keeper_save",
+                    "mcp__obsidian_write__obsidian_daily_append",
+                )
+            ),
+            self.event("Stop", stop_hook_active=False),
+            self.event("StopFailure", error="PRIVATE-EVENT-DETAIL"),
+            self.event("UserPromptSubmit", prompt="more"),
+        ]
+        for error_type in (
+            AttributeError,
+            IndexError,
+            Exception,
+            native.NativeError,
+        ):
+            for event in events:
+                with self.subTest(
+                    target=target, error=error_type.__name__, event=event
+                ):
+                    if binding:
+                        binding.write_bytes(bound)
+                    controlled = error_type is native.NativeError
+                    error = error_type(
+                        "CONTROLLED_CODE" if controlled else "PRIVATE-ERROR-DETAIL"
+                    )
+                    with mock.patch.object(
+                        native, target, side_effect=error
+                    ), mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        output = native.hook(home, descriptor, event)
+                    message = (
+                        "CONTROLLED_CODE"
+                        if controlled
+                        else f"{code} ({error_type.__name__})"
+                    )
+                    name = event["hook_event_name"]
+                    if name == "StopFailure":
+                        self.assertEqual(output, {})
+                        self.assertIn(message, stderr.getvalue())
+                    elif name == "Stop":
+                        self.assertEqual(set(output), {"systemMessage"})
+                        self.assertIn(message, output["systemMessage"])
+                    else:
+                        envelope = output["hookSpecificOutput"]
+                        self.assertEqual(envelope["hookEventName"], name)
+                        if event.get("tool_name", "").startswith("mcp__"):
+                            self.assertEqual(envelope["permissionDecision"], "deny")
+                            self.assertIn(message, envelope["permissionDecisionReason"])
+                        else:
+                            self.assertNotIn("permissionDecision", envelope)
+                            self.assertIn(message, envelope["additionalContext"])
+                        self.assertNotIn("decision", output)
+                    self.assertNotIn("PRIVATE-", json.dumps(output) + stderr.getvalue())
+                    self.assertEqual(path.read_bytes(), before)
+                    if (
+                        binding
+                        and target == "engine_hook"
+                        and name == "UserPromptSubmit"
+                    ):
+                        self.assertTrue(json.loads(binding.read_bytes())["paused"])
+        if binding:
+            binding.write_bytes(bound)
+        for error_type in (SystemExit, KeyboardInterrupt):
+            with self.subTest(
+                target=target, error=error_type.__name__
+            ), mock.patch.object(
+                native, target, side_effect=error_type("BASE_EXCEPTION_VISIBLE")
+            ), self.assertRaises(
+                error_type
+            ):
+                native.hook(home, descriptor, events[-1])
+        self.assertEqual(path.read_bytes(), before)
 
     def prepare(self, path, commit, payload=None):
         return self.cli(
@@ -3060,7 +3152,9 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             json.loads(path.read_text())["session_save"]["daily"].startswith("Daily/")
         )
 
-    def test_unexpected_plugin_hook_error_reports_its_class_and_stop_failure_is_silent(self):
+    def test_unexpected_plugin_hook_error_reports_its_class_and_stop_failure_is_silent(
+        self,
+    ):
         self.start()
         program = """
 import json, sys, types
@@ -3103,6 +3197,12 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
         self.assertEqual(failure, {})
         self.assertIn("HOOK_STATE_OR_EVENT_INVALID (KeyError)", result.stderr)
         self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
+    def test_plugin_hook_contains_all_exceptions_but_not_base_exceptions(self):
+        self.start()
+        self.assert_hook_exception_boundaries(
+            "engine_hook", "HOOK_STATE_OR_EVENT_INVALID"
+        )
 
     def test_stop_failure_and_continuation_never_invent_a_prompt_occurrence(self):
         path = self.start()
@@ -5566,6 +5666,21 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(set(output), {"systemMessage"})
         self.assertIn("USER_CAPTURE_UNAVAILABLE (KeyError)", output["systemMessage"])
         self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
+    def test_user_engine_errors_pause_prompts_and_preserve_capture_evidence(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        binding = self.home / "bindings" / (self.session_key("session-1") + ".json")
+        self.assert_hook_exception_boundaries(
+            "engine_hook", "USER_CAPTURE_UNAVAILABLE", binding=binding
+        )
+
+    def test_user_hook_contains_early_errors_but_not_base_exceptions(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assert_hook_exception_boundaries(
+            "check_user_state", "USER_CAPTURE_UNAVAILABLE"
+        )
 
     def test_bound_and_unbound_busy_hooks_do_not_block_prompts_or_unrelated_bash(self):
         self.configure()
