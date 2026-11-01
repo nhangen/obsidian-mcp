@@ -5508,6 +5508,15 @@ module.hook(home, descriptor, json.loads(event))
         for active in (False, True):
             output = self.hook("Stop", session_id="unbound", stop_hook_active=active)
             self.assertEqual(set(output), {"systemMessage"})
+        failure = self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=self.event("StopFailure", session_id="unbound"),
+        )
+        self.assertEqual(failure.returncode, 0, failure.stderr)
+        self.assertEqual(json.loads(failure.stdout or "{}"), {})
+        self.assertIn("PROMPT_EVENT_REQUIRED", failure.stderr)
         self.assertEqual(
             self.cli("drain-status", "--home", str(self.home)).returncode, 64
         )
