@@ -528,12 +528,22 @@ alone; ambiguous leftovers retain evidence and require inspection.
 
 User-scope prompt failures emit advisory context and allow the ordinary prompt to
 proceed. An unresolved previous turn remains unchanged; the binding pauses new
-capture for that session instead of erasing the old turn or attributing new work
-to it. Unrelated Bash commands proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores `StopFailure` output, so that event returns nothing and the capture state is kept; the next prompt reports it. An unexpected exception reports its class (for example `USER_CAPTURE_UNAVAILABLE (KeyError)`), never its text, and refusals still write nothing. Frozen
-requests and matching late receipts still reach the existing validators: partial
-or ambiguous writes need the existing authoritative `retry` review, and changed
-payloads or unprepared new captures remain denied. Resolve the original state,
-then submit a new prompt to resume capture. This retains one pending turn rather than adding a
+capture turns for that session instead of erasing the retained turn. The paused
+prompt supplies that turn's capture guidance. If no session save was attempted,
+the first canonical keeper save can still be prepared, and its body may summarize
+work done since the retained turn began. Once prepared, the body stays frozen.
+Bash Pre/Post/failure events continue through the existing commit engine while
+paused; observed commits can make their first canonical daily append directly.
+Pending-commit gates and executor evidence still apply. Unrelated Bash commands
+proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores
+`StopFailure` output, so that event returns nothing and capture state is kept;
+the next prompt reports it. Unexpected exceptions report their class, never their
+text. Frozen requests and matching late receipts reach the existing validators.
+Partial or ambiguous writes require inspection of the authoritative paths and
+explicit `retry --verification authoritative-path-inspected`; retry arguments
+remain exact. Invalid or unrelated capture requests remain denied. No hook saves
+a stub or skips capture automatically. Resolve the retained state, then submit
+a new prompt to resume capture. This retains one pending turn without a
 multi-turn queue. Enrolled, unpaused pending work keeps the existing bounded Stop
 recovery behavior. Missing enrollment never creates a Stop recovery loop.
 
