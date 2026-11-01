@@ -2236,6 +2236,46 @@ def session_receipt(event, plan):
     )
 
 
+def keeper_arguments_valid(arguments):
+    schema = json.loads((BUNDLE / "contract.json").read_bytes())["tools"][
+        "obsidian_keeper_save"
+    ]["inputSchema"]
+    properties = schema["properties"]
+    if set(arguments) - properties.keys() or not set(schema["required"]) <= set(
+        arguments
+    ):
+        return False
+
+    def text_matches(value, field):
+        if not isinstance(value, str):
+            return False
+        length = len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+        return field.get("minLength", 0) <= length <= field.get(
+            "maxLength", LIMIT
+        ) and (
+            "pattern" not in field
+            or re.search(field["pattern"], value, re.ASCII) is not None
+        )
+
+    for key, value in arguments.items():
+        field = properties[key]
+        if field["type"] == "string":
+            valid = text_matches(value, field)
+        elif field["type"] == "boolean":
+            valid = type(value) is bool and value is field["const"]
+        elif field["type"] == "array":
+            valid = (
+                isinstance(value, list)
+                and len(value) <= field["maxItems"]
+                and all(text_matches(item, field["items"]) for item in value)
+            )
+        else:
+            valid = False
+        if not valid:
+            return False
+    return True
+
+
 def observe_session(state, event):
     plan = state["session_save"]
     arguments = event.get("tool_input", {})
@@ -2251,10 +2291,8 @@ def observe_session(state, event):
         idempotency_key=plan["idempotency_key"],
         resolved=True,
     )
-    if (
-        any(arguments.get(k) != v for k, v in expected.items())
-        or not isinstance(arguments.get("body"), str)
-        or not arguments["body"]
+    if not keeper_arguments_valid(arguments) or any(
+        arguments.get(k) != v for k, v in expected.items()
     ):
         reason = "SESSION_REQUEST_INVALID"
     elif state.get("session_request", arguments) != arguments:

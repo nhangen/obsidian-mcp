@@ -4787,6 +4787,61 @@ module.hook(profile_home, descriptor, json.loads(event))
         self.assertEqual(len(state["commits"]), 1)
         self.assertEqual(state["turn"], before["turn"])
 
+    def test_invalid_keeper_inputs_never_freeze_active_or_paused_requests(self):
+        for paused in (False, True):
+            self.home = self.directory / (
+                "paused-inputs" if paused else "active-inputs"
+            )
+            self.configure()
+            self.hook("UserPromptSubmit", prompt="Original")
+            path = self.state_paths()[0]
+            if paused:
+                self.pause_next_prompt()
+            arguments = self.session_arguments(path)
+            before = path.read_bytes()
+            invalid = (
+                {"body": ""},
+                {"body": "x" * 65537},
+                {"body": "x" * 65535 + "\U0001f600"},
+                {"resolved": 1},
+                {"resolved": "true"},
+                {"links": "not-an-array"},
+                {"links": [1]},
+                {"links": ["link"] * 21},
+                {"links": ["x" * 2049]},
+                {"links": ["bad\nlink"]},
+                {"type": None},
+                {"type": "x" * 101},
+                {"type": "bad\ntype"},
+                {"request_id": "bad key"},
+                {"unknown": True},
+            )
+            for changes in invalid:
+                with self.subTest(paused=paused, fields=tuple(changes)):
+                    denied = self.hook(
+                        "PreToolUse",
+                        tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                        tool_use_id="invalid-save",
+                        tool_input=dict(arguments, **changes),
+                    )
+                    self.assertEqual(
+                        denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                    )
+                    self.assertEqual(path.read_bytes(), before)
+            arguments.update(type="session", links=["x" * 2048], request_id="valid-id")
+            self.assertEqual(
+                self.hook(
+                    "PreToolUse",
+                    tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                    tool_use_id="valid-save",
+                    tool_input=arguments,
+                ),
+                {},
+            )
+            self.assertEqual(
+                json.loads(path.read_bytes())["session_request"], arguments
+            )
+
     def test_paused_directory_can_make_its_first_retained_save(self):
         self.project = self.directory / "notes"
         self.project.mkdir()
