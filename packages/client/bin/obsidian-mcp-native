@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verified native capture for isolated Codex and attached Claude plugins."""
+"""Verified native capture for isolated Codex and attached host profiles."""
 
 import argparse
 from contextlib import ExitStack, contextmanager
@@ -140,11 +140,17 @@ def atomic_write(path, value, *, limit=LIMIT):
             os.unlink(temporary)
 
 
+def attached_profile(profile):
+    return profile.get("host") == "claude-plugin" or (
+        profile.get("host") == "codex" and profile.get("profileMode") == "attached"
+    )
+
+
 def project_mode(profile):
     mode = profile.get("projectMode", "git")
     if not isinstance(mode, str) or mode not in ("git", "directory"):
         raise NativeError("PROJECT_MODE_INVALID")
-    if mode == "directory" and profile.get("host") != "claude-plugin":
+    if mode == "directory" and not attached_profile(profile):
         raise NativeError("PROJECT_MODE_HOST_UNSUPPORTED")
     return mode
 
@@ -152,7 +158,7 @@ def project_mode(profile):
 def capture_scope(profile):
     scope = profile.get("scope", "project")
     if scope not in ("project", "user") or (
-        scope == "user" and profile.get("host") != "claude-plugin"
+        scope == "user" and not attached_profile(profile)
     ):
         raise NativeError("CAPTURE_SCOPE_INVALID")
     return scope
@@ -238,7 +244,9 @@ def relative_folder(value):
 
 
 def attach_profile(args):
-    if args.host != "claude-plugin":
+    if args.host != "claude-plugin" and not (
+        args.host == "codex" and args.scope == "user"
+    ):
         raise NativeError("ATTACH_HOST_REQUIRED")
     metadata = trusted_bundle(args.release_sha256)
     routes = None
@@ -269,7 +277,7 @@ def attach_profile(args):
         raise NativeError("NEW_PROFILE_REQUIRED")
     descriptor = dict(
         schemaVersion=1,
-        host="claude-plugin",
+        host=args.host,
         python=str(Path(sys.executable).resolve()),
         bundle=str(BUNDLE),
         releaseSha256=args.release_sha256,
@@ -279,6 +287,8 @@ def attach_profile(args):
         files={},
         active=True,
     )
+    if args.host == "codex":
+        descriptor["profileMode"] = "attached"
     if args.scope == "user":
         descriptor["scope"] = "user"
     else:
@@ -293,7 +303,7 @@ def attach_profile(args):
     atomic_write(home / "capture-profile.json", encode(descriptor))
     return dict(
         status="attached",
-        host="claude-plugin",
+        host=args.host,
         home=str(home),
         project=str(project) if project is not None else None,
         scope=args.scope,
@@ -308,7 +318,19 @@ def capabilities(expected):
         apiVersion=1,
         hosts=["codex", "claude-plugin"],
         projectModes={"claude-plugin": ["git", "directory"], "codex": ["git"]},
-        captureScopes={"claude-plugin": ["project", "user"], "codex": ["project"]},
+        captureScopes={
+            "claude-plugin": ["project", "user"],
+            "codex": ["project", "user"],
+        },
+        attachedCaptureScopes={"claude-plugin": ["project", "user"], "codex": ["user"]},
+        userWorkspaceModes={
+            "claude-plugin": ["git", "directory"],
+            "codex": ["git", "directory"],
+        },
+        promptIdentities={
+            "claude-plugin": "transcript-watermark-v1",
+            "codex": "native-turn-id",
+        },
         release_id=metadata["releaseId"],
         operations=[
             "attach",
@@ -453,9 +475,19 @@ def load_profile(home, *, parent_only=False, inspect=False):
         or profile.get("active") is not True
         or profile.get("host") not in ("codex", "claude-plugin")
         or profile.get("bundle") != str(BUNDLE)
-        or (profile.get("files") != {} and profile.get("host") == "claude-plugin")
+        or (attached_profile(profile) and profile.get("files") != {})
+        or (
+            attached_profile(profile)
+            and profile.get("host") == "codex"
+            and (
+                "config" in profile
+                or (profile.get("scope") != "user" and "parentHome" not in profile)
+            )
+        )
+        or profile.get("profileMode") not in (None, "attached")
         or (
             profile.get("host") == "codex"
+            and not attached_profile(profile)
             and set(profile.get("files", {})) != set(OWNED)
         )
     ):
@@ -475,7 +507,7 @@ def load_profile(home, *, parent_only=False, inspect=False):
         raise NativeError(
             "PROFILE_PYTHON_UNAVAILABLE; recreate profile with Python 3.11 or newer"
         )
-    if profile["host"] == "claude-plugin":
+    if attached_profile(profile):
         relative_folder(profile["folder"])
         relative_folder(profile["dailyFolder"])
         if scope == "user":
@@ -1245,16 +1277,28 @@ def initial_session_state(profile, session, turn, transcript=None, *, date=None)
     return state
 
 
+def capture_identity_valid(profile, turn, transcript):
+    if profile["host"] == "claude-plugin":
+        return (
+            isinstance(turn, str)
+            and HEX.fullmatch(turn) is not None
+            and isinstance(transcript, str)
+            and HEX.fullmatch(transcript) is not None
+        )
+    try:
+        identifier(turn)
+    except NativeError:
+        return False
+    return transcript is None
+
+
 def validate_initial_state(profile, session, state):
     if not isinstance(state, dict) or not isinstance(state.get("session_save"), dict):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
     turn, transcript = state.get("turn"), state.get("claude_transcript")
     date = state.get("session_save", {}).get("date")
     if (
-        not isinstance(turn, str)
-        or HEX.fullmatch(turn) is None
-        or not isinstance(transcript, str)
-        or HEX.fullmatch(transcript) is None
+        not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
         or datetime.date.fromisoformat(date).isoformat() != date
         or state != initial_session_state(profile, session, turn, transcript, date=date)
@@ -1272,10 +1316,7 @@ def continuation_capture(profile, session, state):
     turn, transcript = state.get("turn"), state.get("claude_transcript")
     date = state["session_save"].get("date")
     if (
-        not isinstance(turn, str)
-        or HEX.fullmatch(turn) is None
-        or not isinstance(transcript, str)
-        or HEX.fullmatch(transcript) is None
+        not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
         or datetime.date.fromisoformat(date).isoformat() != date
     ):
@@ -1286,9 +1327,12 @@ def continuation_capture(profile, session, state):
         "python",
         "session",
         "turn",
-        "claude_transcript",
         "session_save",
     )
+    if profile["host"] == "claude-plugin":
+        fields += ("claude_transcript",)
+    elif "claude_transcript" in state:
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID")
     if any(state.get(key) != expected[key] for key in fields):
         raise NativeError("CONTINUATION_PUBLICATION_INVALID")
     drain_reasons(state)
@@ -1414,7 +1458,7 @@ def retained_capture_event(home, profile, event):
     with state_lock(home, session) as (state, _):
         if state is None:
             return False
-        normalized = normalize_claude(event, state)
+        normalized = normalize_host_event(profile, event, state)
         name = normalized["hook_event_name"]
         if name not in ("PreToolUse", "PostToolUse"):
             return False
@@ -1474,7 +1518,8 @@ def user_hook(home, profile, event):
                 and index is None
                 and event.get("hook_event_name") == "SessionStart"
             ):
-                claude_transcript(event)
+                if profile["host"] == "claude-plugin":
+                    claude_transcript(event)
                 return context(
                     "SessionStart",
                     "Obsidian capture awaits UserPromptSubmit; startup does not enroll a session.",
@@ -1490,7 +1535,7 @@ def user_hook(home, profile, event):
                         activation = state is None or not drain_reasons(state)
             if activation:
                 if event.get("hook_event_name") == "UserPromptSubmit":
-                    normalize_claude(event, None)
+                    normalize_host_event(profile, event, None)
                 active = retire_terminal_sessions(home, profile)
                 hot, _ = read_hot_binding(home, session)
                 index = archive_index(home, session)
@@ -1531,8 +1576,10 @@ def user_hook(home, profile, event):
                     event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
                 )
             try:
-                result = claude_output(
-                    engine_hook(child, descriptor, event), event.get("hook_event_name")
+                result = host_output(
+                    descriptor,
+                    engine_hook(child, descriptor, event),
+                    event.get("hook_event_name"),
                 )
             except Exception as error:
                 if event.get("hook_event_name") == "UserPromptSubmit":
@@ -1543,7 +1590,7 @@ def user_hook(home, profile, event):
                         and str(error) == "PREVIOUS_CAPTURE_UNRESOLVED"
                     ):
                         with state_lock(child, session) as (retained, _):
-                            normalize_claude(event, retained)
+                            normalize_host_event(descriptor, event, retained)
                             guidance = capture_guidance(
                                 child,
                                 retained,
@@ -1567,10 +1614,10 @@ def user_hook(home, profile, event):
                         and record["enrolled"]
                         and record["paused"]
                         and admitted.get("continuation_requested") is True
-                        and event["prompt"].startswith(
+                        and event.get("prompt", "").startswith(
                             "OBSIDIAN_MCP_CONTINUE:" + admitted["turn"] + "\n"
                         )
-                        and normalize_claude(event, admitted)["turn_id"]
+                        and normalize_host_event(descriptor, event, admitted)["turn_id"]
                         == admitted["turn"]
                     ):
                         record["continuationCapture"] = continuation_capture(
@@ -2673,6 +2720,59 @@ def normalize_claude(event, state):
     return normalized
 
 
+def normalize_host_event(profile, event, state):
+    if profile["host"] == "claude-plugin":
+        return normalize_claude(event, state)
+    name = event.get("hook_event_name")
+    if name not in CLAUDE_EVENTS:
+        raise NativeError("HOOK_EVENT_UNSUPPORTED")
+    if event.get("agent_id"):
+        raise NativeError("SUBAGENT_CAPTURE_UNSUPPORTED")
+    if state is not None:
+        drain_reasons(state)
+        if not capture_identity_valid(
+            profile, state.get("turn"), state.get("claude_transcript")
+        ):
+            raise NativeError("CAPTURE_IDENTITY_INVALID")
+    normalized = dict(event)
+    if name in ("SessionStart", "StopFailure"):
+        return normalized
+    identifier(event.get("turn_id"))
+    if name == "UserPromptSubmit":
+        prompt = event.get("prompt", "")
+        if not isinstance(prompt, str):
+            raise NativeError("PROMPT_INVALID")
+        if (
+            state
+            and state.get("continuation_requested")
+            and prompt.startswith("OBSIDIAN_MCP_CONTINUE:" + state["turn"] + "\n")
+        ):
+            normalized["turn_id"] = state["turn"]
+    elif state is None:
+        raise NativeError("PROMPT_EVENT_REQUIRED")
+    if name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        identifier(event.get("tool_use_id"))
+        if not isinstance(event.get("tool_input"), dict) or not isinstance(
+            event.get("tool_name"), str
+        ):
+            raise NativeError("TOOL_EVENT_INVALID")
+        if event["tool_name"] in CLAUDE_TOOLS:
+            raise NativeError("MCP_ALIAS_UNSUPPORTED")
+        if name == "PostToolUseFailure":
+            normalized.update(
+                hook_event_name="PostToolUse",
+                tool_response={"isError": True},
+                host_tool_failed=True,
+            )
+    if name == "Stop" and type(event.get("stop_hook_active")) is not bool:
+        raise NativeError("STOP_EVENT_INVALID")
+    return normalized
+
+
+def host_output(profile, value, name):
+    return claude_output(value, name) if profile["host"] == "claude-plugin" else value
+
+
 def claude_output(value, name):
     if isinstance(value, dict):
         output = {}
@@ -2740,7 +2840,7 @@ def engine_hook(home, profile, event):
         except (OSError, RuntimeError):
             raise NativeError("PROJECT_MISMATCH") from None
         directory_session_event(event)
-    elif profile["host"] == "claude-plugin":
+    elif attached_profile(profile):
         if (
             not isinstance(cwd, str)
             or not cwd
@@ -2752,14 +2852,15 @@ def engine_hook(home, profile, event):
     elif Path(cwd).resolve() != Path(profile["project"]):
         raise NativeError("PROJECT_MISMATCH")
     with state_lock(home, session) as (state, path):
-        if profile["host"] == "claude-plugin":
+        if attached_profile(profile):
             if name == "SessionStart" and state is None:
-                claude_transcript(event)
+                if profile["host"] == "claude-plugin":
+                    claude_transcript(event)
                 return context(
                     name,
                     "Obsidian capture awaits UserPromptSubmit; no turn inferred on startup or resume.",
                 )
-            event = normalize_claude(event, state)
+            event = normalize_host_event(profile, event, state)
             name = event["hook_event_name"]
             if name == "StopFailure":
                 return {}
@@ -2787,11 +2888,7 @@ def engine_hook(home, profile, event):
                     or state.get("snapshot_resolutions")
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
-                if (
-                    state
-                    and profile["host"] == "claude-plugin"
-                    and drain_reasons(state)
-                ):
+                if state and attached_profile(profile) and drain_reasons(state):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 state = initial_session_state(
                     profile,
@@ -2809,7 +2906,11 @@ def engine_hook(home, profile, event):
                 (
                     "This capture profile uses MCP only; plugin ownership is managed separately.\n"
                     if profile["host"] == "claude-plugin"
-                    else "This isolated profile owns capture through MCP only.\n"
+                    else (
+                        "This attached profile uses MCP only; host configuration and ownership are managed externally.\n"
+                        if attached_profile(profile)
+                        else "This isolated profile owns capture through MCP only.\n"
+                    )
                 )
                 + capture_guidance(home, state, profile["host"], routes),
             )
@@ -2936,7 +3037,7 @@ def engine_hook(home, profile, event):
                 command,
                 event["cwd"],
                 profile["project"],
-                allow_subdirectory=profile["host"] == "claude-plugin",
+                allow_subdirectory=attached_profile(profile),
             )
         except NativeError as error:
             if name == "PreToolUse" and (
@@ -3010,7 +3111,7 @@ def engine_hook(home, profile, event):
                 ).strip(),
                 log=reflog(root),
             )
-            if profile["host"] == "claude-plugin":
+            if attached_profile(profile):
                 state["snapshots"][fingerprint]["cwd"] = str(
                     Path(event["cwd"]).resolve()
                 )
@@ -3139,7 +3240,7 @@ def execute_commit(home, profile, args, parent_locks=None):
             before["command"],
             execution_cwd,
             profile["project"],
-            allow_subdirectory=profile["host"] == "claude-plugin",
+            allow_subdirectory=attached_profile(profile),
         )
         if root is None:
             raise NativeError("COMMIT_COMMAND_INVALID")
@@ -3501,6 +3602,14 @@ def dispatch_command(args, extra, locks):
             "request",
         )
         home, profile = load_profile(args.home, inspect=inspection)
+        if (
+            attached_profile(profile)
+            and profile["host"] == "codex"
+            and args.operation in ("run", "disable")
+        ):
+            raise NativeError(
+                "ATTACHED_PROFILE_" + args.operation.upper() + "_UNSUPPORTED"
+            )
         if "parentHome" in profile and args.operation != "profile-status":
             home, profile = load_profile(
                 profile["parentHome"], parent_only=True, inspect=inspection
@@ -3570,6 +3679,8 @@ def dispatch_command(args, extra, locks):
                 active=True,
                 ownership_managed=False,
             )
+            if profile.get("profileMode") is not None:
+                result["profileMode"] = profile["profileMode"]
             if scope == "project":
                 result.update(project=profile["project"], projectMode=mode)
         elif args.operation == "drain-status":

@@ -330,6 +330,59 @@ profile before disabling it; an already-running host has loaded its hook setting
 General profile upgrade/migration and an all-host writer handoff remain separate
 acceptance gates. The existing managed client installer still owns bundle lifecycle.
 
+## Attached user-wide Codex capture API
+
+`attach --host codex --scope user` creates a separate private runtime profile
+for an integrating Codex dispatcher. It does not create an isolated Codex home,
+edit normal-home configuration, register or trust hooks, select credentials, or
+change capture ownership. This is runtime source support, not completed plugin
+onboarding, an administrator installation, or installed-host acceptance.
+
+Verify the public bundle and query its capabilities before attachment. Require
+`captureScopes["codex"]` and `attachedCaptureScopes["codex"]` to include
+`"user"`. `userWorkspaceModes["codex"]` advertises `"git"` and `"directory"`,
+and `promptIdentities["codex"]` is `"native-turn-id"`. Older project-only
+releases are unsupported, without a legacy-writer fallback:
+
+```sh
+python3 <verified-bundle>/bin/obsidian-mcp-native capabilities \
+  --release-sha256 <trusted-release-json-sha256>
+python3 <verified-bundle>/bin/obsidian-mcp-native attach --host codex \
+  --scope user --home /absolute/new-private-codex-capture \
+  --folder Sessions --daily-folder Daily \
+  --release-sha256 <trusted-release-json-sha256>
+```
+
+The state path must be new, under an existing canonical parent; it is not your
+existing `CODEX_HOME`. Attachment owns no `config.toml`, `hooks.json`, or
+`AGENTS.md`; its descriptor uses `profileMode: "attached"` and `files: {}`.
+Isolated-profile `run` and `disable` are refused for attached state. The
+integrating plugin owns hook registration, admission, draining, and
+rollback separately. Do not change an existing writer without that handoff.
+
+The integrating dispatcher forwards original Codex native events to `hook --home
+<attached-profile>` on stdin. Native session/turn IDs and underscore-separated
+MCP tool names retain their Codex semantics; do not translate them to another
+host's transcript identities or aliases. Startup alone does not admit a capture
+turn. A valid prompt binds its session to a canonical workspace, and later events
+cannot move that binding while pending capture remains. Duplicate delivery must
+not erase or recreate pending work.
+
+New Git workspaces route by canonical Git root, including subdirectory entry.
+Non-Git directories receive session-only capture, not inferred commit metadata.
+No workspace configuration or instructions are written. Children inherit the
+parent's immutable release and folder settings. Existing pending-request,
+receipt, replay/conflict, recovery, and aggregate drain checks still apply;
+ordinary prompts receive advisory capture failures instead of being blocked.
+Codex commit capture retains its native preparation/executor contract and
+canonical commit route; it does not inherit Claude-only route overrides or
+unprepared direct-MCP commit capture.
+
+Normal-home plugin activation, suppression of duplicate owned local handlers,
+protected managed dispatch, and the administrator installer remain separate
+acceptance gates. The offline managed exporter is still nondeployable.
+`create` continues to mean a fresh isolated Git-only Codex profile.
+
 ## Attached Claude plugin capture API
 
 The public runtime also supports an explicit `claude-plugin` host mode. This is
@@ -341,9 +394,9 @@ Before using this API, verify the public release using the installer instruction
 above. The dispatcher must require a successful capabilities response with
 `apiVersion: 1` and `claude-plugin` in `hosts`; an older release or any nonzero exit
 is unsupported, with no local writer fallback. Directory attachment additionally
-requires `projectModes["claude-plugin"]` to contain `"directory"`. The additive
-capability map is `{"claude-plugin":["git","directory"],"codex":["git"]}`;
-it does not advertise non-Git Codex native profiles:
+requires `projectModes["claude-plugin"]` to contain `"directory"`. Capability
+checks are host- and operation-specific: attached Codex user scope is described
+above, while isolated Codex creation remains Git-only:
 
 ```sh
 python3 <verified-bundle>/bin/obsidian-mcp-native capabilities \
@@ -480,8 +533,10 @@ ownership change is performed by any of these API calls.
 An integrating Claude plugin can configure a single fallback session folder and
 daily folder, then delegate events from newly opened workspaces without attaching
 each project. First require the additive capability map
-`captureScopes={"claude-plugin":["project","user"],"codex":["project"]}`.
-Profiles without `scope` retain `project` behavior; Codex remains project-only.
+`captureScopes["claude-plugin"]` containing `"user"`. Profiles without `scope`
+retain `project` behavior. Attached Codex user scope is documented separately
+above; its native event contract must not be replaced with the Claude events
+described below.
 
 ```sh
 python3 <verified-bundle>/bin/obsidian-mcp-native attach --host claude-plugin \

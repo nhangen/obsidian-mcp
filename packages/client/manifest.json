@@ -5,7 +5,12 @@
     "policy": "hosts/codex-capture.md",
     "host": "codex",
     "activation": "new-isolated-profile-only",
-    "defaultActivated": false
+    "defaultActivated": false,
+    "attached": {
+      "scope": "user",
+      "activation": "external-host-ownership-only",
+      "defaultActivated": false
+    }
   },
   "pluginCapture": {
     "launcher": "bin/obsidian-mcp-native",

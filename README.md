@@ -54,7 +54,8 @@ it is not a required extra installation for the intended plugin experience.
 The standalone server release is [mcp-v0.2.1](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.1).
 The public portable client source is in [`packages/client`](packages/client/README.md),
 including the pinned bridge, lifecycle installer, optional isolated Codex capture,
-and an explicit Claude plugin attachment API. The public runtime requires no
+attached user-wide Codex capture state, and an explicit Claude plugin attachment
+API. The public runtime requires no
 private llm-tools harness. Attachment preserves existing host settings and does
 not activate writers; the plugin separately owns migration and admission gates.
 Attached Claude commit capture uses canonical MCP arguments directly, with bounded
@@ -68,6 +69,12 @@ Explicit attached Claude profiles can opt into `--project-mode directory` for
 session-only non-Git workspaces. Git remains the default and is required for
 commit capture. See the [directory-profile boundary](packages/client/README.md#explicit-directory-session-profiles);
 this source support does not establish a released client or whole-host acceptance.
+
+The attached Codex API routes newly opened Git and non-Git workspaces from one
+private user profile without creating workspace configuration. It does not
+register hooks, alter normal Codex settings, trust hooks, or activate a writer.
+See [attached Codex capture](packages/client/README.md#attached-user-wide-codex-capture-api).
+Normal plugin activation and administrator-managed deployment remain separate.
 
 From a trusted checkout, with Python 3.11+ and Node.js 22+:
 
