@@ -5487,6 +5487,42 @@ module.hook(home, descriptor, json.loads(event))
         self.assertFalse((self.home / "capture-state/active.json").exists())
         self.assertFalse(self.drain()["quiescent"])
 
+    def test_unexpected_hook_error_reports_its_class_without_its_text(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        program = """
+import json, sys, types
+from pathlib import Path
+script, profile, event = sys.argv[1:]
+module = types.ModuleType("error_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+def broken(*args, **kwargs):
+    raise KeyError("PRIVATE-KEY-DETAIL")
+module.engine_hook = broken
+home, descriptor = module.load_profile(profile)
+print(json.dumps(module.hook(home, descriptor, json.loads(event))))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                json.dumps(self.event("Stop", stop_hook_active=False)),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(set(output), {"systemMessage"})
+        self.assertIn("USER_CAPTURE_UNAVAILABLE (KeyError)", output["systemMessage"])
+        self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
     def test_bound_and_unbound_busy_hooks_do_not_block_prompts_or_unrelated_bash(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")

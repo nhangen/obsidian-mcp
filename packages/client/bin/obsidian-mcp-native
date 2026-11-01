@@ -1554,7 +1554,7 @@ def user_hook(home, profile, event):
             (
                 str(error)
                 if isinstance(error, NativeError)
-                else "USER_CAPTURE_UNAVAILABLE"
+                else "USER_CAPTURE_UNAVAILABLE (" + type(error).__name__ + ")"
             ),
         )
 
@@ -2551,7 +2551,7 @@ def hook(home, profile, event):
         code = (
             str(error)
             if isinstance(error, NativeError)
-            else "HOOK_STATE_OR_EVENT_INVALID"
+            else "HOOK_STATE_OR_EVENT_INVALID (" + type(error).__name__ + ")"
         )
         message = "Obsidian capture unresolved: " + code
         if name == "PreToolUse" and event.get("tool_name") in (
