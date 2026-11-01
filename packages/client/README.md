@@ -68,6 +68,66 @@ explicit invocation can pass the local capability gate. The consumer still requi
 the live server version and discovered schema to match before writing; the released
 contract alone does not change writer ownership.
 
+## Offline managed-hook deployment proposals
+
+`bin/obsidian-mcp-managed-export` is a preparatory offline export tool, not a
+privileged installer or an activation command. It verifies an externally pinned
+packed bundle, validates an explicit supported deployment scope, and previews a
+proposal without touching host policy. An explicit `--output` creates a new
+artifact directory; it never replaces an existing one or writes to proposed
+system paths.
+
+The proposal remains `activationReady: false`. It records unresolved managed
+activation, protected dependencies, policy merging, and lifecycle prerequisites.
+Existing policy is preserved as a separate snapshot, not presented as already
+merged. Do not install its policy fragment before those prerequisites are met.
+No credentials, host hook trust, writer ownership, or server settings change.
+See the public Codex integration guide for the user-wide onboarding and
+administrator deployment boundaries; local fixtures do not prove managed-host
+acceptance.
+
+From a trusted packed bundle, preview the proposed scope:
+
+```sh
+python3 /trusted/client/bin/obsidian-mcp-managed-export \
+  --bundle /trusted/client --release-sha256 <trusted-release-json-sha256> \
+  --plan /private/deployment.json \
+  --existing-policy /private/requirements.snapshot.toml \
+  --local-hooks /private/hooks.snapshot.json
+```
+
+The plan uses exactly these fields. Replace the account ID, data paths,
+administrator-selected destinations, and release ID before running it:
+
+```json
+{
+  "schemaVersion": 1,
+  "host": "codex",
+  "scope": "project",
+  "targetUid": 1000,
+  "project": "/home/example/project",
+  "profileHome": "/home/example/codex-capture",
+  "managedDir": "/etc/codex/hooks/obsidian",
+  "bundlePath": "/opt/obsidian-mcp/<verified-release-id>",
+  "pythonPath": "/usr/bin/python3",
+  "pythonVersion": "3.11"
+}
+```
+
+`pythonVersion` is a declaration, not proof of the target interpreter or its
+dependencies. It must be Python 3.11 or newer, and the full execution chain
+still needs administrator verification. This slice accepts only the currently
+supported project scope; it is not the normal user-wide onboarding path.
+The policy and local-hook snapshots are optional, but omitting them does not
+establish absence of conflicts. Keep all inputs private. Existing policy bytes
+may contain secrets, so an exported snapshot is private review material, not a
+public artifact.
+
+Add `--output /private/new-export` to retain the proposal in a new directory.
+The printed preview remains secret-free and reports `activationReady: false`.
+Do not copy the proposal into `/etc/codex/requirements.toml`: privileged
+installation, managed dispatch, and ownership-safe activation are not shipped.
+
 ## Local commit-event metadata
 
 `bin/obsidian-mcp-commit-event` requires a POSIX host (macOS, Linux or WSL), Python

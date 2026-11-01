@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Render an offline, nondeployable managed Codex capture proposal."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import stat
+import sys
+import tomllib
+
+
+sys.dont_write_bytecode = True
+BUNDLE = Path(__file__).resolve().parent.parent
+LIMIT = 262144
+MATCHER = "^(Bash|mcp__obsidian_write__obsidian_keeper_save|mcp__obsidian_write__obsidian_daily_append)$"
+EVENTS = [dict(event=name, **({"matcher": MATCHER} if "ToolUse" in name else {}))
+          for name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")]
+BLOCKERS = [
+    "Normal-profile and user-wide Codex capture are unsupported; implement and validate them first.",
+    "Managed capture mode and owned local hook suppression are unimplemented; prevent duplicate capture first.",
+    "Administrator verification of the protected ownership chain, interpreter and dependencies is pending.",
+    "Policy merge, dispatcher, installation, upgrade and uninstall are unimplemented; this proposal cannot activate capture.",
+]
+ERRORS = {
+    "CLI_INVALID": "use --help for the offline export interface",
+    "INPUT_INVALID": "inputs must be bounded private regular files containing valid JSON or TOML",
+    "PLAN_INVALID": "use schemaVersion 1, codex project scope, a non-root target UID and the documented paths",
+    "BUNDLE_UNTRUSTED": "supply a packed bundle and its independently obtained release.json SHA-256",
+    "MANAGED_DIR_CONFLICT": "existing hooks.managed_dir differs; resolve ownership before exporting",
+    "OWNERSHIP_UNKNOWN": "existing hooks.managed_dir ownership cannot be established offline",
+    "OWNED_HANDLER_CONFLICT": "existing policy contains capture handlers; resolve ownership first",
+    "LOCAL_CAPTURE_DUPLICATE": "remove or migrate owned local capture hooks before managed activation",
+    "LOCAL_HOOKS_INVALID": "supply a hooks.json inventory with command handlers",
+    "OUTPUT_INVALID": "output must be a new directory outside checkouts and bundles with safe existing parents",
+    "OUTPUT_PARTIAL": "incomplete export retained at the requested --output directory; inspect it before retrying with a new directory",
+}
+
+
+class ExportError(Exception):
+    pass
+
+
+def fail(code):
+    raise ExportError(code)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, _message):
+        fail("CLI_INVALID")
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def private_read(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            item = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(item.st_mode) or item.st_nlink != 1
+                    or item.st_uid != os.getuid() or stat.S_IMODE(item.st_mode) != 0o600
+                    or item.st_size > LIMIT):
+                fail("INPUT_INVALID")
+            data = stream.read(LIMIT + 1)
+        if len(data) > LIMIT:
+            fail("INPUT_INVALID")
+        return data
+    except OSError:
+        fail("INPUT_INVALID")
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("INPUT_INVALID")
+        result[key] = value
+    return result
+
+
+def parse_json(data):
+    try:
+        return json.loads(data, object_pairs_hook=unique_object,
+                          parse_constant=lambda _value: fail("INPUT_INVALID"))
+    except (ValueError, UnicodeError, RecursionError):
+        fail("INPUT_INVALID")
+
+
+def data_path(value):
+    if (not isinstance(value, str) or len(value) > 4096
+            or not re.fullmatch(r"/[A-Za-z0-9_./ -]+", value)
+            or any(part in ("", ".", "..") for part in value.split("/")[1:])
+            or len(Path(value).parts) < 3):
+        fail("PLAN_INVALID")
+    return Path(value)
+
+
+def validate_plan(plan, release_id):
+    keys = {"schemaVersion", "host", "scope", "targetUid", "project", "profileHome",
+            "managedDir", "bundlePath", "pythonPath", "pythonVersion"}
+    if (not isinstance(plan, dict) or set(plan) != keys
+            or type(plan["schemaVersion"]) is not int or plan["schemaVersion"] != 1
+            or plan["host"] != "codex" or plan["scope"] != "project"
+            or type(plan["targetUid"]) is not int or not 0 < plan["targetUid"] < 2**32
+            or plan["managedDir"] != "/etc/codex/hooks/obsidian"
+            or plan["bundlePath"] != "/opt/obsidian-mcp/" + release_id
+            or plan["pythonPath"] != "/usr/bin/python3"
+            or not isinstance(plan["pythonVersion"], str)
+            or not re.fullmatch(r"3\.(?:1[1-9]|[2-9][0-9])(?:\.[0-9]{1,3})?", plan["pythonVersion"])):
+        fail("PLAN_INVALID")
+    for field in ("project", "profileHome"):
+        path = data_path(plan[field])
+        if path.parts[1] in {"etc", "opt", "usr", "bin", "sbin", "System", "root"}:
+            fail("PLAN_INVALID")
+    if plan["project"] == plan["profileHome"]:
+        fail("PLAN_INVALID")
+    return plan
+
+
+def owned_handler(value):
+    if isinstance(value, str):
+        return any(marker in value for marker in ("obsidian-mcp-", "capture-profile.json", "/etc/codex/hooks/obsidian"))
+    if isinstance(value, dict):
+        return any(owned_handler(key) or owned_handler(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(owned_handler(item) for item in value)
+    return False
+
+
+def check_policy(data, plan):
+    try:
+        policy = tomllib.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        fail("INPUT_INVALID")
+    hooks = policy.get("hooks", {})
+    if not isinstance(hooks, dict):
+        fail("OWNERSHIP_UNKNOWN")
+    if "managed_dir" in hooks:
+        fail("OWNERSHIP_UNKNOWN" if hooks["managed_dir"] == plan["managedDir"] else "MANAGED_DIR_CONFLICT")
+    if owned_handler(hooks):
+        fail("OWNED_HANDLER_CONFLICT")
+
+
+def check_local(value):
+    if not isinstance(value, dict) or set(value) != {"hooks"} or not isinstance(value["hooks"], dict):
+        fail("LOCAL_HOOKS_INVALID")
+    for event, groups in value["hooks"].items():
+        if not isinstance(event, str) or not isinstance(groups, list):
+            fail("LOCAL_HOOKS_INVALID")
+        for group in groups:
+            if (not isinstance(group, dict) or set(group) - {"hooks", "matcher"}
+                    or not isinstance(group.get("hooks"), list)
+                    or ("matcher" in group and not isinstance(group["matcher"], str))):
+                fail("LOCAL_HOOKS_INVALID")
+            for handler in group["hooks"]:
+                if (not isinstance(handler, dict) or set(handler) - {"type", "command", "timeout"}
+                        or handler.get("type") != "command" or not isinstance(handler.get("command"), str)):
+                    fail("LOCAL_HOOKS_INVALID")
+    if owned_handler(value):
+        fail("LOCAL_CAPTURE_DUPLICATE")
+
+
+def render(plan, metadata, release_sha, snapshot, local_supplied):
+    dispatcher = plan["managedDir"] + "/obsidian-mcp-dispatch"
+    fragment = '# NONDEPLOYABLE proposal only. No dispatcher exists; do not install or append.\n[proposal]\ndeployable = false\n'
+    fragment += 'managed_dir = ' + json.dumps(plan["managedDir"]) + '\n'
+    for event in EVENTS:
+        fragment += '\n[[proposal.events]]\n'
+        for key, value in dict(event, dispatcherPath=dispatcher, timeoutSeconds=15).items():
+            fragment += key + ' = ' + json.dumps(value) + '\n'
+    artifacts = {"requirements.fragment.toml": fragment.encode(), "dispatcher-config.json": encode(dict(
+        schemaVersion=1, executable=False, activationReady=False, plan=plan,
+        futureDispatcherPath=dispatcher, events=EVENTS, blockers=BLOCKERS))}
+    if snapshot is not None:
+        artifacts["existing-policy.toml"] = snapshot
+    manifest = dict(schemaVersion=1, owner="obsidian-mcp", status="proposal-only",
+                    activationReady=False, policyMerged=False, dispatcherImplemented=False,
+                    releaseId=metadata["releaseId"], releaseSha256=release_sha,
+                    releaseInventory=metadata["files"], blockers=BLOCKERS,
+                    prerequisites=dict(policySnapshotProvided=snapshot is not None,
+                                       localHooksInventoryProvided=local_supplied,
+                                       protectedChainVerified=False, interpreterDependenciesVerified=False),
+                    ownedEntries=[dict(event, dispatcherPath=dispatcher) for event in EVENTS],
+                    artifacts=[dict(path=name, size=len(body), sha256=sha(body)) for name, body in sorted(artifacts.items())])
+    artifacts["ownership-manifest.json"] = encode(manifest)
+    return artifacts
+
+
+def output_parent(output, source):
+    path = Path(output)
+    if (not path.is_absolute() or str(path) != output or ".." in path.parts
+            or any(ord(char) < 32 or ord(char) == 127 for char in output)
+            or len(output) > 4096 or len(path.parts) < 3
+            or path.parts[1] in {"etc", "opt", "usr", "bin", "sbin", "System", "root"}):
+        fail("OUTPUT_INVALID")
+    for protected in (BUNDLE, source):
+        if path == protected or protected in path.parents:
+            fail("OUTPUT_INVALID")
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            item = os.fstat(fd)
+            if (item.st_uid not in (0, os.getuid())
+                    or (item.st_mode & 0o022 and not (item.st_uid == 0 and item.st_mode & stat.S_ISVTX))):
+                fail("OUTPUT_INVALID")
+            try:
+                os.stat(".git", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                fail("OUTPUT_INVALID")
+        return fd, path.name
+    except (OSError, ExportError):
+        os.close(fd)
+        fail("OUTPUT_INVALID")
+
+
+def write_output(output, source, artifacts):
+    parent, name = output_parent(output, source)
+    created = False
+    directory = None
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+        created = True
+        directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        for filename, body in sorted(artifacts.items()):
+            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+    except OSError:
+        fail("OUTPUT_PARTIAL" if created else "OUTPUT_INVALID")
+    finally:
+        if directory is not None:
+            os.close(directory)
+        os.close(parent)
+
+
+def main():
+    parser = Parser(description="Offline managed Codex export. Proposal only; cannot install or activate capture.", allow_abbrev=False)
+    for flag in ("bundle", "release-sha256", "plan"):
+        parser.add_argument("--" + flag, required=True)
+    for flag in ("existing-policy", "local-hooks", "output"):
+        parser.add_argument("--" + flag)
+    args = parser.parse_args()
+    installer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-client-install"))
+    try:
+        source = Path(args.bundle).absolute()
+        metadata = installer["verify_source"](source, args.release_sha256)[0]
+    except (installer["InstallError"], OSError, ValueError, TypeError, KeyError, RecursionError):
+        fail("BUNDLE_UNTRUSTED")
+    plan = validate_plan(parse_json(private_read(args.plan)), metadata["releaseId"])
+    snapshot = private_read(args.existing_policy) if args.existing_policy else None
+    if snapshot is not None:
+        check_policy(snapshot, plan)
+    if args.local_hooks:
+        check_local(parse_json(private_read(args.local_hooks)))
+    artifacts = render(plan, metadata, args.release_sha256, snapshot, args.local_hooks is not None)
+    if args.output:
+        write_output(args.output, source, artifacts)
+    print(encode(dict(status="proposal-only", activationReady=False, blockers=BLOCKERS,
+                      releaseId=metadata["releaseId"], releaseSha256=args.release_sha256,
+                      artifacts=[dict(path=name, size=len(body), sha256=sha(body)) for name, body in sorted(artifacts.items())])).decode(), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ExportError as error:
+        print("obsidian-mcp-managed-export: " + str(error) + ": " + ERRORS[str(error)], file=sys.stderr)
+        raise SystemExit(64) from None
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        print("obsidian-mcp-managed-export: INPUT_INVALID: " + ERRORS["INPUT_INVALID"], file=sys.stderr)
+        raise SystemExit(64) from None

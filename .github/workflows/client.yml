@@ -40,7 +40,7 @@ jobs:
       - name: Run portable client fixture suites
         run: |
           python3 tests/obsidian-mcp-bridge-build.test.py
-          for suite in client client-lifecycle commit-event capture-commit native; do
+          for suite in client client-lifecycle commit-event capture-commit native managed-export; do
             bash "tests/obsidian-mcp-${suite}.test.sh"
           done
       - name: Pack immutable client artifact

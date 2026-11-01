@@ -94,6 +94,50 @@ If running Codex in an existing profile without native hooks:
 - The model invokes `obsidian_find_notes`, `obsidian_commit_meta`, and opt-in write tools on explicit user request.
 - No hooks or background watchers run; writes are explicitly agent-invoked.
 
+## Administrator-managed deployment preview
+
+Codex [managed hooks](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)
+are trusted by administrator policy, including local Unix system requirements
+at `/etc/codex/requirements.toml`; MDM is not the only delivery route. This moves
+authorization to the administrator. Managed handlers cannot be disabled in the
+user hook browser. The administrator must protect the program, interpreter,
+dependencies, and distribution paths, not only the policy file.
+
+`bin/obsidian-mcp-managed-export` prepares an offline proposal from a trusted
+packed runtime, an explicit deployment plan, and optional snapshots of existing
+policy and local hooks. Its default is a non-mutating preview. `--output` writes
+only to a new export directory, never to the proposed system destinations.
+
+The output is **not activation-ready**. It does not provide a managed dispatcher
+implementation, merge or install policy, elevate privileges, copy credentials,
+change hook trust, or migrate a writer. A policy fragment is not a complete
+replacement for an existing requirements file and must not be blindly appended
+to it. Existing policy bytes remain a separate snapshot for administrator review.
+
+Before a managed deployment can serve normal users, finish these gates:
+
+- Normal-home, user-wide Codex capture and automatic workspace routing through
+  the plugin, rather than manual enrollment of each workspace.
+- An explicit managed activation mode that suppresses only the corresponding
+  owned local handlers, preserving unrelated hooks and retained pending work.
+- Protected executable code, interpreter, dependencies, and pointers verified
+  on the target host, with a dispatcher that ignores other accounts and scopes.
+- Reviewed policy merging, scoped install, upgrade, uninstall, rollback, and
+  actual installed-host verification.
+
+Do not set `allow_managed_hooks_only` or force hooks on globally just to install
+Obsidian. Those controls affect other integrations. Conflicting managed
+directories, ownership, or policy require resolution before deployment.
+
+For ordinary user-local hooks, Codex still requires trust. In installed CLI
+0.166.0, `/hooks` opens the hook browser, but `/hooks approve <id>` is treated as
+ordinary model input. The startup review offers **Trust all and continue**;
+that includes unrelated pending hooks, not only Obsidian. Do not automate that
+choice or present it as a scoped Obsidian approval command.
+
+This preview does not install into the current host. Local command-hook support
+also does not establish cloud-orchestrated capture support.
+
 ## Diagnostics & Troubleshooting
 
 - Inspect status and pending events without vault access:

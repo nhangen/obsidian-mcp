@@ -32,6 +32,19 @@ configured and verified profile. Direct OpenCode connections support MCP tools,
 not automatic capture parity. Model choice does not add missing host hooks.
 These boundaries must not be mistaken for completed cross-host onboarding.
 
+### Optional administrator-managed hooks
+
+Codex can trust administrator-managed hooks through system requirements or MDM
+instead of asking each user to trust plugin hooks. The public runtime includes an
+offline deployment exporter for reviewing this option. It is **preparatory, not
+an installer**: it neither edits system policy nor activates capture. See the
+[Codex managed-deployment boundary](integrations/codex/README.md#administrator-managed-deployment-preview).
+
+Normal setup-once Codex capture, an explicit managed mode without duplicate local
+handlers, protected executable dependencies, and an ownership-safe install,
+upgrade, and uninstall remain separate acceptance gates. The exporter does not
+complete plugin #254 or establish managed-host acceptance.
+
 The server remains usable through standard MCP without the plugin. Direct
 runtime installation remains an advanced integration and compatibility route;
 it is not a required extra installation for the intended plugin experience.
