@@ -2715,7 +2715,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             tool_use_id="orphan",
             tool_input={"command": "git commit -m fixture"},
         )
-        self.assertNotIn("permissionDecision", orphan.get("hookSpecificOutput", {}))
+        self.assertEqual(orphan["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("PROMPT_EVENT_REQUIRED", json.dumps(orphan))
         self.assertFalse(self.state_paths())
         self.hook("UserPromptSubmit", prompt="Work")
         first = self.hook("Stop", stop_hook_active=False)
