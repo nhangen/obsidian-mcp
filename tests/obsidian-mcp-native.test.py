@@ -3060,13 +3060,57 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             json.loads(path.read_text())["session_save"]["daily"].startswith("Daily/")
         )
 
+    def test_unexpected_plugin_hook_error_reports_its_class_and_stop_failure_is_silent(self):
+        self.start()
+        program = """
+import json, sys, types
+from pathlib import Path
+script, profile, events = sys.argv[1:]
+module = types.ModuleType("error_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+def broken(*args, **kwargs):
+    raise KeyError("PRIVATE-KEY-DETAIL")
+module.engine_hook = broken
+home, descriptor = module.load_profile(profile)
+print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)]))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                json.dumps(
+                    [
+                        self.event("UserPromptSubmit", prompt="more"),
+                        self.event("StopFailure", error="rate_limit"),
+                    ]
+                ),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt, failure = json.loads(result.stdout)
+        self.assertIn(
+            "HOOK_STATE_OR_EVENT_INVALID (KeyError)",
+            prompt["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertEqual(failure, {})
+        self.assertIn("HOOK_STATE_OR_EVENT_INVALID (KeyError)", result.stderr)
+        self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
     def test_stop_failure_and_continuation_never_invent_a_prompt_occurrence(self):
         path = self.start()
         before = path.read_bytes()
         failure = self.hook(
             "StopFailure", error="rate_limit", error_details="PRIVATE-DETAILS"
         )
-        self.assertNotIn("decision", failure)
+        self.assertEqual(failure, {})
         self.assertEqual(path.read_bytes(), before)
         self.assertNotIn("PRIVATE-DETAILS", json.dumps(failure))
         stopped = self.hook("Stop", stop_hook_active=False)
@@ -5257,8 +5301,10 @@ module.hook(home, descriptor, json.loads(event))
         )
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(path.read_bytes(), before)
-        stopped = self.hook("Stop", stop_hook_active=False)
-        self.assertNotIn("decision", stopped)
+        for active in (False, True):
+            stopped = self.hook("Stop", stop_hook_active=active)
+            self.assertEqual(set(stopped), {"systemMessage"})
+            self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", stopped["systemMessage"])
         self.assertFalse(self.drain()["quiescent"])
         old = json.loads(before)
         skipped = self.cli(
@@ -5485,6 +5531,42 @@ module.hook(home, descriptor, json.loads(event))
         self.assertFalse((self.home / "capture-state/active.json").exists())
         self.assertFalse(self.drain()["quiescent"])
 
+    def test_unexpected_hook_error_reports_its_class_without_its_text(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        program = """
+import json, sys, types
+from pathlib import Path
+script, profile, event = sys.argv[1:]
+module = types.ModuleType("error_fixture")
+module.__file__ = script
+exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
+def broken(*args, **kwargs):
+    raise KeyError("PRIVATE-KEY-DETAIL")
+module.engine_hook = broken
+home, descriptor = module.load_profile(profile)
+print(json.dumps(module.hook(home, descriptor, json.loads(event))))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.bundle / "bin/obsidian-mcp-native"),
+                str(self.home),
+                json.dumps(self.event("Stop", stop_hook_active=False)),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(set(output), {"systemMessage"})
+        self.assertIn("USER_CAPTURE_UNAVAILABLE (KeyError)", output["systemMessage"])
+        self.assertNotIn("PRIVATE-KEY-DETAIL", result.stdout + result.stderr)
+
     def test_bound_and_unbound_busy_hooks_do_not_block_prompts_or_unrelated_bash(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
@@ -5503,8 +5585,18 @@ module.hook(home, descriptor, json.loads(event))
                 self.cli("drain-status", "--home", str(self.home)).returncode, 64
             )
         (self.home / "bindings" / (self.session_key("session-1") + ".json")).unlink()
-        output = self.hook("Stop", session_id="unbound", stop_hook_active=False)
-        self.assertNotIn("decision", output)
+        for active in (False, True):
+            output = self.hook("Stop", session_id="unbound", stop_hook_active=active)
+            self.assertEqual(set(output), {"systemMessage"})
+        failure = self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=self.event("StopFailure", session_id="unbound"),
+        )
+        self.assertEqual(failure.returncode, 0, failure.stderr)
+        self.assertEqual(json.loads(failure.stdout or "{}"), {})
+        self.assertIn("PROMPT_EVENT_REQUIRED", failure.stderr)
         self.assertEqual(
             self.cli("drain-status", "--home", str(self.home)).returncode, 64
         )

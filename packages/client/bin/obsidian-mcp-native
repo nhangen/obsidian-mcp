@@ -1143,6 +1143,11 @@ def user_hook_failure(event, code):
                 permissionDecisionReason=message,
             )
         }
+    if name == "Stop":
+        return dict(systemMessage=message)
+    if name == "StopFailure":
+        print(message, file=sys.stderr)
+        return {}
     return context(name, message)
 
 
@@ -1549,7 +1554,7 @@ def user_hook(home, profile, event):
             (
                 str(error)
                 if isinstance(error, NativeError)
-                else "USER_CAPTURE_UNAVAILABLE"
+                else "USER_CAPTURE_UNAVAILABLE (" + type(error).__name__ + ")"
             ),
         )
 
@@ -2546,7 +2551,7 @@ def hook(home, profile, event):
         code = (
             str(error)
             if isinstance(error, NativeError)
-            else "HOOK_STATE_OR_EVENT_INVALID"
+            else "HOOK_STATE_OR_EVENT_INVALID (" + type(error).__name__ + ")"
         )
         message = "Obsidian capture unresolved: " + code
         if name == "PreToolUse" and event.get("tool_name") in (
@@ -2562,6 +2567,9 @@ def hook(home, profile, event):
             }
         if name == "Stop":
             return dict(systemMessage=message)
+        if name == "StopFailure":
+            print(message, file=sys.stderr)
+            return {}
         return context(name, message)
 
 
@@ -2604,7 +2612,9 @@ def engine_hook(home, profile, event):
                 )
             event = normalize_claude(event, state)
             name = event["hook_event_name"]
-            if name in ("SessionStart", "StopFailure"):
+            if name == "StopFailure":
+                return {}
+            if name == "SessionStart":
                 return context(
                     name,
                     "Obsidian persisted capture state retained.\n"
