@@ -148,6 +148,39 @@ class NativeCaptureFixture(unittest.TestCase):
         state = json.loads(path.read_text())
         return path, state, next(iter(state["commits"]))
 
+    def assert_busy_commit_guard(self, path, lockers):
+        before = path.read_bytes()
+        for label, acquire in lockers:
+            with acquire():
+                for command in (
+                    "git commit -m second",
+                    "/usr/bin/git -C . commit -m second",
+                    "rtk git commit -m second",
+                    "rtk proxy git commit -m second",
+                ):
+                    with self.subTest(lock=label, command=command):
+                        denied = self.hook(
+                            "PreToolUse",
+                            tool_name="Bash",
+                            tool_use_id="second-commit",
+                            tool_input={"command": command},
+                        )
+                        self.assertEqual(
+                            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                        )
+                        self.assertIn("BlockingIOError", json.dumps(denied))
+                for command in ("pwd", "git status"):
+                    advisory = self.hook(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_use_id="ordinary",
+                        tool_input={"command": command},
+                    )
+                    self.assertNotIn(
+                        "permissionDecision", advisory.get("hookSpecificOutput", {})
+                    )
+            self.assertEqual(path.read_bytes(), before)
+
     def execute_rewritten(self, rewritten):
         self.assertEqual(
             rewritten["hookSpecificOutput"].get("permissionDecision"),
@@ -2011,6 +2044,15 @@ class NativeCaptureTest(NativeCaptureFixture):
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
+
+    def test_busy_state_keeps_commit_gate_and_unrelated_shell_advisory(self):
+        self.start()
+        path, _, commit = self.pending_commit()
+        native = self.load_native()
+        self.assert_busy_commit_guard(
+            path, (("state", lambda: native.state_lock(self.home, path.stem)),)
+        )
+        self.assertEqual(self.prepare(path, commit).returncode, 0)
 
     def setUp(self):
         super().setUp()
@@ -4848,6 +4890,21 @@ module.hook(profile_home, descriptor, json.loads(event))
             self.assertEqual(
                 json.loads(path.read_bytes())["session_request"], arguments
             )
+
+    def test_busy_parent_or_child_keeps_paused_commit_gate(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        path, _, commit = self.pending_commit()
+        self.pause_next_prompt()
+        native = self.load_native()
+        self.assert_busy_commit_guard(
+            path,
+            (
+                ("parent", lambda: native.gate_lock(self.home)),
+                ("child", lambda: native.state_lock(path.parents[1], path.stem)),
+            ),
+        )
+        self.assertEqual(self.prepare(path, commit).returncode, 0)
 
     def test_paused_directory_can_make_its_first_retained_save(self):
         self.project = self.directory / "notes"

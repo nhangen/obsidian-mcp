@@ -1125,6 +1125,28 @@ def event_workspace(event):
     )
 
 
+def has_commit_words(words):
+    return "commit" in words and any(w in ("git", "/usr/bin/git") for w in words)
+
+
+def capture_pretool_needs_validation(event):
+    if event.get("hook_event_name") != "PreToolUse":
+        return False
+    tool = event.get("tool_name")
+    if tool in (*CLAUDE_TOOLS, *CLAUDE_TOOLS.values()):
+        return True
+    arguments = event.get("tool_input")
+    if tool != "Bash" or not isinstance(arguments, dict):
+        return False
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return False
+    try:
+        return has_commit_words(shlex.split(command))
+    except ValueError:
+        return True
+
+
 def user_hook_failure(event, code):
     name = event.get("hook_event_name")
     message = (
@@ -1132,10 +1154,7 @@ def user_hook_failure(event, code):
         + code
         + "; pending state retained, no new capture."
     )
-    if name == "PreToolUse" and event.get("tool_name") in (
-        *CLAUDE_TOOLS,
-        *CLAUDE_TOOLS.values(),
-    ):
+    if capture_pretool_needs_validation(event):
         return {
             "hookSpecificOutput": dict(
                 hookEventName=name,
@@ -2075,7 +2094,7 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         if words and words[0] == "proxy":
             words.pop(0)
     if not words or words[0] not in ("git", "/usr/bin/git"):
-        if any(w in ("git", "/usr/bin/git") for w in words) and "commit" in words:
+        if has_commit_words(words):
             raise NativeError(
                 "unsupported commit command; use one git -C <root> commit invocation"
             )
@@ -2687,10 +2706,7 @@ def hook(home, profile, event):
             else "HOOK_STATE_OR_EVENT_INVALID (" + type(error).__name__ + ")"
         )
         message = "Obsidian capture unresolved: " + code
-        if name == "PreToolUse" and event.get("tool_name") in (
-            *CLAUDE_TOOLS,
-            *CLAUDE_TOOLS.values(),
-        ):
+        if capture_pretool_needs_validation(event):
             return {
                 "hookSpecificOutput": dict(
                     hookEventName=name,
