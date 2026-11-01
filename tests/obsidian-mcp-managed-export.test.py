@@ -284,10 +284,24 @@ class ManagedExportTest(unittest.TestCase):
         exporter = runpy.run_path(str(EXPORT))
         for output in ("/private/etc/export", "/Library/export", "/Applications/export",
                        "/etc/export", "/usr/local/export", "/System/export",
-                       "/PRIVATE/EtC/export", "/LIBRARY/export"):
+                       "/PRIVATE/EtC/export", "/LIBRARY/export", "/private/var/db/export",
+                       "/var/lib/export", "/var/log/export", "/run/export", "/dev/export", "/private/var"):
             with self.subTest(output=output), patch("os.open", side_effect=AssertionError("host access forbidden")):
                 with self.assertRaisesRegex(exporter["ExportError"], "OUTPUT_INVALID"):
                     exporter["output_parent"](output, self.bundle)
+        for path in ("/private/var/folders/user/export", "/var/tmp/export", "/tmp/export"):
+            self.assertFalse(exporter["system_path"](Path(path)))
+
+    def test_privileged_invocation_rejects_without_mutation(self):
+        guard = (
+            "import os,runpy,sys\n"
+            "os.geteuid = lambda: 0\n"
+            "sys.argv = sys.argv[1:]\n"
+            "runpy.run_path(sys.argv[0],run_name='__main__')\n"
+        )
+        output = self.directory / "privileged-export"
+        self.rejected(self.cli("--output", output, guard=guard), "ROOT_NOT_SUPPORTED")
+        self.assertFalse(output.exists())
 
     def test_case_alias_cannot_export_inside_verified_bundle(self):
         source = self.directory / "source"

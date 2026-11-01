@@ -26,6 +26,7 @@ BLOCKERS = [
     "Policy merge, dispatcher, installation, upgrade and uninstall are unimplemented; this proposal cannot activate capture.",
 ]
 ERRORS = {
+    "ROOT_NOT_SUPPORTED": "run this offline proposal tool without elevated privileges",
     "CLI_INVALID": "use --help for the offline export interface",
     "INPUT_INVALID": "inputs must be bounded private regular files containing valid JSON or TOML",
     "PLAN_INVALID": "use schemaVersion 1, codex project scope, a non-root target UID and the documented paths",
@@ -106,8 +107,11 @@ def data_path(value):
 
 def system_path(path):
     parts = tuple(part.casefold() for part in path.parts)
-    return (parts[1] in {"etc", "opt", "usr", "bin", "sbin", "system", "root", "library", "applications"}
-            or parts[1:3] == ("private", "etc"))
+    if parts[1] == "private" and parts[2] in {"etc", "var", "tmp"}:
+        parts = parts[:1] + parts[2:]
+    return (parts[1] in {"etc", "opt", "usr", "bin", "sbin", "system", "root", "library", "applications",
+                         "boot", "dev", "proc", "sys", "run", "lib", "lib64"}
+            or (parts[1] == "var" and parts[2:3] not in {("tmp",), ("folders",)}))
 
 
 def validate_plan(plan, release_id):
@@ -266,6 +270,8 @@ def main():
     for flag in ("existing-policy", "local-hooks", "output"):
         parser.add_argument("--" + flag)
     args = parser.parse_args()
+    if os.getuid() == 0 or os.geteuid() == 0:
+        fail("ROOT_NOT_SUPPORTED")
     installer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-client-install"))
     try:
         source = Path(args.bundle).absolute()

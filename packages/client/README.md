@@ -75,7 +75,7 @@ privileged installer or an activation command. It verifies an externally pinned
 packed bundle, validates an explicit supported deployment scope, and previews a
 proposal without touching host policy. An explicit `--output` creates a new
 artifact directory; it never replaces an existing one or writes to proposed
-system paths.
+system paths. Run it without elevated privileges; root execution is refused.
 
 The proposal remains `activationReady: false`. It records unresolved managed
 activation, protected dependencies, policy merging, and lifecycle prerequisites.
