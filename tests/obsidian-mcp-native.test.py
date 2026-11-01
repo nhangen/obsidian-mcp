@@ -4264,30 +4264,61 @@ module.hook(profile_home, descriptor, json.loads(event))
                     + '{"type":"user","uuid":"changed-prompt"}\n'
                 )
                 output = self.hook("UserPromptSubmit", prompt="New unrelated prompt")
-                self.assertNotIn("obsidian_keeper_save", json.dumps(output))
                 if established:
+                    self.assertNotIn("obsidian_keeper_save", json.dumps(output))
                     self.assertEqual(path.read_bytes(), frozen)
                     self.assertTrue(temporary.exists())
                 else:
                     self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
                     self.assertEqual(json.loads(path.read_bytes()), intended)
                     self.assertFalse(temporary.exists())
-                    skipped = self.cli(
-                        "skip",
-                        "--home",
-                        str(self.home),
-                        "--session",
-                        path.stem,
-                        "--turn",
-                        intended["turn"],
-                        "--reason",
-                        "no_meaningful_work",
+                    plan = intended["session_save"]
+                    arguments = dict(
+                        title=plan["title"],
+                        folder_hint=plan["folder"],
+                        session_link_date=plan["date"],
+                        idempotency_key=plan["idempotency_key"],
                     )
-                    self.assertEqual(skipped.returncode, 0, skipped.stderr)
+                    guidance = output["hookSpecificOutput"]["additionalContext"]
+                    prefix = "mcp__obsidian-write__obsidian_keeper_save using "
+                    guided, _ = json.JSONDecoder().raw_decode(
+                        guidance.split(prefix, 1)[1]
+                    )
+                    self.assertEqual(guided, arguments)
+                    self.assertIn("body may summarize work done since", guidance)
+                    binding = json.loads(
+                        (self.home / "bindings" / (path.stem + ".json")).read_bytes()
+                    )
+                    self.assertTrue(binding["enrolled"])
+                    self.assertTrue(binding["paused"])
+                    arguments.update(body="Private session context", resolved=True)
+                    self.assertEqual(
+                        self.hook(
+                            "PreToolUse",
+                            tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                            tool_use_id="retained-save",
+                            tool_input=arguments,
+                        ),
+                        {},
+                    )
+                    prepared = json.loads(path.read_bytes())
+                    self.assertEqual(prepared["session_request"], arguments)
+                    self.assertEqual(prepared["turn"], intended["turn"])
+                    self.assertEqual(prepared["session_save"], plan)
+                    self.assertEqual(prepared["disposition"], "pending")
+                    self.save(path, call="retained-save")
+                    saved = json.loads(path.read_bytes())
+                    self.assertEqual(saved["session_request"], arguments)
+                    self.assertEqual(saved["turn"], intended["turn"])
+                    self.assertEqual(saved["session_save"], plan)
+                    self.assertEqual(saved["disposition"], "saved")
                     resumed = self.hook(
                         "UserPromptSubmit", prompt="New unrelated prompt"
                     )
                     self.assertIn("obsidian_keeper_save", json.dumps(resumed))
+                    self.assertNotEqual(
+                        json.loads(path.read_bytes())["turn"], intended["turn"]
+                    )
 
     def test_binding_publication_cannot_bypass_missing_retained_ancestry(self):
         temporary, original, _ = self.unpublished_publication("paused")
@@ -4439,6 +4470,22 @@ module.hook(profile_home, descriptor, json.loads(event))
         original = path.read_bytes()
         self.pause_next_prompt()
         self.assertEqual(path.read_bytes(), original)
+        guidance = json.dumps(self.hook("UserPromptSubmit", prompt="Keep recovering"))
+        self.assertIn("authoritative-path-inspected", guidance)
+        self.assertNotIn("body may summarize work done since", guidance)
+        skipped = self.cli(
+            "skip",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--turn",
+            json.loads(original)["turn"],
+            "--reason",
+            "no_meaningful_work",
+        )
+        self.assertEqual(skipped.returncode, 64)
+        self.assertEqual(path.read_bytes(), original)
         args = self.session_arguments(path)
         call = dict(
             tool_name="mcp__obsidian-write__obsidian_keeper_save",
@@ -4485,6 +4532,15 @@ module.hook(profile_home, descriptor, json.loads(event))
         )
         self.assertEqual(self.hook("PreToolUse", **call), {})
         self.pause_next_prompt()
+        frozen = path.read_bytes()
+        for name in ("PostToolUse", "PostToolUseFailure"):
+            for invalid in (
+                dict(call, tool_use_id="wrong-call"),
+                dict(call, tool_input=dict(args, body="changed")),
+            ):
+                with self.subTest(event=name, invalid=invalid):
+                    self.hook(name, **invalid, tool_response={"isError": True})
+                    self.assertEqual(path.read_bytes(), frozen)
         receipt = dict(
             status="committed",
             request_id="late-fixture",
@@ -4555,6 +4611,192 @@ module.hook(profile_home, descriptor, json.loads(event))
         self.assertEqual(
             json.loads(path.read_text())["commits"][commit]["status"], "committed"
         )
+
+    def test_paused_commit_first_append_is_validated_frozen_and_recoverable(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        path, _, commit = self.pending_commit()
+        self.pause_next_prompt()
+        output = self.hook("UserPromptSubmit", prompt="Recover the commit")
+        arguments = ClaudePluginCaptureTest.commit_arguments(
+            self,
+            path,
+            ["Implemented the retained change", "Verified local fixtures"],
+            output=output,
+        )
+        call = dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id="first-append",
+            tool_input=arguments,
+        )
+        before = path.read_bytes()
+        for changes in (
+            {"idempotency_key": "unrelated-key"},
+            {"target_path": "Other/commit.md"},
+            {"content": "invalid context"},
+            {"content": "- Branch: changed\n- Valid factual context"},
+        ):
+            with self.subTest(changes=changes):
+                denied = self.hook(
+                    "PreToolUse", **dict(call, tool_input=dict(arguments, **changes))
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                self.assertEqual(path.read_bytes(), before)
+        denied = self.hook(
+            "PreToolUse",
+            **dict(call, tool_name="mcp__obsidian_write__obsidian_daily_append"),
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(path.read_bytes(), before)
+        self.hook("PostToolUse", **call, tool_response={"isError": True})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        prepared = json.loads(path.read_bytes())["commits"][commit]
+        self.assertEqual(prepared["native_arguments"], arguments)
+        frozen = path.read_bytes()
+        changed = dict(
+            call,
+            tool_input=dict(arguments, content=arguments["content"] + "\n- Later work"),
+        )
+        denied = self.hook("PreToolUse", **changed)
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        for name in ("PostToolUse", "PostToolUseFailure"):
+            for invalid in (dict(call, tool_use_id="orphan"), changed):
+                with self.subTest(event=name, invalid=invalid):
+                    self.hook(name, **invalid, tool_response={"isError": True})
+                    self.assertEqual(path.read_bytes(), frozen)
+        self.hook("PostToolUseFailure", **call, error="interrupted")
+        state = json.loads(path.read_bytes())
+        self.assertTrue(state["commits"][commit]["recovery"])
+        guidance = json.dumps(self.hook("UserPromptSubmit", prompt="Inspect recovery"))
+        self.assertIn("authoritative-path-inspected", guidance)
+        self.assertEqual(
+            self.hook("PreToolUse", **call)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        retry = self.cli(
+            "retry",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--commit",
+            commit,
+            "--payload-sha256",
+            prepared["payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["arguments"], arguments)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.hook(
+            "PostToolUse",
+            **call,
+            tool_response={
+                "structuredContent": ClaudePluginCaptureTest.commit_receipt(
+                    self, arguments
+                )
+            },
+        )
+        state = json.loads(path.read_bytes())
+        self.assertEqual(state["commits"][commit]["status"], "committed")
+        self.assertEqual(state["session_save"], json.loads(before)["session_save"])
+
+    def test_paused_bash_observes_new_commit_and_keeps_one_pending_turn(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        path = self.state_paths()[0]
+        original = json.loads(path.read_bytes())
+        self.pause_next_prompt()
+        self.assertEqual(
+            self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="ordinary",
+                tool_input={"command": "pwd"},
+            ),
+            {},
+        )
+        path, state, commit = self.pending_commit()
+        self.assertEqual(state["turn"], original["turn"])
+        self.assertEqual(state["session_save"], original["session_save"])
+        self.assertEqual(len(self.state_paths()), 1)
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="second",
+            tool_input={"command": "git commit -m second"},
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        output = self.hook("UserPromptSubmit", prompt="Capture continued work")
+        arguments = ClaudePluginCaptureTest.commit_arguments(
+            self, path, ["Recorded continued work"], output=output
+        )
+        call = dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id="append",
+            tool_input=arguments,
+        )
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.hook(
+            "PostToolUse",
+            **call,
+            tool_response={
+                "structuredContent": ClaudePluginCaptureTest.commit_receipt(
+                    self, arguments
+                )
+            },
+        )
+        self.save(path)
+        self.assertTrue(self.drain()["quiescent"])
+        self.hook("UserPromptSubmit", prompt="A fresh turn")
+        self.assertNotEqual(json.loads(path.read_bytes())["turn"], original["turn"])
+
+    def test_paused_bash_failure_retains_executor_evidence_until_matching_post(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Original")
+        call = dict(
+            tool_name="Bash",
+            tool_use_id="commit",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = self.hook("PreToolUse", **call)
+        (self.project / "file.txt").write_text("fixture\n")
+        self.git("add", "file.txt")
+        executed = self.execute_rewritten(rewritten)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        path = self.state_paths()[0]
+        before = json.loads(path.read_bytes())
+        self.pause_next_prompt()
+        self.hook("PostToolUseFailure", **call, error="host interrupted")
+        state = json.loads(path.read_bytes())
+        (snapshot,) = state["snapshots"].values()
+        self.assertTrue(snapshot["host_failure"])
+        self.assertEqual(
+            snapshot["captured"], next(iter(before["snapshots"].values()))["captured"]
+        )
+        self.assertFalse(state["commits"])
+        denied = self.hook("PreToolUse", **dict(call, tool_use_id="second"))
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.hook("PostToolUse", **call, tool_response=executed.stdout)
+        state = json.loads(path.read_bytes())
+        self.assertFalse(state["snapshots"])
+        self.assertEqual(len(state["commits"]), 1)
+        self.assertEqual(state["turn"], before["turn"])
+
+    def test_paused_directory_can_make_its_first_retained_save(self):
+        self.project = self.directory / "notes"
+        self.project.mkdir()
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Review notes")
+        path = self.state_paths()[0]
+        self.pause_next_prompt()
+        self.save(path)
+        self.assertTrue(self.drain()["quiescent"])
+        self.assertFalse(json.loads(path.read_bytes())["commits"])
 
     def test_removed_terminal_workspace_can_be_inspected_but_not_executed(self):
         self.configure()
@@ -5392,33 +5634,56 @@ module.hook(home, descriptor, json.loads(event))
         self.assertNotIn("decision", output)
         self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
         self.assertEqual(path.read_bytes(), before)
+        old = json.loads(before)
+        guidance = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(old["session_save"]["idempotency_key"], guidance)
+        self.assertIn("body may summarize work done since", guidance)
+        binding = self.home / "bindings" / (path.stem + ".json")
+        self.assertTrue(json.loads(binding.read_bytes())["paused"])
+        for prompt in ("More meaningful work", "More meaningful work"):
+            self.hook("UserPromptSubmit", prompt=prompt)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(json.loads(binding.read_bytes())["paused"])
         arguments = self.session_arguments(path)
-        denied = self.hook(
-            "PreToolUse",
+        call = dict(
             tool_name="mcp__obsidian-write__obsidian_keeper_save",
             tool_use_id="save",
             tool_input=arguments,
         )
+        for changes in (
+            {"idempotency_key": "other-turn"},
+            {"title": "Changed"},
+            {"folder_hint": "Other"},
+            {"session_link_date": "2000-01-01"},
+            {"resolved": False},
+            {"body": ""},
+        ):
+            with self.subTest(changes=changes):
+                denied = self.hook(
+                    "PreToolUse", **dict(call, tool_input=dict(arguments, **changes))
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                self.assertEqual(path.read_bytes(), before)
+        denied = self.hook(
+            "PreToolUse",
+            **dict(call, tool_name="mcp__obsidian_write__obsidian_keeper_save"),
+        )
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.hook("PostToolUse", **call, tool_response={"isError": True})
         self.assertEqual(path.read_bytes(), before)
         for active in (False, True):
             stopped = self.hook("Stop", stop_hook_active=active)
             self.assertEqual(set(stopped), {"systemMessage"})
             self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", stopped["systemMessage"])
         self.assertFalse(self.drain()["quiescent"])
-        old = json.loads(before)
-        skipped = self.cli(
-            "skip",
-            "--home",
-            str(self.home),
-            "--session",
-            path.stem,
-            "--turn",
-            old["turn"],
-            "--reason",
-            "no_meaningful_work",
-        )
-        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.save(path, call="save")
+        saved = json.loads(path.read_bytes())
+        self.assertEqual(saved["session_request"], arguments)
+        self.assertEqual(saved["turn"], old["turn"])
+        self.assertEqual(saved["session_save"], old["session_save"])
+        self.assertTrue(self.drain()["quiescent"])
         self.hook("UserPromptSubmit", prompt="new ordinary prompt")
         self.assertNotEqual(json.loads(path.read_text())["turn"], old["turn"])
 

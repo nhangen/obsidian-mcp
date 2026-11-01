@@ -1390,7 +1390,7 @@ def reconcile_enrollment(home, profile):
                 atomic_write(path, encode(dict(record, enrolled=True)))
 
 
-def retained_capture_event(home, event):
+def retained_capture_event(home, profile, event):
     session = digest(identifier(event.get("session_id")).encode())
     with state_lock(home, session) as (state, _):
         if state is None:
@@ -1402,18 +1402,41 @@ def retained_capture_event(home, event):
         arguments = normalized.get("tool_input")
         tool = normalized.get("tool_name")
         call = normalized.get("tool_use_id")
+        if tool == "Bash":
+            return True
         if tool == "mcp__obsidian_write__obsidian_keeper_save":
+            if (
+                name == "PreToolUse"
+                and state["disposition"] == "pending"
+                and "session_request" not in state
+                and not state.get("session_recovery")
+                and not state.get("session_in_flight")
+                and arguments.get("idempotency_key")
+                == state["session_save"]["idempotency_key"]
+            ):
+                return True
             return (
                 bool(state.get("session_request"))
                 and arguments == state["session_request"]
                 and (name == "PreToolUse" or call == state.get("session_call"))
             )
         if tool == "mcp__obsidian_write__obsidian_daily_append":
-            return any(
-                pending.get("native_arguments") is not None
-                and arguments == pending["native_arguments"]
-                and (name == "PreToolUse" or call == pending.get("in_flight"))
-                for pending in state["commits"].values()
+            consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+            matches = matching_commits(
+                state, arguments, consumer=consumer, routes=commit_routes(profile)
+            )
+            if len(matches) != 1:
+                return False
+            pending = matches[0]
+            if "native_arguments" not in pending:
+                return (
+                    name == "PreToolUse"
+                    and pending["status"] == "pending"
+                    and not pending.get("recovery")
+                    and not pending.get("in_flight")
+                )
+            return arguments == pending["native_arguments"] and (
+                name == "PreToolUse" or call == pending.get("in_flight")
             )
         return False
 
@@ -1483,7 +1506,7 @@ def user_hook(home, profile, event):
             if (
                 record["paused"]
                 and event.get("hook_event_name") != "UserPromptSubmit"
-                and not retained_capture_event(child, event)
+                and not retained_capture_event(child, descriptor, event)
             ):
                 return user_hook_failure(
                     event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
@@ -1492,10 +1515,29 @@ def user_hook(home, profile, event):
                 result = claude_output(
                     engine_hook(child, descriptor, event), event.get("hook_event_name")
                 )
-            except Exception:
+            except Exception as error:
                 if event.get("hook_event_name") == "UserPromptSubmit":
                     record["paused"] = True
                     atomic_write(path, encode(record))
+                    if (
+                        isinstance(error, NativeError)
+                        and str(error) == "PREVIOUS_CAPTURE_UNRESOLVED"
+                    ):
+                        with state_lock(child, session) as (retained, _):
+                            normalize_claude(event, retained)
+                            guidance = capture_guidance(
+                                child,
+                                retained,
+                                descriptor["host"],
+                                commit_routes(descriptor),
+                                retained=True,
+                            )
+                        return context(
+                            "UserPromptSubmit",
+                            "Obsidian capture advisory: PREVIOUS_CAPTURE_UNRESOLVED; "
+                            "retained turn unchanged. Resolve it before a new capture turn.\n"
+                            + guidance,
+                        )
                 raise
             if event.get("hook_event_name") == "UserPromptSubmit" and (
                 record["paused"] or not record["enrolled"]
@@ -2300,7 +2342,48 @@ def pending_target(pending, consumer, routes=None):
         raise NativeError("COMMIT_ROUTES_INVALID") from None
 
 
-def capture_guidance(home, state, host="codex", routes=None):
+def matching_commits(state, arguments, *, consumer=None, routes=None):
+    matches = []
+    for pending in state["commits"].values():
+        planned = pending.get("native_arguments", {})
+        if consumer is not None and "native_arguments" not in pending:
+            _, planned = consumer["capture_arguments"](
+                pending["metadata"],
+                [],
+                target_path=pending_target(pending, consumer, routes),
+            )
+        if arguments.get("idempotency_key") and arguments[
+            "idempotency_key"
+        ] == planned.get("idempotency_key"):
+            matches.append(pending)
+    return matches
+
+
+def retry_guidance(home, state, payload_digest, *, commit=None):
+    command = [
+        state["python"],
+        str(BUNDLE / "bin/obsidian-mcp-native"),
+        "retry",
+        "--home",
+        str(home),
+        "--session",
+        state["session"],
+        "--payload-sha256",
+        payload_digest,
+        "--verification",
+        "authoritative-path-inspected",
+    ]
+    if commit is not None:
+        command.extend(["--commit", commit])
+    return (
+        "Confirm the original tool has completed and inspect the authoritative capture paths. "
+        "Only after that inspection, authorize an exact retry with "
+        + shlex.join(command)
+        + ". Use the returned arguments unchanged; do not replace the body or context."
+    )
+
+
+def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
     key = state["session"]
     plan = state["session_save"]
     commands = []
@@ -2326,6 +2409,13 @@ def capture_guidance(home, state, host="codex", routes=None):
                     )
                 else:
                     instruction = "Preserve these prepared arguments exactly. "
+                    if pending.get("in_flight") or pending.get("recovery"):
+                        instruction += (
+                            retry_guidance(
+                                home, state, pending["payload_digest"], commit=event_id
+                            )
+                            + " "
+                        )
                 commands.append(
                     f"Capture the pending commit through {tool_prefix}obsidian_daily_append before another commit. "
                     + instruction
@@ -2351,7 +2441,31 @@ def capture_guidance(home, state, host="codex", routes=None):
             commands.append(
                 f'Prepare the pending commit before another commit: pipe JSON {{"context":[3-8 concise factual context bullets]}} to {command}, then call mcp__obsidian_write__obsidian_daily_append with the returned exact arguments. Inspect its result; do not claim capture on failure.'
             )
-    if state["disposition"] == "pending":
+    if state["disposition"] == "pending" and "session_request" in state:
+        if state.get("session_in_flight") or state.get("session_recovery"):
+            commands.append(
+                f"Recover the session through {tool_prefix}obsidian_keeper_save. "
+                + retry_guidance(home, state, state["session_payload_digest"])
+            )
+        else:
+            command = shlex.join(
+                [
+                    state["python"],
+                    str(BUNDLE / "bin/obsidian-mcp-native"),
+                    "request",
+                    "--home",
+                    str(home),
+                    "--session",
+                    key,
+                ]
+            )
+            commands.append(
+                "Retrieve the frozen keeper save arguments with "
+                + command
+                + f"; call {tool_prefix}obsidian_keeper_save with those exact arguments. "
+                "Do not add later work to a frozen body."
+            )
+    if state["disposition"] == "pending" and "session_request" not in state:
         commands.append(
             f"Save meaningful session work through {tool_prefix}obsidian_keeper_save using "
             + json.dumps(
@@ -2366,6 +2480,11 @@ def capture_guidance(home, state, host="codex", routes=None):
                 }
             )
             + ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
+            + (
+                " The body may summarize work done since the retained turn began."
+                if retained
+                else ""
+            )
         )
         command = shlex.join(
             [
@@ -3042,19 +3161,7 @@ def observe_commit(state, event, *, attached=False, routes=None):
         if attached
         else None
     )
-    matches = []
-    for pending in state["commits"].values():
-        planned = pending.get("native_arguments", {})
-        if attached and "native_arguments" not in pending:
-            _, planned = consumer["capture_arguments"](
-                pending["metadata"],
-                [],
-                target_path=pending_target(pending, consumer, routes),
-            )
-        if arguments.get("idempotency_key") and arguments[
-            "idempotency_key"
-        ] == planned.get("idempotency_key"):
-            matches.append(pending)
+    matches = matching_commits(state, arguments, consumer=consumer, routes=routes)
     if len(matches) != 1:
         if matches and attached and event["hook_event_name"] == "PreToolUse":
             raise NativeError("COMMIT_EVENT_AMBIGUOUS")
