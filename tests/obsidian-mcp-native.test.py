@@ -5669,7 +5669,7 @@ module.hook(home, descriptor, json.loads(event))
             json.loads(capabilities.stdout)["captureScopes"],
             {
                 "claude-plugin": ["project", "user"],
-                "codex": ["project"],
+                "codex": ["project", "user"],
             },
         )
         self.assertTrue(self.drain()["quiescent"])
@@ -5882,7 +5882,7 @@ module.hook(home, descriptor, json.loads(event))
                 )
         self.assertEqual(self.state_paths()[0].read_bytes(), before)
 
-    def test_user_scope_rejects_project_arguments_and_codex_and_limits_active_work(
+    def test_user_scope_rejects_project_arguments_and_isolated_create_and_limits_active_work(
         self,
     ):
         rejected = self.cli(

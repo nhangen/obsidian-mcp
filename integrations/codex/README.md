@@ -86,7 +86,23 @@ For automated session and commit capture without relying on the Claude plugin:
    - A pending event locks commit capture for that session; other sessions in the profile are denied until resolved.
    - Bounded recovery: `obsidian-mcp-native takeover` safely releases an interrupted owner's lock without reconstructing git history.
 
-### 2. Skill-Driven Capture (`obsidian-mcp` skill)
+### 2. Attached user-wide runtime state
+
+An integrating plugin can use `attach --host codex --scope user` to route new
+workspaces through one private runtime profile. Git roots and subdirectories
+support commit capture; non-Git workspaces are session-only. It writes neither
+normal Codex configuration nor workspace instructions. Require the runtime's
+`captureScopes["codex"]` and `attachedCaptureScopes["codex"]` capabilities to
+include `"user"` before using it. Directory support is reported separately in
+`userWorkspaceModes["codex"]`; isolated creation remains Git-only.
+
+See the [attached API](../../packages/client/README.md#attached-user-wide-codex-capture-api)
+for creation and lifecycle boundaries. This API does not install hooks, approve
+them, or activate capture. Plugin-managed normal-home activation, duplicate-safe
+managed mode, and the administrator installer remain separate work. Do not use
+the isolated `run` or `disable` commands on attached state.
+
+### 3. Skill-Driven Capture (`obsidian-mcp` skill)
 
 If running Codex in an existing profile without native hooks:
 - Register the servers as shown above.
@@ -148,8 +164,10 @@ also does not establish cloud-orchestrated capture support.
    ```bash
    /prefix/current/bin/obsidian-mcp-native request --home <profile> --session <key>
    ```
-- Cleanly disable native capture:
+- Cleanly disable an isolated native profile only:
   ```bash
   /prefix/current/bin/obsidian-mcp-native disable --home <profile>
   ```
-  Disable removes owned profile config/hooks while retaining capture evidence.
+  Disable removes owned isolated-profile config/hooks while retaining capture
+  evidence. Attached state rejects this command; its integrating plugin owns
+  admission and rollback.

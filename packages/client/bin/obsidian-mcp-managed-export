@@ -20,7 +20,7 @@ MATCHER = "^(Bash|mcp__obsidian_write__obsidian_keeper_save|mcp__obsidian_write_
 EVENTS = [dict(event=name, **({"matcher": MATCHER} if "ToolUse" in name else {}))
           for name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")]
 BLOCKERS = [
-    "Normal-profile and user-wide Codex capture are unsupported; implement and validate them first.",
+    "Normal-home Codex plugin activation is unimplemented; runtime attachment alone does not enable capture.",
     "Managed capture mode and owned local hook suppression are unimplemented; prevent duplicate capture first.",
     "Administrator verification of the protected ownership chain, interpreter and dependencies is pending.",
     "Policy merge, dispatcher, installation, upgrade and uninstall are unimplemented; this proposal cannot activate capture.",
