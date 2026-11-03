@@ -30,9 +30,13 @@
     "readHttpBridge": {
       "package": "mcp-remote@0.14.3",
       "path": "vendor/mcp-remote-read",
-      "provenanceSha256": "aa00a48a279dad2cb9cc6ea7f1c170ec212d685ac4d73a68cffbf753b006f6a5",
+      "provenanceSha256": "c647e34121f5a4950bc00f58e0478ec507523668e09a1eb8b3e4fee7cdd4e210",
       "retryableTools": [
-        "obsidian_find_notes"
+        "obsidian_find_notes",
+        "obsidian_commit_meta"
+      ],
+      "retryableMethods": [
+        "tools/list"
       ]
     },
     "readHostServer": "obsidian",

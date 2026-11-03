@@ -42,7 +42,7 @@
   },
   "patch": {
     "path": "mcp-remote-0.14.3-session-recovery.patch",
-    "sha256": "25d7dd54ce16767362119b415e6525da232126fd47b29dc563c6b7364faba870"
+    "sha256": "3bc3373fd94705af7212ffb110a737f637bfd88e0dca1cd7b43a86a3171db74e"
   },
   "runtime": {
     "entry": "mcp-remote-read.mjs",
@@ -50,7 +50,11 @@
     "requiresNode": ">=22",
     "requiresNpm": false,
     "retryableTools": [
-      "obsidian_find_notes"
+      "obsidian_find_notes",
+      "obsidian_commit_meta"
+    ],
+    "retryableMethods": [
+      "tools/list"
     ]
   },
   "files": {
@@ -59,7 +63,7 @@
     "build-package.json": "d2243fd3161626ca2d08553dd48181d57e8379626b802a46889e4e6c211169ca",
     "build-package-lock.json": "09316d45687b924ff86aabd6b06606488424a1002cdeb8d6273011ad037b1ed9",
     "build.py": "bb1095061b7571a4710a2a95d684052ef731a8c1f0ecce7e3c56ce0c543c86eb",
-    "mcp-remote-read.mjs": "bcb82581428c6f07aa805200ab63174aecaeb85b375e4d392e0d698b5e6cdd4c",
+    "mcp-remote-read.mjs": "b612f822ea330c3f4b203a02d88678dfe38476d256695ea0c58b02a962812772",
     "mcp-remote-read.mjs.LEGAL.txt": "09fe14a317c94a706f8a48517b42ba02917ca4a6c991aa0d85a4485229ac9669",
     "xdg-open": "7d759d54f0d4ce1beeb34ee62c587985b5042374e8de237b0dcb8cd47aa698cf",
     "strict-url-sanitise.NOTICE.txt": "b774f314e63b8462d7a370d458a92368bd2538f4a383188e4fd8fa17ef98e848"

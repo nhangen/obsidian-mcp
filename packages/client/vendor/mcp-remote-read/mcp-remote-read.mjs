@@ -82703,7 +82703,7 @@ function mcpProxy({
     return error51 instanceof SdkHttpError && error51.status === 404 ? error51[requestSessionIdForError] : void 0;
   }
   function isReplayableRead(message) {
-    return message.method === "tools/call" && message.params?.name === "obsidian_find_notes";
+    return message.method === "tools/list" || message.method === "tools/call" && ["obsidian_find_notes", "obsidian_commit_meta"].includes(message.params?.name);
   }
   function postEndpoint() {
     return transportToServer._endpoint?.href;

@@ -47,13 +47,14 @@ def regular_bytes(root: Path, relative: str) -> bytes:
 
 def verified_files(root: Path, pin: dict) -> dict[str, bytes]:
     if not isinstance(pin, dict) or set(pin) != {
-        "package", "path", "provenanceSha256", "retryableTools"
+        "package", "path", "provenanceSha256", "retryableTools", "retryableMethods"
     }:
         fail()
     if (
         pin["package"] != "mcp-remote@0.14.3"
         or pin["path"] != VENDOR
-        or pin["retryableTools"] != ["obsidian_find_notes"]
+        or pin["retryableTools"] != ["obsidian_find_notes", "obsidian_commit_meta"]
+        or pin["retryableMethods"] != ["tools/list"]
         or not isinstance(pin["provenanceSha256"], str)
         or not re.fullmatch(r"[0-9a-f]{64}", pin["provenanceSha256"])
     ):
@@ -68,6 +69,9 @@ def verified_files(root: Path, pin: dict) -> dict[str, bytes]:
         fail()
     metadata = json.loads(metadata_bytes)
     if metadata.get("package") != pin["package"] or set(metadata.get("files", {})) != set(RUNTIME_FILES):
+        fail()
+    runtime = metadata.get("runtime", {})
+    if any(runtime.get(key) != pin[key] for key in ("retryableTools", "retryableMethods")):
         fail()
     for relative, digest in metadata["files"].items():
         if hashlib.sha256(files[f"{VENDOR}/{relative}"]).hexdigest() != digest:

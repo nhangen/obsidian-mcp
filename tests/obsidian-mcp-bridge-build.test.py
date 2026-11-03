@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import types
@@ -10,6 +11,42 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class BridgePinTest(unittest.TestCase):
+    def test_pin_requires_the_exact_read_method_and_tool_allowlists(self):
+        source = ROOT / "packages/client/lib/verify-read-bridge.py"
+        module = types.ModuleType("bridge_verifier_under_test")
+        module.__file__ = str(source)
+        exec(compile(source.read_bytes(), str(source), "exec"), module.__dict__)
+        client = ROOT / "packages/client"
+        pin = json.loads((client / "manifest.json").read_bytes())["readBridge"]
+        self.assertTrue(module.verified_files(client, pin))
+        for field, value in (("retryableTools", ["obsidian_find_notes"]), ("retryableMethods", ["resources/list"])):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "invalid read bridge"):
+                    module.verified_files(client, {**pin, field: value})
+
+    def test_verified_provenance_cannot_claim_a_different_retry_policy(self):
+        source = ROOT / "packages/client/lib/verify-read-bridge.py"
+        module = types.ModuleType("bridge_verifier_under_test")
+        module.__file__ = str(source)
+        exec(compile(source.read_bytes(), str(source), "exec"), module.__dict__)
+        client = ROOT / "packages/client"
+        pin = json.loads((client / "manifest.json").read_bytes())["readBridge"]
+        with tempfile.TemporaryDirectory(prefix="bridge-policy-pin-") as directory:
+            fixture = Path(directory)
+            vendor = fixture / pin["path"]
+            shutil.copytree(client / pin["path"], vendor)
+            provenance = vendor / "provenance.json"
+            original = json.loads(provenance.read_bytes())
+            for field, value in (("retryableTools", ["obsidian_keeper_save"]), ("retryableMethods", ["resources/list"])):
+                with self.subTest(field=field):
+                    changed = {**original, "runtime": {**original["runtime"], field: value}}
+                    provenance.write_text(json.dumps(changed) + "\n")
+                    changed_pin = {**pin, "provenanceSha256": hashlib.sha256(provenance.read_bytes()).hexdigest()}
+                    with self.assertRaisesRegex(ValueError, "invalid read bridge"):
+                        module.verified_files(fixture, changed_pin)
 
 
 class BridgeBuildTest(unittest.TestCase):
