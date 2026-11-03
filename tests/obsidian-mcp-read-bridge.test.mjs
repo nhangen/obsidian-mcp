@@ -16,6 +16,7 @@ const authSecret = "fixture-auth-secret-181";
 const sessionSecretPrefix = "fixture-session-secret-181";
 const mutation = process.argv[2] ?? "none";
 const recoveryOnly = process.argv[3] === "--recovery-only";
+const initWinsOnly = process.argv[3] === "--init-wins-only";
 const allowedMutations = new Set(["none", "captured-session", "read-allowlist", "legacy-read-allowlist", "method-allowlist", "retry-bound", "singleflight", "clear-session", "preauthenticated-http", "unresolved-bearer", "unresolved-header", "unresolved-header-nonpreauth", "first-authorization-only", "unresolved-client-info"]);
 assert(allowedMutations.has(mutation), `unknown mutation: ${mutation}`);
 assert(mutation === "none" || !process.env.OBSIDIAN_MCP_TEST_READ_LAUNCHER, "mutations require the direct vendored runtime");
@@ -136,6 +137,11 @@ async function installRuntime(temp, name = "runtime", headerGate = false) {
     assert(bundle.includes(before));
     bundle = bundle.replace(before, after);
   }
+  const recoveryCall = "        await reinitializeSession(expiredId);";
+  assert.equal(bundle.split(recoveryCall).length, 2, "recovery acknowledgment seam drifted");
+  bundle = bundle.replace(recoveryCall, `        const recovery = reinitializeSession(expiredId);
+        if (process.env.OBSIDIAN_MCP_TEST_RECOVERY_ACK === "1") require("node:fs").writeSync(3, "recovery-entered\\n");
+        await recovery;`);
   await writeFile(bundlePath, bundle);
   return bundlePath;
 }
@@ -170,6 +176,10 @@ class FixtureServer {
     this.initializedNotifications = 0;
     this.oldRequests = [];
     this.reinitResponse = null;
+    this.burstResponses = [];
+    this.burstReleasing = false;
+    this.burstReleased = false;
+    this.recoveryBarrier = null;
     this.newSession = null;
     this.firstRetryFinished = false;
     this.toolAttempts = 0;
@@ -261,8 +271,12 @@ class FixtureServer {
         this.resolveReinitStarted();
       } else if (this.mode === "burst") {
         this.newSession = nextSession;
-        this.reinitResponse = answer;
-        this.releaseBurstIfReady();
+        if (this.burstReleased) answer();
+        else {
+          this.burstResponses.push(answer);
+          this.reinitResponse = answer;
+          await this.releaseBurstIfReady();
+        }
       } else if (this.mode === "midcycle" || this.mode === "pre-header") {
         this.newSession = nextSession;
         this.reinitResponse = answer;
@@ -305,7 +319,7 @@ class FixtureServer {
       this.oldRequests.push({ request, response });
       if (this.mode === "burst" && this.oldRequests.length === 4) {
         sessionNotFound(this.oldRequests[0].response);
-        this.releaseBurstIfReady();
+        await this.releaseBurstIfReady();
       } else if (this.mode === "late" && this.oldRequests.length === 2) {
         sessionNotFound(this.oldRequests[0].response);
       } else if (this.mode === "pre-header" && this.oldRequests.length > 1) {
@@ -328,10 +342,14 @@ class FixtureServer {
     sessionNotFound(response);
   }
 
-  releaseBurstIfReady() {
-    if (this.oldRequests.length !== 4 || !this.reinitResponse) return;
+  async releaseBurstIfReady() {
+    if (this.oldRequests.length !== 4 || !this.reinitResponse || this.burstReleasing) return;
+    this.burstReleasing = true;
     for (const held of this.oldRequests.slice(1)) sessionNotFound(held.response);
-    this.reinitResponse();
+    if (this.recoveryBarrier && process.env.OBSIDIAN_MCP_TEST_SKIP_BURST_BARRIER !== "1") await this.recoveryBarrier();
+    this.recoveryEntriesAtRelease = this.recoveryEntryCount?.();
+    this.burstReleased = true;
+    for (const answer of this.burstResponses) answer();
     this.reinitResponse = null;
   }
 
@@ -355,6 +373,12 @@ class Bridge {
     this.responseCounts = new Map();
     this.stdout = "";
     this.stderr = "";
+    this.recoveryEntries = 0;
+    this.recoveryAck = readline.createInterface({ input: child.stdio[3] });
+    this.recoveryAck.on("line", (line) => {
+      assert.equal(line, "recovery-entered", "unexpected fixture acknowledgment");
+      this.recoveryEntries++;
+    });
     readline.createInterface({ input: child.stdout }).on("line", (line) => {
       this.stdout += `${line}\n`;
       const message = JSON.parse(line);
@@ -378,6 +402,26 @@ class Bridge {
 
   send(message) {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  waitForRecoveryEntries(count) {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.recoveryAck.off("line", check);
+      };
+      const check = () => {
+        if (this.recoveryEntries < count) return;
+        cleanup();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`overlapping recovery acknowledgment timed out: ${this.recoveryEntries}/${count}`));
+      }, 3000);
+      this.recoveryAck.on("line", check);
+      check();
+    });
   }
 
   request(message, timeoutMs = 15000) {
@@ -407,6 +451,7 @@ class Bridge {
     if (!await wait(1000)) this.child.kill("SIGTERM");
     if (!await wait(1000)) this.child.kill("SIGKILL");
     assert(await wait(1000), "bridge did not exit after SIGKILL");
+    this.recoveryAck.close();
     for (const id of this.requestedIds) {
       assert.equal(this.responseCounts.get(id), 1, `client request ${id} received ${this.responseCounts.get(id) ?? 0} responses`);
     }
@@ -430,6 +475,7 @@ async function startBridge(runtime, url, childRoot, extraEnv = {}, credential = 
     XDG_DATA_HOME: xdgData,
     MCP_REMOTE_CONFIG_DIR: mcpRemoteConfig,
     OBSIDIAN_MCP_TEST_ORIGIN: new URL(url).origin,
+    OBSIDIAN_MCP_TEST_RECOVERY_ACK: "0",
     ...extraEnv,
   };
   for (const name of ["NODE_OPTIONS", "NODE_PATH", "DEBUG", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
@@ -449,7 +495,7 @@ async function startBridge(runtime, url, childRoot, extraEnv = {}, credential = 
         OBSIDIAN_MCP_TEST_TOKEN: credential,
       } : env,
       cwd: configuredLauncher ? os.tmpdir() : path.dirname(path.dirname(runtime)),
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
     },
   );
   const bridge = new Bridge(child);
@@ -596,7 +642,12 @@ async function recoveryScenario(runtime, mode, requests, temp, recover = true) {
   const server = new FixtureServer(mode);
   await server.start();
   const childRoot = await mkdtemp(path.join(temp, `recovery-${mode}.`));
-  const bridge = await startBridge(runtime, server.url, childRoot);
+  const acknowledgedBurst = mode === "burst" && runtime !== null;
+  const bridge = await startBridge(runtime, server.url, childRoot, acknowledgedBurst ? { OBSIDIAN_MCP_TEST_RECOVERY_ACK: "1" } : {});
+  if (acknowledgedBurst) {
+    server.recoveryBarrier = () => bridge.waitForRecoveryEntries(requests.length);
+    server.recoveryEntryCount = () => bridge.recoveryEntries;
+  }
   try {
     let answers;
     if (mode === "midcycle" || mode === "midcycle-fail") {
@@ -612,6 +663,10 @@ async function recoveryScenario(runtime, mode, requests, temp, recover = true) {
     }
     const label = requests.map((request) => request.method === "tools/call" ? request.params?.name : request.method).join(",");
     const retries = mode === "second-404" || recover;
+    if (acknowledgedBurst) {
+      assert.equal(server.recoveryEntriesAtRelease, requests.length, "burst released before overlapping recovery acknowledgment");
+      console.log(`recovery-overlap: ${server.recoveryEntriesAtRelease}/${requests.length} acknowledged before initialize response`);
+    }
     assert.equal(server.initializations, retries || mode === "midcycle-fail" ? 2 : 1, `${label}: recovery initialization bound changed`);
     assert(answers.every((answer) => recover ? answer.result && !answer.error : answer.error && !answer.result),
       `${label}: ${mode} ${recover ? "did not recover" : "unexpectedly succeeded"}: ${JSON.stringify(answers)}`);
@@ -786,7 +841,9 @@ try {
   await verifyRuntime();
   const packedRuntime = Boolean(process.env.OBSIDIAN_MCP_TEST_READ_LAUNCHER);
   const runtime = packedRuntime ? null : await installRuntime(temp);
-  if (recoveryOnly) {
+  if (initWinsOnly) {
+    await recoveryScenario(runtime, "late", [operationRequest("tools/list", 40), operationRequest("obsidian_commit_meta", 41)], temp);
+  } else if (recoveryOnly) {
     await safeReadRecovery(runtime, temp);
   } else if (mutation === "captured-session") {
     await scenario(runtime, "late", temp);
