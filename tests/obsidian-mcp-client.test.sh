@@ -548,6 +548,7 @@ for mutation in captured-session read-allowlist legacy-read-allowlist method-all
     unresolved-client-info) expected='invalid non-preauthenticated startup (succeeded|reached the network)' ;;
   esac
   if node "$ROOT/tests/obsidian-mcp-read-bridge.test.mjs" "$mutation" ${mutation_args[@]+"${mutation_args[@]}"} >"$tmp/$mutation.out" 2>&1; then
+    grep -E '^(recovery-overlap:|obsidian-mcp-read-bridge: PASS mutation=)' "$tmp/$mutation.out" >&2 || true
     fail "$mutation regression survived"
   fi
   if ! grep -Eq "$expected" "$tmp/$mutation.out"; then
