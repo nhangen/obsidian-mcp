@@ -530,10 +530,15 @@ grep -Fq 'live server version and discovered schema to match' "$bundle/README.md
 OBSIDIAN_MCP_TEST_READ_LAUNCHER="$bundle/bin/obsidian-mcp-read" \
   node "$ROOT/tests/obsidian-mcp-read-bridge.test.mjs"
 
-for mutation in captured-session read-allowlist clear-session preauthenticated-http unresolved-bearer unresolved-header unresolved-header-nonpreauth first-authorization-only unresolved-client-info; do
+for mutation in captured-session read-allowlist legacy-read-allowlist method-allowlist retry-bound singleflight clear-session preauthenticated-http unresolved-bearer unresolved-header unresolved-header-nonpreauth first-authorization-only unresolved-client-info; do
+  mutation_args=()
   case "$mutation" in
     captured-session) expected='late old-session 404 triggered an extra reinitialization' ;;
     read-allowlist) expected='nonallowlisted write was replayed' ;;
+    legacy-read-allowlist) expected='safe read recovery failed'; mutation_args=(--recovery-only) ;;
+    method-allowlist) expected='resources/list: recovery initialization bound changed'; mutation_args=(--recovery-only) ;;
+    retry-bound) expected='tools/list: recovery initialization bound changed'; mutation_args=(--recovery-only) ;;
+    singleflight) expected='recovery initialization bound changed'; mutation_args=(--recovery-only) ;;
     clear-session) expected='pre-header recovery failed' ;;
     preauthenticated-http) expected='preauthenticated startup probed OAuth metadata|rejected credential triggered metadata discovery' ;;
     unresolved-bearer) expected='invalid preauthenticated startup succeeded' ;;
@@ -542,7 +547,7 @@ for mutation in captured-session read-allowlist clear-session preauthenticated-h
     first-authorization-only) expected='invalid preauthenticated startup succeeded' ;;
     unresolved-client-info) expected='invalid non-preauthenticated startup (succeeded|reached the network)' ;;
   esac
-  if node "$ROOT/tests/obsidian-mcp-read-bridge.test.mjs" "$mutation" >"$tmp/$mutation.out" 2>&1; then
+  if node "$ROOT/tests/obsidian-mcp-read-bridge.test.mjs" "$mutation" ${mutation_args[@]+"${mutation_args[@]}"} >"$tmp/$mutation.out" 2>&1; then
     fail "$mutation regression survived"
   fi
   if ! grep -Eq "$expected" "$tmp/$mutation.out"; then

@@ -15,7 +15,8 @@ const sourceRuntime = path.join(root, "packages/client/vendor/mcp-remote-read");
 const authSecret = "fixture-auth-secret-181";
 const sessionSecretPrefix = "fixture-session-secret-181";
 const mutation = process.argv[2] ?? "none";
-const allowedMutations = new Set(["none", "captured-session", "read-allowlist", "clear-session", "preauthenticated-http", "unresolved-bearer", "unresolved-header", "unresolved-header-nonpreauth", "first-authorization-only", "unresolved-client-info"]);
+const recoveryOnly = process.argv[3] === "--recovery-only";
+const allowedMutations = new Set(["none", "captured-session", "read-allowlist", "legacy-read-allowlist", "method-allowlist", "retry-bound", "singleflight", "clear-session", "preauthenticated-http", "unresolved-bearer", "unresolved-header", "unresolved-header-nonpreauth", "first-authorization-only", "unresolved-client-info"]);
 assert(allowedMutations.has(mutation), `unknown mutation: ${mutation}`);
 assert(mutation === "none" || !process.env.OBSIDIAN_MCP_TEST_READ_LAUNCHER, "mutations require the direct vendored runtime");
 
@@ -50,7 +51,8 @@ async function verifyRuntime() {
     assert.equal(actual, mode, `${relative} mode drifted`);
   }
   assert.equal(provenance.runtime.requiresNpm, false, "read bridge unexpectedly requires npm at runtime");
-  assert.deepEqual(provenance.runtime.retryableTools, ["obsidian_find_notes"], "read retry allowlist drifted");
+  assert.deepEqual(provenance.runtime.retryableTools, ["obsidian_find_notes", "obsidian_commit_meta"], "read retry tool allowlist drifted");
+  assert.deepEqual(provenance.runtime.retryableMethods, ["tools/list"], "read retry method allowlist drifted");
   const patchPath = path.join(sourceRuntime, provenance.patch.path);
   assert.equal(sha256(await readFile(patchPath)), provenance.patch.sha256, "patch hash drifted");
 }
@@ -67,11 +69,23 @@ async function installRuntime(temp, name = "runtime", headerGate = false) {
     const after = "return error51 instanceof SdkHttpError && error51.status === 404 ? transportToServer.sessionId : void 0;";
     assert(bundle.includes(before));
     bundle = bundle.replace(before, after);
-  } else if (mutation === "read-allowlist") {
-    const before = 'return message.method === "tools/call" && message.params?.name === "obsidian_find_notes";';
-    const after = 'return message.method === "tools/call";';
+  } else if (["read-allowlist", "legacy-read-allowlist", "method-allowlist"].includes(mutation)) {
+    const before = 'return message.method === "tools/list" || message.method === "tools/call" && ["obsidian_find_notes", "obsidian_commit_meta"].includes(message.params?.name);';
+    const after = mutation === "read-allowlist"
+      ? 'return message.method === "tools/list" || message.method === "tools/call";'
+      : mutation === "legacy-read-allowlist"
+        ? 'return message.method === "tools/call" && message.params?.name === "obsidian_find_notes";'
+        : 'return message.method === "tools/list" || ["obsidian_find_notes", "obsidian_commit_meta"].includes(message.params?.name);';
     assert(bundle.includes(before));
     bundle = bundle.replace(before, after);
+  } else if (mutation === "retry-bound") {
+    const before = ' || alreadyRetriedExpiredSession || !isReplayableRead(message)';
+    assert(bundle.includes(before));
+    bundle = bundle.replace(before, ' || !isReplayableRead(message)');
+  } else if (mutation === "singleflight") {
+    const before = '    if (reinitInFlight) {\n      if (reinitInFlight.expiredId === expiredId) return reinitInFlight.promise;';
+    assert(bundle.includes(before));
+    bundle = bundle.replace(before, '    if (false) {\n      if (reinitInFlight.expiredId === expiredId) return reinitInFlight.promise;');
   } else if (mutation === "clear-session") {
     const before = "if (currentId !== void 0 && currentId !== expiredId) return;\n    const id = `mcp-remote-reinit-${++reinitSeq}`;";
     const after = "if (currentId !== void 0 && currentId !== expiredId) return;\n    transportToServer._sessionId = void 0;\n    const id = `mcp-remote-reinit-${++reinitSeq}`;";
@@ -145,7 +159,7 @@ function okResult(response, request, sessionId) {
   jsonResponse(response, 200, {
     jsonrpc: "2.0",
     id: request.id,
-    result: { content: [{ type: "text", text: JSON.stringify({ query: request.params?.arguments?.query ?? "write" }) }] },
+    result: request.method === "tools/list" ? { tools: [] } : { content: [{ type: "text", text: JSON.stringify({ query: request.params?.arguments?.query ?? "write" }) }] },
   }, sessionId);
 }
 
@@ -159,6 +173,7 @@ class FixtureServer {
     this.newSession = null;
     this.firstRetryFinished = false;
     this.toolAttempts = 0;
+    this.operations = [];
     this.metadataRequests = 0;
     this.preSessionGets = 0;
     this.streamGets = 0;
@@ -264,10 +279,7 @@ class FixtureServer {
       response.writeHead(202).end();
       return;
     }
-    if (request.method !== "tools/call") {
-      jsonResponse(response, 200, { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "unsupported" } }, sessionId);
-      return;
-    }
+    this.operations.push({ request, sessionId });
     this.toolAttempts++;
     if (sessionId === `${sessionSecretPrefix}-1`) {
       if (this.mode === "write") {
@@ -282,11 +294,11 @@ class FixtureServer {
         httpError(response, 408, "Request timed out");
         return;
       }
-      if (this.mode === "auth") {
-        httpError(response, 401, "Unauthorized");
+      if (this.mode === "auth" || this.mode === "forbidden") {
+        httpError(response, this.mode === "auth" ? 401 : 403, "Unauthorized");
         return;
       }
-      if (this.mode === "midcycle" || this.mode === "midcycle-fail" || this.mode === "second-404") {
+      if (this.mode === "expired" || this.mode === "midcycle" || this.mode === "midcycle-fail" || this.mode === "second-404") {
         sessionNotFound(response);
         return;
       }
@@ -302,7 +314,7 @@ class FixtureServer {
       return;
     }
     if (sessionId === this.newSession) {
-      if (this.mode === "second-404") {
+      if (this.mode === "second-404" && this.initializations === 2) {
         sessionNotFound(response);
         return;
       }
@@ -569,6 +581,91 @@ function readRequest(id) {
   return { jsonrpc: "2.0", id, method: "tools/call", params: { name: "obsidian_find_notes", arguments: { query: `query-${id}` } } };
 }
 
+function operationRequest(kind, id) {
+  if (kind === "obsidian_find_notes") return readRequest(id);
+  return {
+    jsonrpc: "2.0", id,
+    method: kind === "tools/list" ? kind : "tools/call",
+    params: kind === "tools/list"
+      ? { cursor: `cursor-${id}`, _meta: { fixture: id } }
+      : { name: kind, arguments: { repository: `/fixture/repository-${id}` }, _meta: { fixture: id } },
+  };
+}
+
+async function recoveryScenario(runtime, mode, requests, temp, recover = true) {
+  const server = new FixtureServer(mode);
+  await server.start();
+  const childRoot = await mkdtemp(path.join(temp, `recovery-${mode}.`));
+  const bridge = await startBridge(runtime, server.url, childRoot);
+  try {
+    let answers;
+    if (mode === "midcycle" || mode === "midcycle-fail") {
+      const first = bridge.request(requests[0]);
+      await waitFor(() => server.initializations === 2, "mixed reinitialization did not start");
+      const second = bridge.request(requests[1]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(server.operations.length, 1, "mixed read entering recovery reached the old session");
+      server.releaseMidcycle();
+      answers = await Promise.all([first, second]);
+    } else {
+      answers = await Promise.all(requests.map((request) => bridge.request(request)));
+    }
+    const label = requests.map((request) => request.method === "tools/call" ? request.params?.name : request.method).join(",");
+    const retries = mode === "second-404" || recover;
+    assert.equal(server.initializations, retries || mode === "midcycle-fail" ? 2 : 1, `${label}: recovery initialization bound changed`);
+    assert(answers.every((answer) => recover ? answer.result && !answer.error : answer.error && !answer.result),
+      `${label}: ${mode} ${recover ? "did not recover" : "unexpectedly succeeded"}: ${JSON.stringify(answers)}`);
+    for (const request of requests) {
+      const attempts = server.operations.filter((entry) => entry.request.id === request.id);
+      const firstDuringRecovery = mode === "midcycle" && request === requests[1];
+      const unsent = mode === "midcycle-fail" && request === requests[1];
+      const expectedAttempts = unsent ? 0 : firstDuringRecovery ? 1 : retries ? 2 : 1;
+      assert.equal(attempts.length, expectedAttempts, `${label}: replay bound changed for ${request.id}`);
+      for (const attempt of attempts) assert.deepEqual(attempt.request, request, "replay changed the original request");
+      if (attempts.length === 2) {
+        assert.equal(attempts[0].sessionId, `${sessionSecretPrefix}-1`);
+        assert.equal(attempts[1].sessionId, `${sessionSecretPrefix}-2`);
+      }
+    }
+  } finally {
+    await bridge.close();
+    await assertNoSecrets(bridge, childRoot);
+    await server.stop();
+  }
+}
+
+async function safeReadRecovery(runtime, temp) {
+  const failures = [];
+  for (const kind of ["tools/list", "obsidian_commit_meta"]) {
+    try {
+      await recoveryScenario(runtime, "expired", [operationRequest(kind, 20)], temp);
+      console.log(`expired ${kind}: recovered`);
+    } catch (error) {
+      failures.push(error);
+      console.error(`expired ${kind}: ${error.message}`);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, "safe read recovery failed");
+  await recoveryScenario(runtime, "burst", ["tools/list", "obsidian_commit_meta", "obsidian_find_notes", "tools/list"].map((kind, index) => operationRequest(kind, 30 + index)), temp);
+  await recoveryScenario(runtime, "late", [operationRequest("tools/list", 40), operationRequest("obsidian_commit_meta", 41)], temp);
+  for (const kinds of [["tools/list", "obsidian_commit_meta"], ["obsidian_commit_meta", "tools/list"]]) {
+    await recoveryScenario(runtime, "midcycle", kinds.map((kind, index) => operationRequest(kind, 50 + index)), temp);
+    await recoveryScenario(runtime, "midcycle-fail", kinds.map((kind, index) => operationRequest(kind, 60 + index)), temp, false);
+  }
+  for (const kind of ["tools/list", "obsidian_commit_meta"]) {
+    for (const mode of ["second-404", "auth", "forbidden", "http-408"]) {
+      await recoveryScenario(runtime, mode, [operationRequest(kind, 70)], temp, false);
+    }
+  }
+  for (const kind of ["obsidian_keeper_save", "obsidian_daily_append", "unknown_tool", "obsidian_commit_meta_extra"]) {
+    await recoveryScenario(runtime, "expired", [operationRequest(kind, 80)], temp, false);
+  }
+  for (const method of ["resources/list", "unknown/method", "tools/list-extra"]) {
+    const request = { ...operationRequest("obsidian_commit_meta", 90), method };
+    await recoveryScenario(runtime, "expired", [request], temp, false);
+  }
+}
+
 async function waitFor(check, message, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -689,7 +786,9 @@ try {
   await verifyRuntime();
   const packedRuntime = Boolean(process.env.OBSIDIAN_MCP_TEST_READ_LAUNCHER);
   const runtime = packedRuntime ? null : await installRuntime(temp);
-  if (mutation === "captured-session") {
+  if (recoveryOnly) {
+    await safeReadRecovery(runtime, temp);
+  } else if (mutation === "captured-session") {
     await scenario(runtime, "late", temp);
   } else {
   if (!packedRuntime) {
@@ -764,6 +863,7 @@ try {
   await scenario(runtime, "http-408", temp);
   await scenario(runtime, "auth", temp);
   await scenario(runtime, "write", temp);
+  await safeReadRecovery(runtime, temp);
   }
   console.log(`obsidian-mcp-read-bridge: PASS mutation=${mutation}`);
 } finally {
