@@ -7601,6 +7601,35 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 "USER_CAPTURE_UNAVAILABLE", json.dumps(result)
             )
 
+    def test_helper_down_denies_innocent_text_and_documents_the_trade_off(self):
+        """Regression naming the accepted over-fail-closed trade-off:
+
+        quote spelling is dropped before token matching, so with the helper
+        unavailable, innocent argument text carrying both tokens (e.g.
+        ``grep 'git commit' notes.md``) is denied rather than allowed past
+        the capture gate. Under-denying is the chosen failure direction;
+        see the README policy bullets.
+        """
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = "/nonexistent/shell-capture-parser"
+        try:
+            for command in (
+                "grep 'git commit' notes.md",
+                "echo git commit",
+                "echo 'git commit' fixture",
+            ):
+                with self.assertRaises(module.ShellParseError) as raised:
+                    module.analyze_shell_command(command)
+                self.assertIn("helper unavailable", str(raised.exception), command)
+                self.assertTrue(module.has_commit_evidence(command), command)
+        finally:
+            module.helper_path_override = original
+        readme = (ROOT / "packages/client/README.md").read_text()
+        self.assertIn("deliberate over-fail-closed trade-off", readme)
+        allowed = (self.bundle / "bin/obsidian-mcp-native")
+        self.assertTrue(allowed.is_file())
+
     def test_hook_denies_ambiguous_heredoc_commands(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
@@ -7618,6 +7647,122 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 "USER_CAPTURE_UNAVAILABLE",
                 denied["hookSpecificOutput"]["permissionDecisionReason"],
             )
+
+    def test_oversized_command_fails_closed_only_with_commit_evidence(self):
+        module = self.native()
+        huge = "echo " + "x" * 300000
+        self.assertGreater(len(json.dumps(huge)), module.HELPER_INPUT_BYTES)
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.analyze_shell_command(huge + " && git commit -m y")
+        self.assertIn("INPUT_TOO_LARGE", str(raised.exception))
+        with self.assertRaises(module.ShellParseError):
+            module.analyze_shell_command("git commit -m " + "x" * 300000)
+        self.assertEqual(
+            module.analyze_shell_command(huge)["kind"],
+            None,
+            "innocent oversized text stays allowed; the gate is not an allowlist",
+        )
+        self.assertTrue(
+            module.capture_pretool_needs_validation(
+                dict(
+                    hook_event_name="PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": "git commit -m " + "x" * 300000},
+                )
+            )
+        )
+        self.assertFalse(
+            module.capture_pretool_needs_validation(
+                dict(
+                    hook_event_name="PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": huge},
+                )
+            )
+        )
+
+    def test_production_timeout_constant_is_pinned(self):
+        self.assertEqual(
+            self.native().HELPER_TIMEOUT_SECONDS,
+            5,
+            "the shipped helper budget must not silently widen",
+        )
+
+    def test_simple_shape_cross_check_pins_each_branch(self):
+        shape = self.native().simple_git_shape
+        for words, expected in (
+            (["git", "commit", "-m", "x"], True),
+            (["/usr/bin/git", "commit", "-m", "x"], True),
+            (["'git'", "commit", "-m", "x"], False),
+            (["rtk", "git", "commit", "-m", "x"], True),
+            (["/weird/dir/rtk", "git", "commit", "-m", "x"], True),
+            (["rtk", "proxy", "git", "commit", "-m", "x"], True),
+            (["proxy", "git", "commit", "-m", "x"], False),
+            (["rtk", "list"], False),
+            (["rtk", "proxy", "extra", "git", "commit", "-m", "x"], False),
+            (["git", "-C", "root", "commit", "-m", "x"], True),
+            (["git", "-C", "a", "-C", "b", "commit", "-m", "x"], False),
+            (["git", "log", "--grep", "commit"], False),
+            (["git"], False),
+        ):
+            self.assertEqual(shape(words), expected, repr(words))
+
+    def test_rtk_prefixed_commits_still_wrap_for_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for index, command in enumerate(
+            ("rtk git commit -m first", "rtk proxy git commit -m second")
+        ):
+            args = dict(
+                tool_name="Bash",
+                tool_use_id=f"rtk-{index}",
+                tool_input={"command": command},
+            )
+            rewritten = self.hook("PreToolUse", **args)
+            self.assertEqual(
+                rewritten["hookSpecificOutput"]["permissionDecision"],
+                self.expected_rewrite_decision,
+                command,
+            )
+            self.assertIn(
+                "execute-commit",
+                rewritten["hookSpecificOutput"]["updatedInput"]["command"],
+            )
+            (self.project / "file.txt").write_text(f"fixture {index}\n")
+            self.git("add", "file.txt")
+            executed = self.execute_rewritten(rewritten)
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            self.hook("PostToolUse", **args, tool_response=executed.stdout)
+            path = next(iter(self.state_paths()))
+            commits = json.loads(path.read_text())["commits"]
+            pending = [
+                key
+                for key, entry in commits.items()
+                if entry.get("status") == "pending"
+            ]
+            self.assertEqual(len(pending), 1, json.dumps(commits)[:400])
+            prepared = self.prepare(path, pending[0])
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.append_event(json.loads(prepared.stdout)["arguments"])
+
+    def test_unicode_message_classifies_for_capture(self):
+        module = self.native()
+        command = 'git commit -m "café café"'
+        analysis = module.analyze_shell_command(command)
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(
+            module.parse_shell_script(command),
+            shlex.split(command),
+        )
+
+    def test_active_assembly_helper_timeout_text_uses_fixed_code(self):
+        module = self.native()
+        self.assertEqual(module.HELPER_TIMEOUT_CODE, "HELPER_TIMEOUT")
+        self.assertEqual(module.HELPER_UNAVAILABLE_CODE, "HELPER_UNAVAILABLE")
+        self.assertEqual(module.HELPER_FAILED_CODE, "HELPER_FAILED")
+        self.assertEqual(
+            module.HELPER_PROTOCOL_CODE, "HELPER_PROTOCOL_INVALID"
+        )
 
     def test_hook_still_wraps_ordinary_commits(self):
         self.configure()

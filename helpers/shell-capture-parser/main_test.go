@@ -266,6 +266,23 @@ func TestAnalyzeBadInput(t *testing.T) {
 	}
 }
 
+func TestAnalyzeOversizeInput(t *testing.T) {
+	command := strings.Repeat("x", maxInputBytes+1)
+	got, _ := analyze(command)
+	if got.Status != "deny" || got.ReasonCode != "INPUT_TOO_LARGE" {
+		t.Fatalf("status = %q code = %q, want deny INPUT_TOO_LARGE", got.Status, got.ReasonCode)
+	}
+	if got.Schema != schemaVersion {
+		t.Fatalf("schema = %q, want %q", got.Schema, schemaVersion)
+	}
+
+	bounded := command[:maxInputBytes]
+	outcome, _ := analyze(bounded)
+	if outcome.Status != "analyze" {
+		t.Fatalf("status = %q, want analyze at the boundary", outcome.Status)
+	}
+}
+
 func TestJSONDecodeStrictness(t *testing.T) {
 	sample := `{"schema": "shell-capture-parser@1", "command": "echo hello", "extra": 1}`
 	decoder := json.NewDecoder(strings.NewReader(sample))

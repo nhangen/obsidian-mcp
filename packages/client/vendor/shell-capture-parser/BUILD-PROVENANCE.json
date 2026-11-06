@@ -69,7 +69,7 @@
     "go.mod": "4fd666ce86cd38543afec209a9608881d733919de1312e50472b865f33695391",
     "go.sum": "06af6e7a6d1a395d041c1e29e244fe4613b69ca9620b4bfadae58c02af92d5bb",
     "main.go": "d7eb88e4907e23d95479cae304d028af7c57a97ba5c6d162071bbcf4efb3f698",
-    "main_test.go": "d2f1a1972b343a2c3366dfbbe66f5d9bee52d9cb24eba684b6a487d7737f62d6"
+    "main_test.go": "6a781ce3a324bcf97ea54502ebfb697b929c2f991b48d9bc84a1daf95f702ba8"
   },
   "toolchain": {
     "goVersion": "go1.27.3",

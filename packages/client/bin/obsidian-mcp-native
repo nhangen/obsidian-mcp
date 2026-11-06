@@ -1184,11 +1184,52 @@ SCHEMA = "shell-capture-parser@1"
 HELPER_INPUT_BYTES = 262144
 HELPER_OUTPUT_BYTES = 4096
 HELPER_TIMEOUT_SECONDS = 5
+HELPER_TIMEOUT_CODE = "HELPER_TIMEOUT"
+HELPER_UNAVAILABLE_CODE = "HELPER_UNAVAILABLE"
+HELPER_FAILED_CODE = "HELPER_FAILED"
+HELPER_PROTOCOL_CODE = "HELPER_PROTOCOL_INVALID"
+HELPER_WATCHDOG_CODE = "HELPER_WATCHDOG_EXPIRED"
+INVENTORY_ENTRY_MISSING_CODE = "INVENTORY_ENTRY_MISSING"
+INVENTORY_ENTRY_MISMATCH_CODE = "INVENTORY_ENTRY_MISMATCH"
+INVENTORY_ARTIFACT_CODE = "INVENTORY_ARTIFACT_INVALID"
+TOKENIZATION_MISMATCH_CODE = "SHAPE_TOKENIZATION_MISMATCH"
+SHAPE_MISMATCH_CODE = "SHAPE_MISMATCH"
+INPUT_TOO_LARGE_CODE = "INPUT_TOO_LARGE"
+SHELL_PARSE_CODES = frozenset(
+    {
+        HELPER_TIMEOUT_CODE,
+        HELPER_UNAVAILABLE_CODE,
+        HELPER_FAILED_CODE,
+        HELPER_PROTOCOL_CODE,
+        HELPER_WATCHDOG_CODE,
+        INVENTORY_ENTRY_MISSING_CODE,
+        INVENTORY_ENTRY_MISMATCH_CODE,
+        INVENTORY_ARTIFACT_CODE,
+        TOKENIZATION_MISMATCH_CODE,
+        SHAPE_MISMATCH_CODE,
+        INPUT_TOO_LARGE_CODE,
+    }
+)
+HELPER_FLAGS = frozenset(
+    {"GIT_COMMIT_SIMPLE", "COMMIT_WORDS_DETECTED", "DYNAMIC_WORDS", "HEREDOC_EXPANSION"}
+)
+HELPER_WATCHDOG_EXIT = 124
 
 # helper_path_override is a test seam only; production resolution goes
 # through the bundled vendor artifact verified against the release
 # inventory.
 helper_path_override = None
+# Verified helper artifacts are cached per process after one successful
+# inventory verification; the cache is keyed by absolute path and holds
+# the pinned size and mode so later calls only need one cheap lstat.
+_helper_verified = {}
+
+
+def shell_parse_failure(code, detail=""):
+    """Fixed reason code with optional prose tail; both stay machine-safe."""
+    if not detail:
+        return ShellParseError(code)
+    return ShellParseError(f"{code} ({detail})")
 
 
 def helper_artifact_path():
@@ -1201,28 +1242,68 @@ def helper_artifact_path():
         "vendor/shell-capture-parser/"
         + f"shell-capture-parser-{system}-{machine}"
     )
+    # Cache is keyed on the release.json digest: the small inventory is
+    # re-read each call, so a rebuilt artifact fails closed on inventory
+    # edits, while the multi-megabyte binary read is skipped for a stable
+    # inventory after one verified pass.
+    fingerprint = digest((BUNDLE / "release.json").read_bytes())
+    cached = _helper_verified.get(fingerprint)
+    previous = _helper_verified.get("artifact")
+    if (
+        cached is not None
+        and previous == artifact.absolute()
+        and fingerprint in _helper_verified
+    ):
+        expected_size, expected_mode = cached
+        item = artifact.lstat()
+        if (
+            stat.S_IMODE(item.st_mode) == expected_mode
+            and stat.S_ISREG(item.st_mode)
+            and item.st_nlink == 1
+            and item.st_size == expected_size
+        ):
+            return artifact
+    _helper_verified.clear()
     inventory_files = json.loads(
         (BUNDLE / "release.json").read_text()
     ).get("files") or []
     relative = artifact.relative_to(BUNDLE).as_posix()
     entry = next((item for item in inventory_files if item.get("path") == relative), None)
     if entry is None:
-        raise ShellParseError("helper artifact missing from release inventory")
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISSING_CODE,
+            "helper artifact missing from release inventory",
+        )
+    if "mode" not in entry:
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE, "inventory entry missing mode"
+        )
     item = artifact.lstat()
     mode = item.st_mode
     if (
         not (
-            stat.S_IMODE(mode) == entry.get("mode", 0o755)
+            stat.S_IMODE(mode) == entry["mode"]
             and stat.S_ISREG(mode)
         )
         or item.st_nlink != 1
     ):
-        raise ShellParseError("helper artifact is not a private plain file")
+        raise shell_parse_failure(
+            INVENTORY_ARTIFACT_CODE, "helper artifact is not a private plain file"
+        )
     contents = artifact.read_bytes()
     if len(contents) != entry.get("size"):
-        raise ShellParseError("helper artifact size does not match inventory")
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE,
+            "helper artifact size does not match inventory",
+        )
     if digest(contents) != entry.get("sha256"):
-        raise ShellParseError("helper artifact sha256 does not match inventory")
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE,
+            "helper artifact sha256 does not match inventory",
+        )
+    _helper_verified.clear()
+    _helper_verified[fingerprint] = (int(entry["size"]), int(entry["mode"]))
+    _helper_verified["artifact"] = artifact.absolute()
     return artifact
 
 
@@ -1247,22 +1328,34 @@ def helper_parse(command):
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise ShellParseError("helper parse timed out") from None
+        raise shell_parse_failure(
+            HELPER_TIMEOUT_CODE,
+            f"helper parse timed out; budget {HELPER_TIMEOUT_SECONDS}s",
+        ) from None
     except (OSError, ValueError):
-        raise ShellParseError("helper unavailable") from None
+        raise shell_parse_failure(HELPER_UNAVAILABLE_CODE, "helper unavailable") from None
+    if finished.returncode == HELPER_WATCHDOG_EXIT:
+        raise shell_parse_failure(HELPER_WATCHDOG_CODE, "helper watchdog expired budget")
     if finished.returncode != 0 or len(finished.stdout) > HELPER_OUTPUT_BYTES:
-        raise ShellParseError("helper failed")
+        raise shell_parse_failure(HELPER_FAILED_CODE, "helper failed")
     try:
         result = json.loads(finished.stdout)
     except ValueError:
-        raise ShellParseError("helper protocol invalid") from None
+        raise shell_parse_failure(
+            HELPER_PROTOCOL_CODE, "helper protocol invalid"
+        ) from None
+    if not isinstance(result, dict):
+        raise shell_parse_failure(HELPER_PROTOCOL_CODE, "helper protocol invalid")
+    flags = result.get("flags", [])
+    code = result.get("reason_code", "")
     if (
-        not isinstance(result, dict)
-        or result.get("schema") != SCHEMA
+        result.get("schema") != SCHEMA
         or result.get("status") not in ("analyze", "deny", "unsupported")
-        or not isinstance(result.get("flags", []), list)
+        or not isinstance(flags, list)
+        or not all(isinstance(flag, str) and flag in HELPER_FLAGS for flag in flags)
+        or (code and not re.fullmatch(r"[A-Z0-9_]{1,64}", str(code)))
     ):
-        raise ShellParseError("helper protocol invalid")
+        raise shell_parse_failure(HELPER_PROTOCOL_CODE, "helper protocol invalid")
     return result
 
 
@@ -1304,21 +1397,26 @@ def analyze_shell_command(command):
         result = helper_parse(command)
         if result["status"] != "analyze":
             raise ShellParseError(result.get("reason_code", "helper failure"))
-    except ShellParseError:
+    except ShellParseError as failure:
         if has_commit_evidence(command):
             raise
+        print(
+            "obsidian-mcp-native: shell analysis degraded; no commit shape identified: "
+            + str(failure),
+            file=sys.stderr,
+        )
         return dict(kind=None, words=[])
     flags = result.get("flags") or []
     if "GIT_COMMIT_SIMPLE" in flags:
         try:
             words = shlex.split(command)
         except ValueError:
-            raise ShellParseError(
-                "untokenizable static commit shape"
+            raise shell_parse_failure(
+                TOKENIZATION_MISMATCH_CODE, "untokenizable static commit shape"
             ) from None
         if not words or not simple_git_shape(words):
-            raise ShellParseError(
-                "helper shape does not match tokenized commit"
+            raise shell_parse_failure(
+                SHAPE_MISMATCH_CODE, "helper shape does not match tokenized commit"
             )
         return dict(kind="simple", words=words)
     if "COMMIT_WORDS_DETECTED" in flags:

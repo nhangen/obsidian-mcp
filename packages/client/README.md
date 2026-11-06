@@ -664,7 +664,12 @@ except the wrapped one. The hook handles each command in one of these ways:
   command, or a trailing comment. The reflog watch then captures the commit.
 - It denies the command when the text has standalone `git` and `commit` tokens
   and the helper rejects the syntax or is unavailable. A heredoc with a
-  backslash-newline is one rejected shape.
+  backslash-newline is one rejected shape. The token check ignores quote
+  spelling on purpose: with the helper down, argument text such as
+  `grep 'git commit' notes.md` or `echo git commit` is also denied. This is a
+  deliberate over-fail-closed trade-off — under-denying a commit lets it slip
+  past the capture receipt, while these false denies fail the run visibly and
+  cost only rerouting the text.
 - It allows any other command, including syntax the helper rejects. The reflog
   watch still applies.
 
