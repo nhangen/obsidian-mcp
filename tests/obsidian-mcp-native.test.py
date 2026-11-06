@@ -6870,6 +6870,10 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.assertEqual(module.helper_artifact_path(), artifact)
         for entries, fragment in (
             ((), "missing from release inventory"),
+            (
+                ({key: value for key, value in good.items() if key != "mode"},),
+                "inventory entry missing mode",
+            ),
             (({**good, "mode": 0o700},), "private plain file"),
             (({**good, "size": 1},), "size does not match"),
             (({**good, "sha256": "0" * 64},), "sha256 does not match"),
