@@ -1,0 +1,78 @@
+{
+  "build": {
+    "dependencyVerification": "go mod verify",
+    "flags": [
+      "CGO_ENABLED=0",
+      "-trimpath",
+      "-buildvcs=false",
+      "-mod=readonly"
+    ],
+    "offline": [
+      "GOTOOLCHAIN=local",
+      "GOPROXY=off",
+      "GOWORK=off"
+    ],
+    "platforms": [
+      {
+        "goarch": "amd64",
+        "goos": "darwin",
+        "mode": "0755",
+        "path": "shell-capture-parser-darwin-amd64",
+        "sha256": "53fb19506395a6c9af16c32258fadbf2cbd1bb113b91eecff4dcc1392fe83611",
+        "size": 4699296
+      },
+      {
+        "goarch": "arm64",
+        "goos": "darwin",
+        "mode": "0755",
+        "path": "shell-capture-parser-darwin-arm64",
+        "sha256": "fec48d92f23ea03f12b7cffe71e823f7b2bd1ce2fbcdcb7d6412d3069c3983a9",
+        "size": 4459842
+      },
+      {
+        "goarch": "amd64",
+        "goos": "linux",
+        "mode": "0755",
+        "path": "shell-capture-parser-linux-amd64",
+        "sha256": "9ee288d715f62e920762acd579b060e2a6f83c1354c3a668466be1f28162bdcf",
+        "size": 4605725
+      },
+      {
+        "goarch": "arm64",
+        "goos": "linux",
+        "mode": "0755",
+        "path": "shell-capture-parser-linux-arm64",
+        "sha256": "82b665fc84491225c3f33f7b9ed942e01cad3c2e3919758cc4b4069cd12d479d",
+        "size": 4375280
+      }
+    ]
+  },
+  "formatVersion": 1,
+  "helper": "shell-capture-parser",
+  "licenses": [
+    {
+      "path": "LICENSE-mvdan-sh.txt",
+      "sha256": "ce63850f77649f00d1394045e2794ffb09a5596beabac51c9548edd958845d7c"
+    },
+    {
+      "path": "LICENSE-go-runtime.txt",
+      "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+    }
+  ],
+  "module": {
+    "goSum": "mvdan.cc/sh/v3 v3.11.0 h1:q5h+XMDRfUGUedCqFFsjoFjrhwf2Mvtt1rkMvVz0blw=",
+    "license": "LICENSE-mvdan-sh.txt",
+    "name": "mvdan.cc/sh/v3",
+    "version": "v3.11.0"
+  },
+  "source": {
+    "go.mod": "a6229b40505dda12140d4b7841e4be4431d0d83b01633908c650520b28e35d13",
+    "go.sum": "06af6e7a6d1a395d041c1e29e244fe4613b69ca9620b4bfadae58c02af92d5bb",
+    "main.go": "4a5b2d929002455c3887c14241cc6d124f08c6c966c0f8327be696faa103abe7",
+    "main_test.go": "25880b4b2886ee40c3bde29605bad100ca8e332f73b90a287f1d399fc7b08549"
+  },
+  "toolchain": {
+    "goVersion": "go1.27.3",
+    "license": "LICENSE-go-runtime.txt"
+  }
+}

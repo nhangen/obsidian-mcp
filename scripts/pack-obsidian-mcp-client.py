@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "packages/client"
 CATALOG = ROOT / "packages/client/catalog.json"
-CONTRACT = ROOT / "contract.json"
+CONTRACT = ROOT / "packages/client/contract.json"
 EXIT_FAILURE = 64
 FILES = (
     "README.md",
@@ -31,6 +31,13 @@ FILES = (
     "lib/launch-profile.sh",
     "lib/verify-read-bridge.py",
     "examples/profiles.env.example",
+    "vendor/shell-capture-parser/BUILD-PROVENANCE.json",
+    "vendor/shell-capture-parser/LICENSE-go-runtime.txt",
+    "vendor/shell-capture-parser/LICENSE-mvdan-sh.txt",
+    "vendor/shell-capture-parser/shell-capture-parser-darwin-amd64",
+    "vendor/shell-capture-parser/shell-capture-parser-darwin-arm64",
+    "vendor/shell-capture-parser/shell-capture-parser-linux-amd64",
+    "vendor/shell-capture-parser/shell-capture-parser-linux-arm64",
 )
 EXECUTABLES = {
     "bin/obsidian-mcp-read",
@@ -43,7 +50,25 @@ EXECUTABLES = {
     "lib/launch-profile.sh",
     "vendor/mcp-remote-read/xdg-open",
     "vendor/mcp-remote-read/mcp-remote-read.mjs",
+    "vendor/shell-capture-parser/shell-capture-parser-darwin-amd64",
+    "vendor/shell-capture-parser/shell-capture-parser-darwin-arm64",
+    "vendor/shell-capture-parser/shell-capture-parser-linux-amd64",
+    "vendor/shell-capture-parser/shell-capture-parser-linux-arm64",
 }
+HELPER_VENDOR = "vendor/shell-capture-parser"
+HELPER_SOURCE = ROOT / "helpers/shell-capture-parser"
+HELPER_PROVENANCE = f"{HELPER_VENDOR}/BUILD-PROVENANCE.json"
+HELPER_MODULE = "mvdan.cc/sh/v3"
+HELPER_MODULE_VERSION = "v3.11.0"
+HELPER_SOURCE_FILES = ("main.go", "main_test.go", "go.mod", "go.sum")
+HELPER_PLATFORMS = (
+    ("darwin", "amd64"),
+    ("darwin", "arm64"),
+    ("linux", "amd64"),
+    ("linux", "arm64"),
+)
+MACHO_MAGIC = b"\xcf\xfa\xed\xfe"
+ELF_MAGIC = b"\x7fELF"
 
 
 def fail(message: str) -> None:
@@ -87,6 +112,99 @@ def server_reference(catalog: dict, contract_bytes: bytes) -> dict[str, str]:
     }
 
 
+def validate_helper_vendor(files: dict[str, bytes]) -> dict:
+    """Validate vendored shell-capture-parser artifacts against live helper
+    sources before packing, rejecting stale sources, missing artifacts,
+    symlinks (by refusal of non-regular-nlink-1 bytes), and mismatches."""
+    if HELPER_PROVENANCE not in files:
+        fail(f"bundle is missing {HELPER_PROVENANCE}")
+    provenance = json.loads(files[HELPER_PROVENANCE])
+    if provenance.get("formatVersion") != 1:
+        fail("helper provenance formatVersion is missing")
+    if provenance.get("helper") != "shell-capture-parser":
+        fail("helper provenance names a different helper")
+    module = provenance.get("module", {})
+    if (
+        module.get("name") != HELPER_MODULE
+        or module.get("version") != HELPER_MODULE_VERSION
+    ):
+        fail(
+            f"helper provenance does not pin {HELPER_MODULE} "
+            f"{HELPER_MODULE_VERSION}"
+        )
+    source = provenance.get("source")
+    if not isinstance(source, dict) or set(source) != set(HELPER_SOURCE_FILES):
+        fail("helper provenance does not carry the pinned helper sources")
+    for relative, expected in sorted(source.items()):
+        helper_file = HELPER_SOURCE / relative
+        for parent in helper_file.absolute().parents:
+            if ROOT not in parent.absolute().parents and parent.absolute() != ROOT.absolute():
+                continue
+            parent_item = parent.lstat()
+            if stat.S_ISLNK(parent_item.st_mode):
+                fail(f"helper source traverses a symbolic-link ancestor: {parent}")
+            if not stat.S_ISDIR(parent_item.st_mode):
+                fail(f"helper source traverses a non-directory ancestor: {parent}")
+        actual = hashlib.sha256(
+            regular_file_bytes(helper_file, f"helper source {relative}")
+        ).hexdigest()
+        if actual != expected:
+            fail(
+                f"helper source has changed since the pinned build: "
+                f"{relative}; rebuild the helper before packing"
+            )
+    artifacts = provenance.get("build", {}).get("platforms")
+    if not isinstance(artifacts, list):
+        fail("helper provenance does not list build platforms")
+    listed = {}
+    for artifact in artifacts:
+        if (
+            not isinstance(artifact, dict)
+            or not isinstance(artifact.get("path"), str)
+            or not isinstance(artifact.get("goos"), str)
+            or not isinstance(artifact.get("goarch"), str)
+        ):
+            fail("helper provenance carries a malformed platform entry")
+        listed[f"{HELPER_VENDOR}/{artifact['path']}"] = artifact
+    expected_paths = {
+        f"{HELPER_VENDOR}/shell-capture-parser-{goos}-{goarch}"
+        for goos, goarch in HELPER_PLATFORMS
+    }
+    if set(listed) != expected_paths:
+        fail("helper provenance platform artifacts do not match the allowlist")
+    for platform_path, artifact in sorted(listed.items()):
+        contents = files.get(platform_path)
+        if contents is None:
+            fail(f"bundle is missing helper artifact {platform_path}")
+        if hashlib.sha256(contents).hexdigest() != artifact.get("sha256"):
+            fail(f"helper artifact does not match its provenance: {platform_path}")
+        if len(contents) != artifact.get("size"):
+            fail(f"helper artifact size does not match provenance: {platform_path}")
+        expected_magic = ELF_MAGIC if artifact["goos"] == "linux" else MACHO_MAGIC
+        if not contents.startswith(expected_magic):
+            fail(
+                f"helper artifact does not carry the "
+                f"{artifact['goos']} binary magic: {platform_path}"
+            )
+    licenses = {
+        f"{HELPER_VENDOR}/{item.get('path')}": item
+        for item in provenance.get("licenses", [])
+    }
+    expected_licenses = {
+        f"{HELPER_VENDOR}/LICENSE-go-runtime.txt",
+        f"{HELPER_VENDOR}/LICENSE-mvdan-sh.txt",
+    }
+    if set(licenses) != expected_licenses:
+        fail("helper provenance does not list exactly the bundled licenses")
+    for relative in sorted(expected_licenses):
+        contents = files.get(relative)
+        if contents is None:
+            fail(f"bundle is missing helper license {relative}")
+        if hashlib.sha256(contents).hexdigest() != licenses[relative].get("sha256"):
+            fail(f"helper license does not match provenance: {relative}")
+    return provenance
+
+
 def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     contract_bytes = regular_file_bytes(contract_path, "contract input")
     catalog = json.loads(regular_file_bytes(catalog_path, "catalog input"))
@@ -114,6 +232,7 @@ def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     files["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     files["contract.json"] = contract_bytes
     files["LICENSE"] = regular_file_bytes(ROOT / "LICENSE", "project license input")
+    validate_helper_vendor(files)
     return files
 
 

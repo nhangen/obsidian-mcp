@@ -1086,7 +1086,6 @@ class NativeCaptureTest(NativeCaptureFixture):
         for command in (
             "false && git commit -m nope",
             "git commit -m x; true",
-            "git commit -m $(echo x)",
         ):
             output = self.hook(
                 "PreToolUse",
@@ -1097,6 +1096,20 @@ class NativeCaptureTest(NativeCaptureFixture):
             self.assertIn(
                 "unsupported", output["hookSpecificOutput"]["additionalContext"]
             )
+        # A dynamic Git subcommand is explicitly unsupported and denied.
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="unsupported",
+            tool_input={"command": "git commit -m $(echo x)"},
+        )
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertNotIn(
+            "USER_CAPTURE_UNAVAILABLE",
+            denied["hookSpecificOutput"]["permissionDecisionReason"],
+        )
         args = dict(
             tool_name="Bash",
             tool_use_id="failed",
@@ -6680,6 +6693,201 @@ class CommitRoutesTest(NativeCaptureFixture):
             )
             self.assertEqual(result.returncode, 64)
             self.assertFalse(self.home.exists())
+
+
+class CaptureShellParserTest(NativeCaptureFixture):
+    def native(self):
+        if not hasattr(self, "native_module"):
+            self.native_module = self.load_native()
+        return self.native_module
+
+    def analyze(self, command):
+        return self.native().analyze_shell_command(command)
+
+    def assert_rejected(self, command, fragment):
+        with self.assertRaises(self.native().ShellParseError) as raised:
+            self.analyze(command)
+        self.assertIn(fragment, str(raised.exception), repr(command))
+
+    def test_heredoc_variants_analyze_without_commits(self):
+        for command in (
+            "cat <<'EOF'\nit's fine\nEOF\n",
+            "cat <<EOF\nplain body\nEOF\n",
+            "cat <<E\"F\"OO\nhello\nEFOO\necho z",
+            "cat <<-BEGIN\n\t\tdata\n\tBEGIN\necho done",
+            "cat <<A <<B\none\nA\ntwo\nB\necho next",
+            "# git commit\necho hi\n",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], None, repr(command))
+        self.assertEqual(self.parse_shell_words("cat <<'EOF'\nit's fine\nEOF\n"), [])
+
+    def test_backslash_delimiter_fails_closed_under_the_pinned_parser(self):
+        self.assert_rejected("cat <<E\\\\OO\nhello\nEOO\necho z", "PARSE_INVALID")
+
+    def parse_shell_words(self, command):
+        return self.native().parse_shell_script(command)
+
+    def test_substitution_interiors_are_swept_consistently(self):
+        words_shapes = {}
+        for command in (
+            "echo \"$(git commit -m x)\"",
+            "cat <<EOF\n$(git commit -m x)\nEOF\n",
+            "echo `git commit -m x`",
+        ):
+            analysis = self.analyze(command)
+            self.assertEqual(analysis["kind"], "detected", repr(command))
+        analysis = self.analyze("'git' commit -m x")
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(analysis["words"], ["git", "commit", "-m", "x"])
+        analysis = self.analyze("cat <<'EOF'\n$(git commit -m x)\nEOF\n")
+        self.assertEqual(analysis["kind"], None)
+
+    def test_unknown_or_ambiguous_syntax_fails_closed(self):
+        for command, fragment in (
+            ("cat <<'EOF'\nmissing\n", "PARSE_INVALID"),
+            ("cat <<EOF\nmissing final line", "PARSE_INVALID"),
+            ("cat <<EOF", "PARSE_INVALID"),
+            ("cat <<E$X\nbody\nEOF\n", "PARSE_INVALID"),
+            ("cat <<'EOF", "PARSE_INVALID"),
+            ("echo 'open", "PARSE_INVALID"),
+            ("echo \"open", "PARSE_INVALID"),
+            ("x=$(( git ))", "ARITHMETIC_UNSUPPORTED"),
+            ("git commit -m $\'x\'", "QUOTING_UNSUPPORTED"),
+            ("g?t commit -m x", "DYNAMIC_COMMAND_NAME"),
+            ("git commit -m *", "GIT_DYNAMIC_INVOCATION"),
+            ("git -C ~/repo commit -m x", "GIT_DYNAMIC_INVOCATION"),
+        ):
+            self.assert_rejected(command, fragment)
+
+    def test_deep_nesting_is_bounded(self):
+        deep = "echo " + "$(" * 40 + "hi" + ")" * 40
+        self.assert_rejected(deep, "AST_LIMIT_EXCEEDED")
+
+    def test_shell_commit_revalidation_paths(self):
+        module = self.native()
+        self.assertEqual(
+            module.shell_commit("cat <<'EOF'\nit's\nEOF\n", self.project, self.project),
+            None,
+        )
+        self.assertEqual(
+            module.shell_commit(
+                "git commit -m \"it's fine\"", str(self.project), self.project
+            ),
+            self.project.resolve(),
+        )
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.shell_commit("cat <<'EOF'\nx\n", self.project, self.project)
+        self.assertIn("PARSE_INVALID", str(raised.exception))
+        for command in (
+            "git commit -m msg <<'EOF'\nx\nEOF\n",
+            "cat <<EOF\n$(git commit -m x)\nEOF\n",
+            "echo \"$(git commit -m x)\"",
+        ):
+            with self.assertRaises(module.NativeError) as raised:
+                module.shell_commit(command, self.project, self.project)
+            self.assertIn(
+                "unsupported commit command", str(raised.exception), repr(command)
+            )
+
+    def test_needs_validation_matches_helper_outcome(self):
+        module = self.native()
+        for command, validated in (
+            ("pwd", False),
+            ("cat <<'EOF'\nit's fine\nEOF\n", False),
+            ("git commit -m x", True),
+            ("''git commit -m x", True),
+            ("cat <<'EOF'\nx\n", True),
+            ("cat <<EOF\nmissing\n", True),
+            ("cat <<EOF\n$(git commit -m x)\nEOF\n", True),
+            ("cat <<'EOF'\n$(git commit -m x)\nEOF\n", False),
+        ):
+            self.assertEqual(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    )
+                ),
+                validated,
+                repr(command),
+            )
+
+    def test_helper_failure_fails_closed_before_validation(self):
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = "/nonexistent/shell-capture-parser"
+        try:
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn("helper unavailable", str(raised.exception))
+            self.assertTrue(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": "git commit -m x"},
+                    )
+                )
+            )
+        finally:
+            module.helper_path_override = original
+
+    def test_hook_preserves_apostrophe_heredoc_commands(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        command = "cat <<'EOF'\nit's fine\nEOF\n"
+        for name in ("PreToolUse", "PostToolUse"):
+            result = self.hook(
+                name,
+                tool_name="Bash",
+                tool_use_id="reuse-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(result, {})
+            self.assertNotIn(
+                "USER_CAPTURE_UNAVAILABLE", json.dumps(result)
+            )
+
+    def test_hook_denies_ambiguous_heredoc_commands(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in ("cat <<'EOF\nbody\n", "cat <<EOF\nbody\n"):
+            denied = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="deny-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"], "deny"
+            )
+            self.assertNotIn(
+                "USER_CAPTURE_UNAVAILABLE",
+                denied["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+
+    def test_hook_still_wraps_ordinary_commits(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="commit-call",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = self.hook("PreToolUse", **args)
+        self.assertEqual(
+            rewritten["hookSpecificOutput"]["permissionDecision"],
+            self.expected_rewrite_decision,
+        )
+        self.assertIn(
+            "execute-commit",
+            rewritten["hookSpecificOutput"]["updatedInput"]["command"],
+        )
+        self.assertEqual(
+            self.parse_shell_words("git commit -m fixture"),
+            shlex.split("git commit -m fixture"),
+        )
 
 
 if __name__ == "__main__":

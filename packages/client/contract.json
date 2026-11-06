@@ -1,0 +1,351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contractVersion": "0.1.3",
+  "protocol": {
+    "sdk": "@modelcontextprotocol/server@2.0.0",
+    "modernRevision": "2026-07-28",
+    "compatibilityRevisions": ["2025-11-25"],
+    "node": ">=20",
+    "transports": {
+      "mvp": ["stdio", "streamable-http"],
+      "planned": [],
+      "compatibilityOnly": ["http+sse"]
+    },
+    "clientMatrix": [
+      { "protocolRevision": "2026-07-28", "transport": "stdio", "status": "supported" },
+      { "protocolRevision": "2025-11-25", "transport": "stdio", "status": "compatibility" },
+      { "protocolRevision": "2026-07-28", "transport": "streamable-http", "status": "planned" },
+      { "protocolRevision": "2025-11-25", "transport": "streamable-http", "status": "compatibility" }
+    ]
+  },
+  "scopes": {
+    "stdio": ["vault:read", "repo:read"],
+    "stdioWriteProfile": ["vault:read", "repo:read", "vault:write"],
+    "streamableHttp": ["vault:read", "repo:read", "vault:write"],
+    "available": ["vault:read", "repo:read", "vault:write", "vault:admin"]
+  },
+  "writeAuthorization": {
+    "mode": "host-policy",
+    "perWriteApproval": false,
+    "stdioProfile": "write",
+    "httpScope": "vault:write",
+    "routineTools": ["obsidian_keeper_save", "obsidian_daily_append"],
+    "outOfContract": "fail-closed"
+  },
+  "http": {
+    "path": "/mcp",
+    "defaultBind": "127.0.0.1",
+    "authentication": "HS256 bearer JWT on every request",
+    "requiredClaims": ["iss", "aud", "exp", "scope"],
+    "sessionMode": "stateful",
+    "methods": ["GET", "POST", "DELETE"],
+    "queryCredentials": false,
+    "hostAllowlist": "MCP_HTTP_ALLOWED_HOSTS",
+    "originAllowlist": "MCP_HTTP_ALLOWED_ORIGINS",
+    "tls": "Terminate TLS in a trusted reverse proxy for remote deployments."
+  },
+  "limits": {
+    "searchResults": 5,
+    "previewCharacters": 240,
+    "toolOutputBytes": 65536,
+    "subprocessTimeoutMs": 5000,
+    "maxRepositoryPathCharacters": 4096,
+    "maxScanEntries": 10000,
+    "maxScanBytes": 67108864,
+    "maxResourceBytes": 65536,
+    "httpRequestBodyBytesDefault": 1048576,
+    "httpResponseBytesDefault": 1048576,
+    "httpSessionTtlMsDefault": 900000,
+    "httpConcurrentRequestsDefault": 16,
+    "httpRequestTimeoutMsDefault": 30000
+  },
+  "tools": {
+    "obsidian_find_notes": {
+      "status": "mvp",
+      "readOnly": true,
+      "scope": "vault:read",
+      "privacy": "vault-note-path-and-preview",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "\\S" }
+        }
+      },
+      "resultSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["matches"],
+        "properties": {
+          "matches": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "preview"],
+              "properties": {
+                "path": { "type": "string" },
+                "preview": { "type": "string", "maxLength": 240 }
+              }
+            }
+          }
+        }
+      },
+      "idempotency": "not-required-read-only",
+      "errors": ["INVALID_INPUT", "READ_FAILED", "SCAN_LIMIT", "SUBPROCESS_TIMEOUT", "SUBPROCESS_OUTPUT_LIMIT"]
+    },
+    "obsidian_commit_meta": {
+      "status": "mvp",
+      "readOnly": true,
+      "scope": "repo:read",
+      "privacy": "sanitized-git-metadata",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "repositoryRoots": "Source checkouts default to the adapter repository root; installed packages default to no roots; MCP_REPOSITORY_ROOTS is an explicit path-delimited allowlist.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository"],
+        "properties": {
+          "repository": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "\\S" }
+        }
+      },
+      "resultSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository", "branch", "commit", "files", "ticket", "date", "time", "subject"],
+        "properties": {
+          "repository": { "type": "string" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string" },
+          "files": { "type": "string" },
+          "ticket": { "type": "string" },
+          "date": { "type": "string" },
+          "time": { "type": "string" },
+          "subject": { "type": "string" }
+        }
+      },
+      "idempotency": "not-required-read-only",
+      "errors": ["INVALID_INPUT", "PATH_INVALID", "METADATA_INCOMPLETE", "READ_FAILED", "SUBPROCESS_TIMEOUT", "SUBPROCESS_OUTPUT_LIMIT"]
+    },
+    "obsidian_keeper_save": {
+      "status": "mvp",
+      "readOnly": false,
+      "scope": "vault:write",
+      "privacy": "user-authored-content",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "body", "resolved", "folder_hint"],
+        "properties": {
+          "title": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^\\/\\\\\\u0000-\\u001F\\u007F]*$" },
+          "body": { "type": "string", "minLength": 1, "maxLength": 65536 },
+          "resolved": { "type": "boolean", "const": true },
+          "folder_hint": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:\\/(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+)*$" },
+          "type": { "type": "string", "maxLength": 100, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
+          "links": { "type": "array", "items": { "type": "string", "maxLength": 2048, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" }, "maxItems": 20 },
+          "session_link_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[A-Za-z0-9._:-]+$" },
+          "request_id": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[A-Za-z0-9._:-]+$" }
+        }
+      },
+      "resultSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "request_id", "idempotency_key", "path", "affected_paths", "warnings", "recovery", "error_code", "retryable"],
+        "properties": {
+          "status": { "type": "string", "enum": ["committed", "skipped", "conflict", "partial", "failed"] },
+          "request_id": { "type": "string" },
+          "idempotency_key": { "type": "string" },
+          "path": { "type": "string" },
+          "affected_paths": { "type": "array", "items": { "type": "string" } },
+          "warnings": { "type": "array", "items": { "type": "string" } },
+          "recovery": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["required", "action"],
+            "properties": { "required": { "type": "boolean" }, "action": { "type": "string" } }
+          },
+          "error_code": { "type": ["string", "null"] },
+          "retryable": { "type": "boolean" }
+        }
+      },
+      "idempotency": "required for Streamable HTTP writes and optional for local stdio compatibility; same key and payload skips, same key with a different payload conflicts",
+      "errors": ["INVALID_INPUT", "PATH_INVALID", "CONFIG_INVALID", "FORBIDDEN", "IDEMPOTENCY_CONFLICT", "CONFLICT", "PARTIAL", "WRITE_FAILED", "KEEPER_PROTOCOL_ERROR", "SUBPROCESS_TIMEOUT", "SUBPROCESS_OUTPUT_LIMIT", "CANCELLED"]
+    },
+    "obsidian_daily_append": {
+      "status": "mvp",
+      "readOnly": false,
+      "scope": "vault:write",
+      "privacy": "user-authored-content",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content"],
+        "properties": {
+          "content": { "type": "string", "minLength": 1, "maxLength": 65536 },
+          "section": { "type": "string", "maxLength": 240, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
+          "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+          "target_path": { "type": "string", "minLength": 4, "maxLength": 1024, "pattern": "^(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:\\/(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+)*\\.[mM][dD]$" },
+          "skip_if_hash": { "type": "string", "minLength": 7, "maxLength": 64, "pattern": "^[0-9a-fA-F]+$" },
+          "init_content": { "type": "string", "minLength": 1, "maxLength": 65536 },
+          "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[A-Za-z0-9._:-]+$" },
+          "request_id": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[A-Za-z0-9._:-]+$" }
+        }
+      },
+      "resultSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "request_id", "idempotency_key", "path", "affected_paths", "warnings", "recovery", "error_code", "retryable"],
+        "properties": {
+          "status": { "type": "string", "enum": ["committed", "skipped", "conflict", "partial", "failed"] },
+          "request_id": { "type": "string" },
+          "idempotency_key": { "type": "string" },
+          "path": { "type": "string" },
+          "affected_paths": { "type": "array", "items": { "type": "string" } },
+          "warnings": { "type": "array", "items": { "type": "string" } },
+          "recovery": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["required", "action"],
+            "properties": { "required": { "type": "boolean" }, "action": { "type": "string" } }
+          },
+          "error_code": { "type": ["string", "null"] },
+          "retryable": { "type": "boolean" }
+        }
+      },
+      "idempotency": "required for Streamable HTTP writes and optional for local stdio compatibility; same key and payload skips, same key with a different payload conflicts; an exact heading hash skips while a strict abbreviation/full-hash relation conflicts without writing",
+      "errors": ["INVALID_INPUT", "PATH_INVALID", "CONFIG_INVALID", "FORBIDDEN", "IDEMPOTENCY_CONFLICT", "CONFLICT", "PARTIAL", "WRITE_FAILED", "KEEPER_PROTOCOL_ERROR", "SUBPROCESS_TIMEOUT", "SUBPROCESS_OUTPUT_LIMIT", "CANCELLED"]
+    }
+  },
+  "resources": {
+    "obsidian://taxonomy": {
+      "status": "mvp",
+      "mimeType": "text/plain",
+      "scope": "vault:read",
+      "privacy": "vault-structure",
+      "maxBytes": 65536,
+      "source": "allowlisted-project-taxonomy-table-only"
+    },
+    "obsidian://daily/{date}": {
+      "status": "mvp",
+      "mimeType": "text/markdown",
+      "scope": "vault:read",
+      "privacy": "user-authored-content",
+      "maxBytes": 65536,
+      "datePattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "source": "configured-daily-path"
+    },
+    "obsidian://librarian": {
+      "status": "mvp",
+      "mimeType": "text/markdown",
+      "scope": "vault:read",
+      "privacy": "vault-index",
+      "maxBytes": 65536,
+      "source": "Librarian.md-at-vault-root"
+    },
+    "obsidian://pending": {
+      "status": "mvp",
+      "mimeType": "text/markdown",
+      "scope": "vault:read",
+      "privacy": "workflow-state",
+      "maxBytes": 65536,
+      "source": "Pending.md-at-vault-root"
+    }
+  },
+  "prompts": {
+    "ask_vault_librarian": {
+      "status": "mvp",
+      "serverModel": false,
+      "scope": "vault:read",
+      "semantics": "Return client-side instructions limited to MCP read resources and bounded search previews; cite returned paths, report coverage gaps, and refuse every vault mutation request."
+    },
+    "summarize_session": {
+      "status": "mvp",
+      "serverModel": false,
+      "scope": "vault:read",
+      "semantics": "Accept a transcript and return the client-side provider instructions for the existing SKIP-or-Markdown session summary contract; the MCP server performs no model call or vault write."
+    },
+    "reorganize_vault": {
+      "status": "excluded-from-mcp-mvp",
+      "serverModel": false,
+      "scope": "vault:admin",
+      "semantics": "Existing plugin workflow only until an explicit approval and write contract exist."
+    }
+  },
+  "writes": {
+    "status": "released",
+    "released": true,
+    "mvp": true,
+    "requiredScopes": ["vault:write"],
+    "statuses": ["committed", "skipped", "partial", "conflict", "failed"],
+    "invariants": [
+      "Canonical containment rejects traversal and symlink escape for keeper-cooperating same-host writers.",
+      "Path publication is revalidated while holding the canonical vault lock; non-cooperating filesystem mutation is outside the portable shell threat model.",
+      "A response never reports success for a partial or conflicted write.",
+      "Keeper-save callers must set resolved=true and provide a vault-relative target folder; MCP does not invoke librarian routing or deduplication.",
+      "A keyless partial result is downgraded to failed and never advertises automatic recovery.",
+      "A keeper request-body pipe error cannot produce a successful response.",
+      "Remote writes require authentication, the configured vault:write policy, and an idempotency key."
+    ]
+  },
+  "errors": {
+    "codes": ["INVALID_INPUT", "PATH_INVALID", "CONFIG_INVALID", "READ_FAILED", "SCAN_LIMIT", "METADATA_INCOMPLETE", "FORBIDDEN", "IDEMPOTENCY_CONFLICT", "CONFLICT", "PARTIAL", "WRITE_FAILED", "KEEPER_PROTOCOL_ERROR", "SUBPROCESS_TIMEOUT", "SUBPROCESS_OUTPUT_LIMIT", "CANCELLED"],
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": { "type": "string" },
+        "detail": { "type": "string", "maxLength": 240 },
+        "status": { "type": "string", "enum": ["conflict", "partial", "failed"] },
+        "request_id": { "type": "string" },
+        "idempotency_key": { "type": "string" },
+        "path": { "type": "string" },
+        "affected_paths": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "action"],
+          "properties": { "required": { "type": "boolean" }, "action": { "type": "string" } }
+        },
+        "error_code": { "type": "string" },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "transport": "Use standard JSON-RPC/MCP errors for invalid requests and stable tool codes for execution failures.",
+    "tool": "Return isError=true with a stable code and bounded detail.",
+    "successBoundary": "Only validated, complete results may be reported as successful."
+  },
+  "cancellation": {
+    "notification": "notifications/cancelled",
+    "handlerSignal": "ServerContext.mcpReq.signal",
+    "response": "No successful tool response after cancellation.",
+    "childProcess": "Terminate, await close, and escalate only if termination does not reap the child."
+  }
+}
