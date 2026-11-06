@@ -7489,6 +7489,61 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.assertEqual(state["turn"], "turn-2")
         self.assertEqual(state["commits"], {})
 
+    def test_stop_during_a_retained_snapshot_keeps_reconciliation_armed(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        snapshot = next(iter(state["snapshots"]))
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.watched_bash("make more", lambda: self.empty_commit("hidden"))
+        self.hook("Stop", stop_hook_active=False)
+        self.assertNotIn("stop_watched", self.watched_state())
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_failed_turn_reconcile_is_reported_at_the_prompt(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        output = json.loads(self.next_turn().stdout)
+        self.assertIn(
+            "history check unavailable",
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+
     def test_bash_after_stop_rearms_reconciliation(self):
         self.configure()
         self.empty_commit("base")

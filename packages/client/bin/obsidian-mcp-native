@@ -3243,6 +3243,7 @@ def engine_hook(home, profile, event):
             continuation = state and prompt.startswith(
                 "OBSIDIAN_MCP_CONTINUE:" + state["turn"] + "\n"
             )
+            reconcile_note = ""
             if not continuation and (state is None or state["turn"] != turn):
                 if state and (
                     state["disposition"] == "pending"
@@ -3261,7 +3262,7 @@ def engine_hook(home, profile, event):
                     try:
                         watch_git_history(home, session, state, path, profile, routes)
                     except WATCH_ERRORS:
-                        pass
+                        reconcile_note = WATCH_UNAVAILABLE + "\n"
                     if has_pending_capture(state):
                         raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 state = initial_session_state(
@@ -3282,7 +3283,8 @@ def engine_hook(home, profile, event):
             atomic_write(path, encode(state))
             return context(
                 name,
-                (
+                reconcile_note
+                + (
                     "This capture profile uses MCP only; plugin ownership is managed separately.\n"
                     if profile["host"] == "claude-plugin"
                     else (
@@ -3300,8 +3302,9 @@ def engine_hook(home, profile, event):
             if mode == "git":
                 try:
                     watch_git_history(home, session, state, path, profile, routes)
-                    state["stop_watched"] = True
-                    atomic_write(path, encode(state))
+                    if not state["snapshots"]:
+                        state["stop_watched"] = True
+                        atomic_write(path, encode(state))
                 except WATCH_ERRORS:
                     watch_failed = True
             guidance = capture_guidance(home, state, profile["host"], routes)

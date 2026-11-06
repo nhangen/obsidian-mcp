@@ -679,8 +679,8 @@ Stop:
   session can't suppress a capture. A rare duplicate capture stays harmless,
   because `skip_if_hash` keeps the first.
 - Reflog entries with a known non-commit reason need nothing: `am`, `bisect`,
-  `branch`, `checkout`, `cherry-pick`, `clone`, `merge`, `pull`, `rebase`,
-  `reset`, and `revert`. Those operations can create commits, but they aren't
+  `branch`, `checkout`, `cherry-pick`, `clone`, `initial`, `merge`, `pull`,
+  `rebase`, `reset`, and `revert`. Those operations can create commits, but they aren't
   `git commit` events. A `git commit` that concludes a merge or cherry-pick is
   captured.
 - Anything it can't prove keeps an unresolved snapshot: two commits in one
