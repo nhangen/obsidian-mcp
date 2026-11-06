@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import platform as platformlib
 import shlex
 import signal
 import stat
@@ -32,6 +33,24 @@ LIMIT = 262144
 # Two accepted JSON components may expand when Unicode is canonicalized.
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
+REFLOG_WINDOW = 65536
+WATCH_UNAVAILABLE = (
+    "Obsidian commit history check unavailable; commits may be uncaptured."
+)
+NON_COMMIT_REFLOG = (
+    b"am",
+    b"bisect",
+    b"branch",
+    b"checkout",
+    b"cherry-pick",
+    b"clone",
+    b"initial",
+    b"merge",
+    b"pull",
+    b"rebase",
+    b"reset",
+    b"revert",
+)
 CLAUDE_PRODUCER_TIMEOUT = 3.0
 COMMIT_CONTEXT_TEMPLATE = (
     "<replace with the goal and implemented change>",
@@ -78,6 +97,10 @@ ENVIRONMENT = (
 
 class NativeError(Exception):
     pass
+
+
+class ShellParseError(NativeError):
+    """A shell command cannot be analyzed with the supported grammar."""
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -1157,8 +1180,267 @@ def event_workspace(event):
     )
 
 
-def has_commit_words(words):
-    return "commit" in words and any(w in ("git", "/usr/bin/git") for w in words)
+SCHEMA = "shell-capture-parser@1"
+HELPER_INPUT_BYTES = 262144
+HELPER_OUTPUT_BYTES = 4096
+HELPER_TIMEOUT_SECONDS = 5
+HELPER_TIMEOUT_CODE = "HELPER_TIMEOUT"
+HELPER_UNAVAILABLE_CODE = "HELPER_UNAVAILABLE"
+HELPER_FAILED_CODE = "HELPER_FAILED"
+HELPER_PROTOCOL_CODE = "HELPER_PROTOCOL_INVALID"
+HELPER_WATCHDOG_CODE = "HELPER_WATCHDOG_EXPIRED"
+INVENTORY_ENTRY_MISSING_CODE = "INVENTORY_ENTRY_MISSING"
+INVENTORY_ENTRY_MISMATCH_CODE = "INVENTORY_ENTRY_MISMATCH"
+INVENTORY_ARTIFACT_CODE = "INVENTORY_ARTIFACT_INVALID"
+TOKENIZATION_MISMATCH_CODE = "SHAPE_TOKENIZATION_MISMATCH"
+SHAPE_MISMATCH_CODE = "SHAPE_MISMATCH"
+INPUT_TOO_LARGE_CODE = "INPUT_TOO_LARGE"
+SHELL_PARSE_CODES = frozenset(
+    {
+        HELPER_TIMEOUT_CODE,
+        HELPER_UNAVAILABLE_CODE,
+        HELPER_FAILED_CODE,
+        HELPER_PROTOCOL_CODE,
+        HELPER_WATCHDOG_CODE,
+        INVENTORY_ENTRY_MISSING_CODE,
+        INVENTORY_ENTRY_MISMATCH_CODE,
+        INVENTORY_ARTIFACT_CODE,
+        TOKENIZATION_MISMATCH_CODE,
+        SHAPE_MISMATCH_CODE,
+        INPUT_TOO_LARGE_CODE,
+    }
+)
+HELPER_FLAGS = frozenset(
+    {"GIT_COMMIT_SIMPLE", "COMMIT_WORDS_DETECTED", "DYNAMIC_WORDS", "HEREDOC_EXPANSION"}
+)
+HELPER_WATCHDOG_EXIT = 124
+
+# helper_path_override is a test seam only; production resolution goes
+# through the bundled vendor artifact verified against the release
+# inventory.
+helper_path_override = None
+# Verified helper artifacts are cached per process after one successful
+# inventory verification; the cache is keyed by absolute path and holds
+# the pinned size and mode so later calls only need one cheap lstat.
+_helper_verified = {}
+
+
+def shell_parse_failure(code, detail=""):
+    """Fixed reason code with optional prose tail; both stay machine-safe."""
+    if not detail:
+        return ShellParseError(code)
+    return ShellParseError(f"{code} ({detail})")
+
+
+def helper_artifact_path():
+    if helper_path_override is not None:
+        return Path(helper_path_override)
+    system = platformlib.system().lower()
+    machine = platformlib.machine().lower()
+    machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+    artifact = BUNDLE / (
+        "vendor/shell-capture-parser/"
+        + f"shell-capture-parser-{system}-{machine}"
+    )
+    # Cache is keyed on the release.json digest: the small inventory is
+    # re-read each call, so a rebuilt artifact fails closed on inventory
+    # edits, while the multi-megabyte binary read is skipped for a stable
+    # inventory after one verified pass.
+    fingerprint = digest((BUNDLE / "release.json").read_bytes())
+    cached = _helper_verified.get(fingerprint)
+    previous = _helper_verified.get("artifact")
+    if (
+        cached is not None
+        and previous == artifact.absolute()
+        and fingerprint in _helper_verified
+    ):
+        expected_size, expected_mode = cached
+        item = artifact.lstat()
+        if (
+            stat.S_IMODE(item.st_mode) == expected_mode
+            and stat.S_ISREG(item.st_mode)
+            and item.st_nlink == 1
+            and item.st_size == expected_size
+        ):
+            return artifact
+    _helper_verified.clear()
+    inventory_files = json.loads(
+        (BUNDLE / "release.json").read_text()
+    ).get("files") or []
+    relative = artifact.relative_to(BUNDLE).as_posix()
+    entry = next((item for item in inventory_files if item.get("path") == relative), None)
+    if entry is None:
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISSING_CODE,
+            "helper artifact missing from release inventory",
+        )
+    if "mode" not in entry:
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE, "inventory entry missing mode"
+        )
+    item = artifact.lstat()
+    mode = item.st_mode
+    if (
+        not (
+            stat.S_IMODE(mode) == entry["mode"]
+            and stat.S_ISREG(mode)
+        )
+        or item.st_nlink != 1
+    ):
+        raise shell_parse_failure(
+            INVENTORY_ARTIFACT_CODE, "helper artifact is not a private plain file"
+        )
+    contents = artifact.read_bytes()
+    if len(contents) != entry.get("size"):
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE,
+            "helper artifact size does not match inventory",
+        )
+    if digest(contents) != entry.get("sha256"):
+        raise shell_parse_failure(
+            INVENTORY_ENTRY_MISMATCH_CODE,
+            "helper artifact sha256 does not match inventory",
+        )
+    _helper_verified.clear()
+    _helper_verified[fingerprint] = (int(entry["size"]), int(entry["mode"]))
+    _helper_verified["artifact"] = artifact.absolute()
+    return artifact
+
+
+def helper_parse(command):
+    """Run the pinned parse-only helper with bounded I/O and timeout.
+
+    Bugs, timeouts, oversized payloads, and any schema deviation raise
+    ShellParseError; nothing from the helper is echoed into executor argv.
+    """
+    payload = json.dumps(
+        {"schema": SCHEMA, "command": command}, sort_keys=True
+    ).encode()
+    if len(payload) > HELPER_INPUT_BYTES:
+        raise ShellParseError("INPUT_TOO_LARGE")
+    try:
+        artifact = helper_artifact_path()
+        finished = subprocess.run(
+            [str(artifact)],
+            input=payload,
+            capture_output=True,
+            timeout=HELPER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise shell_parse_failure(
+            HELPER_TIMEOUT_CODE,
+            f"helper parse timed out; budget {HELPER_TIMEOUT_SECONDS}s",
+        ) from None
+    except (OSError, ValueError):
+        raise shell_parse_failure(HELPER_UNAVAILABLE_CODE, "helper unavailable") from None
+    if finished.returncode == HELPER_WATCHDOG_EXIT:
+        raise shell_parse_failure(HELPER_WATCHDOG_CODE, "helper watchdog expired budget")
+    if finished.returncode != 0 or len(finished.stdout) > HELPER_OUTPUT_BYTES:
+        raise shell_parse_failure(HELPER_FAILED_CODE, "helper failed")
+    try:
+        result = json.loads(finished.stdout)
+    except ValueError:
+        raise shell_parse_failure(
+            HELPER_PROTOCOL_CODE, "helper protocol invalid"
+        ) from None
+    if not isinstance(result, dict):
+        raise shell_parse_failure(HELPER_PROTOCOL_CODE, "helper protocol invalid")
+    flags = result.get("flags", [])
+    code = result.get("reason_code", "")
+    if (
+        result.get("schema") != SCHEMA
+        or result.get("status") not in ("analyze", "deny", "unsupported")
+        or not isinstance(flags, list)
+        or not all(isinstance(flag, str) and flag in HELPER_FLAGS for flag in flags)
+        or (code and not re.fullmatch(r"[A-Z0-9_]{1,64}", str(code)))
+    ):
+        raise shell_parse_failure(HELPER_PROTOCOL_CODE, "helper protocol invalid")
+    return result
+
+
+def simple_git_shape(words):
+    """Mirror the helper's strict standalone commit word prefix."""
+    index = 0
+    if index < len(words) and Path(words[index]).name == "rtk":
+        index += 1
+        if index < len(words) and words[index] == "proxy":
+            index += 1
+    if index >= len(words) or words[index] not in ("git", "/usr/bin/git"):
+        return False
+    index += 1
+    if index + 1 < len(words) and words[index] == "-C":
+        index += 2
+    return index < len(words) and words[index] == "commit"
+
+
+def has_commit_evidence(command):
+    """Report standalone git and commit tokens, ignoring quote spelling."""
+    text = re.sub(r"\\\r?\n", "", command)
+    text = text.translate(str.maketrans("", "", "'\"\\"))
+    return bool(
+        re.search(r"(?:^|[\s;&|()`])(?:[^\s;&|()`]*/)?git(?=[\s;&|()`]|$)", text)
+        and re.search(r"(?:^|[\s;&|()`])commit(?=[\s;&|()`]|$)", text)
+    )
+
+
+def analyze_shell_command(command):
+    """Classify through the helper and return the analyzed word list.
+
+    Returns {kind, words} where kind is "simple" (single supported static
+    Git commit shape), "detected" (commit words in an unsupported shape),
+    or None (no commit semantics). A helper rejection or failure raises
+    ShellParseError only with commit evidence: this gate protects capture
+    integrity and is not a shell allowlist.
+    """
+    try:
+        result = helper_parse(command)
+        if result["status"] != "analyze":
+            raise ShellParseError(result.get("reason_code", "helper failure"))
+    except ShellParseError as failure:
+        if has_commit_evidence(command):
+            raise
+        print(
+            "obsidian-mcp-native: shell analysis degraded; no commit shape identified: "
+            + str(failure),
+            file=sys.stderr,
+        )
+        return dict(kind=None, words=[])
+    flags = result.get("flags") or []
+    if "GIT_COMMIT_SIMPLE" in flags:
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            raise shell_parse_failure(
+                TOKENIZATION_MISMATCH_CODE, "untokenizable static commit shape"
+            ) from None
+        if not words or not simple_git_shape(words):
+            raise shell_parse_failure(
+                SHAPE_MISMATCH_CODE, "helper shape does not match tokenized commit"
+            )
+        return dict(kind="simple", words=words)
+    if "COMMIT_WORDS_DETECTED" in flags:
+        return dict(kind="detected", words=[])
+    return dict(kind=None, words=[])
+
+
+def parse_shell_script(command):
+    """Tokenize a shell script into words via the classification helper.
+
+    The helper decides the classification; the recognized-word list only
+    ever comes back for the graded static Git commit shape, in which case
+    it is computed on the unparsed original with shlex and cross-checked
+    against the helper's word-prefix rules. Rejections follow
+    analyze_shell_command.
+    """
+    analysis = analyze_shell_command(command)
+    if analysis["kind"] is None:
+        return []
+    if analysis["kind"] == "detected":
+        raise NativeError(
+            "unsupported commit command; use one git -C <root> commit invocation"
+        )
+    return analysis["words"]
 
 
 def capture_pretool_needs_validation(event):
@@ -1174,9 +1456,10 @@ def capture_pretool_needs_validation(event):
     if not isinstance(command, str):
         return False
     try:
-        return has_commit_words(shlex.split(command))
-    except ValueError:
+        analysis = analyze_shell_command(command)
+    except ShellParseError:
         return True
+    return analysis["kind"] is not None
 
 
 def user_hook_failure(event, code):
@@ -1301,7 +1584,8 @@ def validate_initial_state(profile, session, state):
         not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
         or datetime.date.fromisoformat(date).isoformat() != date
-        or state != initial_session_state(profile, session, turn, transcript, date=date)
+        or {key: value for key, value in state.items() if key != "git_watch"}
+        != initial_session_state(profile, session, turn, transcript, date=date)
     ):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
 
@@ -2133,18 +2417,19 @@ def context(event, message):
 def shell_commit(command, cwd, project, *, allow_subdirectory=False):
     if not isinstance(command, str):
         return None
-    words = shlex.split(command)
-    if not words:
+    analysis = analyze_shell_command(command)
+    if analysis["kind"] is None:
         return None
+    if analysis["kind"] == "detected":
+        raise NativeError(
+            "unsupported commit command; use one git -C <root> commit invocation"
+        )
+    words = analysis["words"]
     if Path(words[0]).name == "rtk":
         words.pop(0)
         if words and words[0] == "proxy":
             words.pop(0)
     if not words or words[0] not in ("git", "/usr/bin/git"):
-        if has_commit_words(words):
-            raise NativeError(
-                "unsupported commit command; use one git -C <root> commit invocation"
-            )
         return None
     words.pop(0)
     root = Path(cwd).resolve()
@@ -2220,6 +2505,186 @@ def producer_event(root, before):
     )
     consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
     return event, consumer["run_producer"](BUNDLE, event, sys.executable)
+
+
+WATCH_ERRORS = (NativeError, OSError, subprocess.SubprocessError)
+
+
+def git_position(root):
+    return dict(
+        head=git(root, "rev-parse", "--verify", "HEAD", allow_failure=True).strip(),
+        log=reflog(root),
+    )
+
+
+def reflog_entries(root, before):
+    """Return (new hash, reason) pairs appended since before.
+
+    None means the log no longer extends the recorded position, so its new
+    lines cannot be attributed.
+    """
+    path = Path(git(root, "rev-parse", "--git-path", "logs/HEAD").strip())
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        return None
+    with path.open("rb") as stream:
+        stream.seek(max(0, before["log"]["size"] - 8192))
+        prefix = stream.read(min(8192, before["log"]["size"]))
+        if before["log"]["size"] and digest(prefix) != before["log"]["tail"]:
+            return None
+        data = stream.read(REFLOG_WINDOW + 1)
+    if len(data) > REFLOG_WINDOW:
+        return None
+    entries = []
+    for line in data.splitlines():
+        record, _, reason = line.partition(b"\t")
+        hashes = record.split(b" ", 2)
+        if len(hashes) < 2:
+            return None
+        entries.append((hashes[1].decode("ascii", "replace"), reason))
+    return entries
+
+
+def session_records_commit(home, owner, commit):
+    if HEX.fullmatch(owner) is None:
+        return False
+    try:
+        state = json.loads(private_read(home / "capture-state" / (owner + ".json")))
+        return any(
+            pending["event"].get("commit") == commit
+            for pending in state["commits"].values()
+        ) or any(
+            (snapshot.get("captured") or [{}])[0].get("commit") == commit
+            for snapshot in state["snapshots"].values()
+        )
+    except (NativeError, OSError, ValueError, LookupError, TypeError, AttributeError):
+        return False
+
+
+def claim_commit(home, session, commit):
+    """Give one commit a single owning session across a shared checkout.
+
+    A claim whose owner does not record the commit transfers, because a crash
+    can orphan it. Two captures of one commit are harmless: skip_if_hash
+    keeps the first, while a suppressed commit would be lost.
+    """
+    directory = home / "commit-claims"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    target = directory / commit
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".claim-")
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(session)
+        try:
+            os.link(temporary, target)
+            return True
+        except FileExistsError:
+            pass
+        owner = target.read_text()
+        if owner == session:
+            return True
+        if session_records_commit(home, owner, commit):
+            return False
+        os.replace(temporary, target)
+        return True
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def record_watch_result(home, session, state, path):
+    """Persist first: a busy or foreign gate must not lose the observation."""
+    atomic_write(path, encode(state))
+    try:
+        claim_gate(home, session, state)
+    except (NativeError, OSError):
+        pass
+    return ""
+
+
+def accounted_commits(state):
+    commits = {pending["event"].get("commit") for pending in state["commits"].values()}
+    commits.update(
+        record.get("observed_head") for record in state.get("snapshot_resolutions", [])
+    )
+    return commits
+
+
+def watch_git_history(home, session, state, path, profile, routes):
+    """Capture project commits from HEAD reflog movement, however they ran.
+
+    A static parser cannot see commits inside scripts, eval, or interpreters,
+    so the reflog is the evidence. One unaccounted commit at HEAD becomes a
+    pending capture. Commit movement that cannot be proven retains an
+    unresolved snapshot, which stops further commits until it is inspected.
+    Returns a note when capture state changed, otherwise None.
+    """
+    if state["snapshots"]:
+        return None
+    root = Path(profile["project"])
+    current = git_position(root)
+    before = state.get("git_watch")
+    if before == current:
+        return None
+    if before is None:
+        state["git_watch"] = current
+        atomic_write(path, encode(state))
+        return None
+    entries = reflog_entries(root, before)
+    unproven = entries is None or (
+        not entries and before["head"] != current["head"]
+    )
+    fresh = []
+    if not unproven:
+        accounted = accounted_commits(state)
+        for commit, reason in entries:
+            if reason.startswith((b"commit: ", b"commit (")):
+                if HASH.fullmatch(commit) is None:
+                    unproven = True
+                elif commit not in accounted and claim_commit(home, session, commit):
+                    fresh.append(commit)
+            elif (reason.split(None, 1) or [b""])[0].rstrip(b":").lower() not in (
+                NON_COMMIT_REFLOG
+            ):
+                unproven = True
+    state["git_watch"] = current
+    if not unproven and not fresh:
+        atomic_write(path, encode(state))
+        return None
+    failure = "COMMIT_AMBIGUOUS"
+    if not unproven and fresh == [current["head"]]:
+        event = dict(
+            schemaVersion=1,
+            event="git.commit",
+            outcome="success",
+            repository=str(root),
+            commit=current["head"],
+        )
+        try:
+            consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+            metadata = consumer["run_producer"](BUNDLE, event, sys.executable)
+            state["commits"][digest(encode(event))] = dict(
+                event=event,
+                metadata=metadata,
+                status="pending",
+                capture_path=consumer["capture_target"](metadata, routes),
+            )
+            return record_watch_result(home, session, state, path)
+        except Exception as error:
+            failure = type(error).__name__
+    fingerprint = digest(encode(["git-watch", before, current]))
+    state["snapshots"][fingerprint] = dict(
+        call="",
+        command="",
+        wrapped="",
+        head=before["head"],
+        log=before["log"],
+        execution_started=True,
+        exit_code=0,
+        capture_error=failure,
+    )
+    return record_watch_result(home, session, state, path)
 
 
 def session_plan(profile, session, turn, *, date=None):
@@ -2876,6 +3341,7 @@ def engine_hook(home, profile, event):
             continuation = state and prompt.startswith(
                 "OBSIDIAN_MCP_CONTINUE:" + state["turn"] + "\n"
             )
+            reconcile_note = ""
             if not continuation and (state is None or state["turn"] != turn):
                 if state and (
                     state["disposition"] == "pending"
@@ -2890,6 +3356,13 @@ def engine_hook(home, profile, event):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if state and attached_profile(profile) and drain_reasons(state):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
+                if state and mode == "git" and not state.get("stop_watched"):
+                    try:
+                        watch_git_history(home, session, state, path, profile, routes)
+                    except WATCH_ERRORS:
+                        reconcile_note = WATCH_UNAVAILABLE + "\n"
+                    if has_pending_capture(state):
+                        raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 state = initial_session_state(
                     profile,
                     session,
@@ -2900,10 +3373,16 @@ def engine_hook(home, profile, event):
                         else None
                     ),
                 )
+                if mode == "git":
+                    try:
+                        state["git_watch"] = git_position(Path(profile["project"]))
+                    except WATCH_ERRORS:
+                        pass
             atomic_write(path, encode(state))
             return context(
                 name,
-                (
+                reconcile_note
+                + (
                     "This capture profile uses MCP only; plugin ownership is managed separately.\n"
                     if profile["host"] == "claude-plugin"
                     else (
@@ -2917,9 +3396,20 @@ def engine_hook(home, profile, event):
         if state is None:
             raise NativeError("PROMPT_EVENT_REQUIRED")
         if name == "Stop":
+            watch_failed = False
+            if mode == "git":
+                try:
+                    watch_git_history(home, session, state, path, profile, routes)
+                    if not state["snapshots"]:
+                        state["stop_watched"] = True
+                        atomic_write(path, encode(state))
+                except WATCH_ERRORS:
+                    watch_failed = True
             guidance = capture_guidance(home, state, profile["host"], routes)
             if not guidance:
-                return {}
+                return dict(systemMessage=WATCH_UNAVAILABLE) if watch_failed else {}
+            if watch_failed:
+                guidance += "\n" + WATCH_UNAVAILABLE
             if event.get("stop_hook_active") is not False or state.get(
                 "continuation_requested"
             ):
@@ -2978,6 +3468,17 @@ def engine_hook(home, profile, event):
             ),
             None,
         )
+        watched = None
+        watch_failed = False
+        if state.pop("stop_watched", None):
+            atomic_write(path, encode(state))
+        if not wrapped_snapshot:
+            try:
+                watched = watch_git_history(
+                    home, session, state, path, profile, routes
+                )
+            except WATCH_ERRORS:
+                watch_failed = True
         if name == "PostToolUse" and wrapped_snapshot:
             fingerprint, before = wrapped_snapshot
             if event.get("host_tool_failed"):
@@ -3039,6 +3540,20 @@ def engine_hook(home, profile, event):
                 profile["project"],
                 allow_subdirectory=attached_profile(profile),
             )
+        except ShellParseError as error:
+            if name == "PreToolUse":
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": name,
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Obsidian capture could not analyze this "
+                            "commit-related Bash command; use one plain "
+                            "git commit invocation: " + str(error)
+                        ),
+                    }
+                }
+            return context(name, "Obsidian commit not captured: " + str(error))
         except NativeError as error:
             if name == "PreToolUse" and (
                 state["snapshots"]
@@ -3051,8 +3566,23 @@ def engine_hook(home, profile, event):
                         "permissionDecisionReason": "Resolve the outstanding commit event before another commit.",
                     }
                 }
-            return context(name, "Obsidian commit not captured: " + str(error))
+            if name == "PreToolUse":
+                return context(
+                    name,
+                    "Obsidian commit shape is not wrapped ("
+                    + str(error)
+                    + "). The command runs and capture relies on this project's "
+                    "HEAD reflog; a commit in another repository is not captured.",
+                )
+            root = None
+        if name == "PostToolUse" and watched is not None:
+            return context(
+                name,
+                capture_guidance(home, state, profile["host"], routes) + watched,
+            )
         if root is None:
+            if name == "PostToolUse" and watch_failed:
+                return context(name, WATCH_UNAVAILABLE)
             return {}
         fingerprint = digest(encode([call, command]))
         if name == "PreToolUse":
@@ -3244,7 +3774,7 @@ def execute_commit(home, profile, args, parent_locks=None):
         )
         if root is None:
             raise NativeError("COMMIT_COMMAND_INVALID")
-        words = shlex.split(before["command"])
+        words = parse_shell_script(before["command"])
         if Path(words[0]).name == "rtk":
             words.pop(0)
             if words[0] == "proxy":
@@ -3280,6 +3810,8 @@ def execute_commit(home, profile, args, parent_locks=None):
                 )
             before["captured"] = observed
             before["effects_verified"] = True
+            if observed is not None:
+                claim_commit(home, args.session, observed[0]["commit"])
         except Exception as error:
             before["capture_error"] = type(error).__name__
             atomic_write(path, encode(state))
@@ -3719,7 +4251,12 @@ def dispatch_command(args, extra, locks):
             with state_lock(home, args.session) as (state, path):
                 if not state or args.snapshot not in state["snapshots"]:
                     raise NativeError("SNAPSHOT_UNAVAILABLE")
-                history = state.setdefault("snapshot_resolutions", [])
+                history = state.setdefault(
+                    "watch_resolutions"
+                    if state["snapshots"][args.snapshot].get("call") == ""
+                    else "snapshot_resolutions",
+                    [],
+                )
                 if len(history) >= MAX_PENDING:
                     raise NativeError("SNAPSHOT_RESOLUTION_LIMIT")
                 snapshot = state["snapshots"].pop(args.snapshot)
@@ -3739,6 +4276,14 @@ def dispatch_command(args, extra, locks):
                         status="not_captured",
                     )
                 )
+                if history is state.get("watch_resolutions"):
+                    descriptor = os.open(
+                        home / "watch-resolutions.jsonl",
+                        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(encode(history[-1]) + b"\n")
                 atomic_write(path, encode(state))
                 note = settle_gate(home, args.session, state)
             result = {"status": "not_captured", "snapshot": args.snapshot}

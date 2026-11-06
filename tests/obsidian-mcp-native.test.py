@@ -1086,7 +1086,6 @@ class NativeCaptureTest(NativeCaptureFixture):
         for command in (
             "false && git commit -m nope",
             "git commit -m x; true",
-            "git commit -m $(echo x)",
         ):
             output = self.hook(
                 "PreToolUse",
@@ -1097,6 +1096,18 @@ class NativeCaptureTest(NativeCaptureFixture):
             self.assertIn(
                 "unsupported", output["hookSpecificOutput"]["additionalContext"]
             )
+        advisory = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="unsupported",
+            tool_input={"command": "git commit -m $(echo x)"},
+        )
+        self.assertNotIn(
+            "permissionDecision", advisory["hookSpecificOutput"]
+        )
+        self.assertIn(
+            "not wrapped", advisory["hookSpecificOutput"]["additionalContext"]
+        )
         args = dict(
             tool_name="Bash",
             tool_use_id="failed",
@@ -1756,8 +1767,8 @@ class NativeCaptureTest(NativeCaptureFixture):
 
     def test_takeover_carries_live_snapshots(self):
         self.configure()
-        self.hook("UserPromptSubmit", prompt="session A")
         self.git("commit", "--allow-empty", "-m", "base")
+        self.hook("UserPromptSubmit", prompt="session A")
         path, snapshot = self.live_snapshot()
         head = self.git("rev-parse", "HEAD").stdout.strip()
         second_key = self.session_key("session-2")
@@ -6680,6 +6691,1104 @@ class CommitRoutesTest(NativeCaptureFixture):
             )
             self.assertEqual(result.returncode, 64)
             self.assertFalse(self.home.exists())
+
+
+class CaptureShellParserTest(NativeCaptureFixture):
+    def native(self):
+        if not hasattr(self, "native_module"):
+            self.native_module = self.load_native()
+        return self.native_module
+
+    def analyze(self, command):
+        return self.native().analyze_shell_command(command)
+
+    def assert_rejected(self, command, fragment):
+        reply = self.native().helper_parse(command)
+        self.assertIn(reply["status"], ("deny", "unsupported"), repr(command))
+        self.assertEqual(reply["reason_code"], fragment, repr(command))
+
+    def stub_helper(self, body):
+        path = Path(tempfile.mkdtemp(dir=self.temp.name)) / "stub-helper"
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = str(path)
+        self.addCleanup(setattr, module, "helper_path_override", original)
+
+    def test_heredoc_variants_analyze_without_commits(self):
+        for command in (
+            "cat <<'EOF'\nit's fine\nEOF\n",
+            "cat <<EOF\nplain body\nEOF\n",
+            "cat <<E\"F\"OO\nhello\nEFOO\necho z",
+            "cat <<-BEGIN\n\t\tdata\n\tBEGIN\necho done",
+            "cat <<A <<B\none\nA\ntwo\nB\necho next",
+            "# git commit\necho hi\n",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], None, repr(command))
+        self.assertEqual(self.parse_shell_words("cat <<'EOF'\nit's fine\nEOF\n"), [])
+
+    def test_backslash_delimiter_fails_closed_under_the_pinned_parser(self):
+        self.assert_rejected("cat <<E\\\\OO\nhello\nEOO\necho z", "PARSE_INVALID")
+
+    def parse_shell_words(self, command):
+        return self.native().parse_shell_script(command)
+
+    def test_substitution_interiors_are_swept_consistently(self):
+        for command in (
+            "echo \"$(git commit -m x)\"",
+            "cat <<EOF\n$(git commit -m x)\nEOF\n",
+            "echo `git commit -m x`",
+        ):
+            analysis = self.analyze(command)
+            self.assertEqual(analysis["kind"], "detected", repr(command))
+        analysis = self.analyze("'git' commit -m x")
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(analysis["words"], ["git", "commit", "-m", "x"])
+        analysis = self.analyze("cat <<'EOF'\n$(git commit -m x)\nEOF\n")
+        self.assertEqual(analysis["kind"], None)
+
+    def test_unknown_or_ambiguous_syntax_fails_closed(self):
+        for command, fragment in (
+            ("cat <<'EOF'\nmissing\n", "PARSE_INVALID"),
+            ("cat <<EOF\nmissing final line", "PARSE_INVALID"),
+            ("cat <<EOF", "PARSE_INVALID"),
+            ("cat <<E$X\nbody\nEOF\n", "PARSE_INVALID"),
+            ("cat <<'EOF", "PARSE_INVALID"),
+            ("echo 'open", "PARSE_INVALID"),
+            ("echo \"open", "PARSE_INVALID"),
+            ("x=$(( git ))", "ARITHMETIC_UNSUPPORTED"),
+            ("git commit -m $\'x\'", "QUOTING_UNSUPPORTED"),
+            ("g?t commit -m x", "DYNAMIC_COMMAND_NAME"),
+            ("git \"${verb}\" -m x", "GIT_DYNAMIC_INVOCATION"),
+        ):
+            self.assert_rejected(command, fragment)
+
+    def test_rejected_commit_text_is_denied_and_other_rejections_allowed(self):
+        module = self.native()
+        for command in (
+            "git commit -m $\'x\'",
+            "git commit -m {a,b}",
+            "g\"i\"t c\\ommit -m $\'x\'",
+            "git com\\\nmit -m {a,b}",
+            "command git commit -m x",
+            "bash -c \'git commit -m x\'",
+            "cat <<\'EOF\ngit commit\n",
+        ):
+            with self.assertRaises(module.ShellParseError):
+                self.analyze(command)
+        for command in (
+            "echo $\'digit committed\'",
+            "cat <<\'EOF\nbody\n",
+            "bash scripts/test.sh",
+            "bash .git/hooks/pre-commit",
+            "sh scripts/git-commit-check.sh",
+            "git log --grep=commit -n $((1+1))",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], None, repr(command))
+
+    def test_dynamic_and_commented_commits_are_detected_not_simple(self):
+        for command in (
+            "git commit -m \"$MSG\"",
+            "git commit -m \"$(cat <<\'EOF\'\nit\'s fine\nEOF\n)\"",
+            "git commit -F - <<\'EOF\'\nit\'s fine\nEOF\n",
+            "git commit -m *",
+            "git -C ~/repo commit -m x",
+            "git commit -m x # --amend",
+            "git commit -m x # it\'s",
+            "git commit -m a[\"b\"]",
+            "git commit -m a=~/x",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], "detected", repr(command))
+        analysis = self.analyze("git commit -m \"fix #12\"")
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(analysis["words"], ["git", "commit", "-m", "fix #12"])
+
+    def test_simple_shape_cross_check_rejects_a_split_subcommand(self):
+        with self.assertRaises(self.native().ShellParseError) as raised:
+            self.analyze("git com\\\nmit -m x")
+        self.assertIn("helper shape", str(raised.exception))
+
+    def test_invalid_helper_outcomes_fail_closed_only_for_commit_text(self):
+        schema = "{\"schema\":\"shell-capture-parser@1\""
+        module = self.native()
+        for body, fragment in (
+            ("exit 3", "helper failed"),
+            ("head -c 5000 /dev/zero", "helper failed"),
+            ("echo not-json", "protocol invalid"),
+            ("echo null", "protocol invalid"),
+            ("echo \'[]\'", "protocol invalid"),
+            ("echo \'\"x\"\'", "protocol invalid"),
+            ("echo \'{\"schema\":\"other\",\"status\":\"analyze\"}\'", "protocol invalid"),
+            (f"echo \'{schema},\"status\":\"maybe\"}}\'", "protocol invalid"),
+            (
+                f"echo \'{schema},\"status\":\"analyze\",\"flags\":\"GIT_COMMIT_SIMPLE\"}}\'",
+                "protocol invalid",
+            ),
+        ):
+            self.stub_helper(body)
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn(fragment, str(raised.exception), body)
+            self.assertEqual(self.analyze("pwd")["kind"], None, body)
+
+    def test_helper_timeout_fails_closed_only_for_commit_text(self):
+        module = self.native()
+        self.stub_helper("exec sleep 30")
+        with mock.patch.object(module, "HELPER_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn("timed out", str(raised.exception))
+            self.assertEqual(self.analyze("pwd")["kind"], None)
+
+    def test_helper_artifact_requires_a_matching_inventory_entry(self):
+        module = self.native()
+        original_bundle = module.BUNDLE
+        self.addCleanup(setattr, module, "BUNDLE", original_bundle)
+        bundle = Path(tempfile.mkdtemp(dir=self.temp.name)).resolve()
+        module.BUNDLE = bundle
+        system = module.platformlib.system().lower()
+        machine = module.platformlib.machine().lower()
+        machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+        relative = f"vendor/shell-capture-parser/shell-capture-parser-{system}-{machine}"
+        artifact = bundle / relative
+        artifact.parent.mkdir(parents=True)
+        contents = b"#!/bin/sh\nexit 3\n"
+        artifact.write_bytes(contents)
+        artifact.chmod(0o755)
+        good = dict(
+            path=relative,
+            mode=0o755,
+            size=len(contents),
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
+
+        def inventory(*entries):
+            (bundle / "release.json").write_text(json.dumps({"files": list(entries)}))
+
+        inventory(good)
+        self.assertEqual(module.helper_artifact_path(), artifact)
+        for entries, fragment in (
+            ((), "missing from release inventory"),
+            (
+                ({key: value for key, value in good.items() if key != "mode"},),
+                "inventory entry missing mode",
+            ),
+            (({**good, "mode": 0o700},), "private plain file"),
+            (({**good, "size": 1},), "size does not match"),
+            (({**good, "sha256": "0" * 64},), "sha256 does not match"),
+        ):
+            inventory(*entries)
+            with self.assertRaises(module.ShellParseError) as raised:
+                module.helper_artifact_path()
+            self.assertIn(fragment, str(raised.exception))
+        inventory(good)
+        link = artifact.with_name("second-link")
+        link.hardlink_to(artifact)
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_artifact_path()
+        self.assertIn("private plain file", str(raised.exception))
+        link.unlink()
+        (bundle / "release.json").write_text("not json")
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_parse("git commit -m x")
+        self.assertIn("helper unavailable", str(raised.exception))
+        (bundle / "release.json").unlink()
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_parse("git commit -m x")
+        self.assertIn("helper unavailable", str(raised.exception))
+
+    def test_deep_nesting_is_bounded(self):
+        deep = "echo " + "$(" * 40 + "hi" + ")" * 40
+        self.assert_rejected(deep, "AST_LIMIT_EXCEEDED")
+
+    def test_shell_commit_revalidation_paths(self):
+        module = self.native()
+        self.assertEqual(
+            module.shell_commit("cat <<'EOF'\nit's\nEOF\n", self.project, self.project),
+            None,
+        )
+        self.assertEqual(
+            module.shell_commit(
+                "git commit -m \"it's fine\"", str(self.project), self.project
+            ),
+            self.project.resolve(),
+        )
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.shell_commit(
+                "cat <<'EOF'\ngit commit\n", self.project, self.project
+            )
+        self.assertIn("PARSE_INVALID", str(raised.exception))
+        for command in (
+            "git commit -m msg <<'EOF'\nx\nEOF\n",
+            "cat <<EOF\n$(git commit -m x)\nEOF\n",
+            "echo \"$(git commit -m x)\"",
+        ):
+            with self.assertRaises(module.NativeError) as raised:
+                module.shell_commit(command, self.project, self.project)
+            self.assertIn(
+                "unsupported commit command", str(raised.exception), repr(command)
+            )
+
+    def test_needs_validation_matches_helper_outcome(self):
+        module = self.native()
+        for command, validated in (
+            ("pwd", False),
+            ("cat <<'EOF'\nit's fine\nEOF\n", False),
+            ("git commit -m x", True),
+            ("''git commit -m x", True),
+            ("cat <<'EOF'\nx\n", False),
+            ("cat <<EOF\nmissing\n", False),
+            ("cat <<'EOF'\ngit commit\n", True),
+            ("bash scripts/test.sh", False),
+            ("git show HEAD@{1}", False),
+            ("cat <<EOF\n$(git commit -m x)\nEOF\n", True),
+            ("cat <<'EOF'\n$(git commit -m x)\nEOF\n", False),
+        ):
+            self.assertEqual(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    )
+                ),
+                validated,
+                repr(command),
+            )
+
+    def test_helper_failure_fails_closed_before_validation(self):
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = "/nonexistent/shell-capture-parser"
+        try:
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn("helper unavailable", str(raised.exception))
+            self.assertTrue(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": "git commit -m x"},
+                    )
+                )
+            )
+            self.assertEqual(self.analyze("ls")["kind"], None)
+            self.assertFalse(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": "ls"},
+                    )
+                )
+            )
+        finally:
+            module.helper_path_override = original
+
+    def test_hook_allows_ordinary_commands_the_helper_rejects(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in (
+            "bash scripts/test.sh",
+            "source venv/bin/activate && pytest",
+            "command -v jq",
+            "env FOO=1 node x.js",
+            "[ -f x ] && echo y",
+            "echo {a,b}",
+            "for i in {1..3}; do echo $i; done",
+            "find . -name x -exec ls {} \\;",
+            "git show HEAD@{1}",
+            "git stash apply stash@{0}",
+            "gh api repos/{owner}/{repo}/pulls",
+            "npm test &>/dev/null",
+            "cat <<< hi",
+            "x=$((1+1))",
+            "echo $'a'",
+            "arr=(a b)",
+            "foo() { ls; }; foo",
+            "git diff \"$BASE\"",
+            "git add *.py",
+            "git -C ~/repo status",
+            "echo 'open",
+            " && ".join(["true"] * 40),
+        ):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="ordinary-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(result, {}, repr(command))
+
+    def test_hook_runs_unwrapped_commit_forms_under_reflog_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in (
+            "git commit -m \"$MSG\"",
+            "git commit -m \"$(cat <<'EOF'\nit's fine\nEOF\n)\"",
+            "git commit -F - <<'EOF'\nit's fine\nEOF\n",
+            "git commit -m x # --amend",
+            "git commit -m x # it's",
+        ):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="unwrapped-call",
+                tool_input={"command": command},
+            )
+            specific = result["hookSpecificOutput"]
+            self.assertNotIn("permissionDecision", specific, repr(command))
+            self.assertNotIn("updatedInput", specific, repr(command))
+            self.assertIn("HEAD reflog", specific["additionalContext"], repr(command))
+
+    def watched_bash(self, command, change=None):
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="watched-call",
+            tool_input={"command": command},
+        )
+        before = self.hook("PreToolUse", **args)
+        if change is not None:
+            change()
+        after = self.hook("PostToolUse", **args, tool_response={"exit_code": 0})
+        return before, after
+
+    def watched_state(self):
+        return json.loads(next(iter(self.state_paths())).read_text())
+
+    def empty_commit(self, message="watched"):
+        self.git("commit", "--allow-empty", "-m", message)
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def test_reflog_watch_captures_commits_the_parser_cannot_see(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        seen = []
+        for command in (
+            'eval "$X"',
+            'bash -c "$CMD"',
+            "sh script.sh",
+            "source x",
+            '"$TOOL" go',
+            "timeout 5 sh -c 'run it'",
+            "python3 -c 'run()'",
+            "make release",
+        ):
+            before, after = self.watched_bash(command, self.empty_commit)
+            self.assertNotIn("permissionDecision", before.get("hookSpecificOutput", {}))
+            self.assertIn(
+                "pending commit before another commit",
+                after["hookSpecificOutput"]["additionalContext"],
+                repr(command),
+            )
+            seen.append(self.head())
+        state = self.watched_state()
+        self.assertEqual(
+            sorted(p["event"]["commit"] for p in state["commits"].values()),
+            sorted(seen),
+        )
+        self.assertTrue(all(p["status"] == "pending" for p in state["commits"].values()))
+        self.assertEqual(state["snapshots"], {})
+
+    def test_reflog_watch_captures_dynamic_commit_message(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash('git commit -m "$MSG"', self.empty_commit)
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="second-call",
+            tool_input={"command": 'git commit -m "$MSG"'},
+        )
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+
+    def test_reflog_watch_ignores_head_movement_without_a_commit(self):
+        self.configure()
+        self.empty_commit("base")
+        self.empty_commit("second")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("git switch -c other", lambda: self.git("switch", "-c", "other"))
+        self.watched_bash("git reset HEAD~1", lambda: self.git("reset", "HEAD~1"))
+        state = self.watched_state()
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+
+    def test_reflog_watch_retains_commits_it_cannot_prove(self):
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        def commit_then_leave():
+            self.empty_commit("one")
+            self.git("reset", "--hard", "HEAD~1")
+
+        def rewritten_log():
+            self.empty_commit("one")
+            log = self.project / ".git/logs/HEAD"
+            log.write_bytes(b"")
+
+        for change in (two_commits, commit_then_leave, rewritten_log):
+            with self.subTest(change.__name__):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.watched_bash("make release", change)
+                state = self.watched_state()
+                self.assertEqual(state["commits"], {})
+                [(snapshot, record)] = state["snapshots"].items()
+                self.assertEqual(record["capture_error"], "COMMIT_AMBIGUOUS")
+                denied = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="next-call",
+                    tool_input={"command": "git commit -m next"},
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                allowed = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="ordinary-call",
+                    tool_input={"command": "ls"},
+                )
+                self.assertEqual(allowed, {})
+                resolved = self.cli(
+                    "resolve-snapshot",
+                    "--home",
+                    str(self.home),
+                    "--session",
+                    self.session_key("session-1"),
+                    "--snapshot",
+                    snapshot,
+                    "--verification",
+                    "command-stopped-and-history-inspected",
+                )
+                self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                self.watched_bash("ls")
+                self.assertEqual(self.watched_state()["snapshots"], {})
+
+    def test_reflog_watch_sees_a_commit_at_stop(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("long-task &")
+        self.empty_commit()
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("pending commit before another commit", stopped["reason"])
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_reflog_watch_does_not_recapture_a_wrapped_commit(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("ls")
+        baseline = self.watched_state()["git_watch"]
+        path, state, key = self.pending_commit()
+        state["commits"][key]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.watched_bash("ls")
+        after = self.watched_state()
+        self.assertEqual(list(after["commits"]), [key])
+        self.assertEqual(after["commits"][key]["status"], "committed")
+        self.assertEqual(after["snapshots"], {})
+
+        after["commits"] = {}
+        after["git_watch"] = baseline
+        after["snapshot_resolutions"] = [dict(observed_head=self.head())]
+        path.write_text(json.dumps(after))
+        self.watched_bash("ls")
+        self.assertEqual(self.watched_state()["commits"], {})
+
+    def test_reflog_watch_captures_a_commit_with_no_bash_call_in_the_turn(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.empty_commit("from a subagent script")
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertEqual(
+            [p["event"]["commit"] for p in self.watched_state()["commits"].values()],
+            [self.head()],
+        )
+
+    def test_reflog_watch_ignores_commits_before_the_turn(self):
+        self.configure()
+        self.empty_commit("base")
+        self.empty_commit("terminal")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("ls")
+        self.assertEqual(self.watched_state()["commits"], {})
+
+    def test_reflog_watch_retains_unknown_reflog_reasons(self):
+        def custom_reason():
+            subprocess.run(
+                ["git", "-C", str(self.project), "commit", "--allow-empty", "-m", "x"],
+                env=dict(self.environment, GIT_REFLOG_ACTION="custom"),
+                check=True,
+                capture_output=True,
+            )
+
+        def plumbing():
+            tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+            made = self.git("commit-tree", tree, "-p", "HEAD", "-m", "x").stdout.strip()
+            self.git("update-ref", "HEAD", made)
+
+        def unchanged_head_rewritten_log():
+            self.empty_commit("one")
+            self.git("reset", "--hard", "HEAD~1")
+            (self.project / ".git/logs/HEAD").write_bytes(b"")
+
+        for change in (custom_reason, plumbing, unchanged_head_rewritten_log):
+            with self.subTest(change.__name__):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.watched_bash("make release", change)
+                state = self.watched_state()
+                self.assertEqual(state["commits"], {})
+                [record] = state["snapshots"].values()
+                self.assertEqual(record["capture_error"], "COMMIT_AMBIGUOUS")
+
+    def test_reflog_watch_captures_a_commit_made_during_a_retained_snapshot(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        snapshot = next(iter(self.watched_state()["snapshots"]))
+        self.watched_bash("make more", lambda: self.empty_commit("three"))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.watched_bash("ls")
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_resolved_watch_snapshot_does_not_block_the_next_turn(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        snapshot = next(iter(self.watched_state()["snapshots"]))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        state = self.watched_state()
+        state["disposition"] = "saved"
+        path.write_text(json.dumps(state))
+        next_turn = self.next_turn()
+        self.assertEqual(next_turn.returncode, 0, next_turn.stderr)
+        self.assertEqual(self.watched_state()["turn"], "turn-2")
+        [record] = (
+            (self.home / "watch-resolutions.jsonl").read_text().splitlines()
+        )
+        self.assertEqual(json.loads(record)["snapshot"], snapshot)
+        self.assertEqual(json.loads(record)["status"], "not_captured")
+
+    def test_reflog_watch_gives_a_commit_one_owning_session(self):
+        self.configure()
+        self.empty_commit("base")
+
+        def session_hook(session, name, **extra):
+            result = self.cli(
+                "hook",
+                "--home",
+                str(self.home),
+                payload=dict(self.event(name, **extra), session_id=session),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout or "{}")
+
+        session_hook("session-1", "UserPromptSubmit", prompt="work")
+        session_hook("session-2", "UserPromptSubmit", prompt="work")
+        self.empty_commit("one")
+        args = dict(
+            tool_name="Bash", tool_use_id="owner-call", tool_input={"command": "ls"}
+        )
+        session_hook("session-1", "PreToolUse", **args)
+        output = session_hook("session-2", "PreToolUse", **args)
+        self.assertEqual(output, {})
+        posted = session_hook(
+            "session-2", "PostToolUse", **args, tool_response={"exit_code": 0}
+        )
+        self.assertNotIn("takeover", json.dumps(posted))
+        pending = [
+            state["commits"]
+            for state in (json.loads(p.read_text()) for p in self.state_paths())
+        ]
+        self.assertEqual(sorted(len(commits) for commits in pending), [0, 1])
+
+    def test_reflog_watch_keeps_takeover_text_from_a_second_session(self):
+        self.configure()
+        self.empty_commit("base")
+
+        def session_hook(session, name, **extra):
+            result = self.cli(
+                "hook",
+                "--home",
+                str(self.home),
+                payload=dict(self.event(name, **extra), session_id=session),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout or "{}")
+
+        args = dict(
+            tool_name="Bash", tool_use_id="gate-call", tool_input={"command": "ls"}
+        )
+        session_hook("session-1", "UserPromptSubmit", prompt="work")
+        session_hook("session-2", "UserPromptSubmit", prompt="work")
+        self.empty_commit("first")
+        session_hook("session-1", "PreToolUse", **args)
+        session_hook("session-2", "PreToolUse", **args)
+        self.empty_commit("second")
+        posted = session_hook(
+            "session-2", "PostToolUse", **args, tool_response={"exit_code": 0}
+        )
+        self.assertIn(
+            "pending commit before another commit",
+            posted["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("takeover", json.dumps(posted))
+
+    def test_reflog_watch_failure_leaves_ordinary_bash_and_stop_working(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        before, after = self.watched_bash("ls")
+        self.assertEqual(before, {})
+        self.assertIn(
+            "history check unavailable",
+            after["hookSpecificOutput"]["additionalContext"],
+        )
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("obsidian_keeper_save", stopped["reason"])
+        self.assertIn("history check unavailable", stopped["reason"])
+
+    def test_reflog_watch_transfers_an_orphaned_or_empty_claim(self):
+        for owner in ("0" * 64, ""):
+            with self.subTest(owner=owner):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.empty_commit("one")
+                claims = self.home / "commit-claims"
+                claims.mkdir(mode=0o700)
+                (claims / self.head()).write_text(owner)
+                self.watched_bash("ls")
+                state = self.watched_state()
+                self.assertEqual(
+                    [p["event"]["commit"] for p in state["commits"].values()],
+                    [self.head()],
+                )
+                self.assertEqual((claims / self.head()).read_text(), state["session"])
+
+    def test_reflog_watch_accepts_a_branch_rename(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash(
+            "git branch -m renamed", lambda: self.git("branch", "-m", "renamed")
+        )
+        state = self.watched_state()
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+
+    def next_turn(self):
+        return self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=dict(
+                self.event("UserPromptSubmit", prompt="more"), turn_id="turn-2"
+            ),
+        )
+
+    def test_turn_without_a_completed_stop_reconciles_the_reflog(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.empty_commit("no stop ran")
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_terminal_commit_after_a_completed_stop_is_not_captured(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.empty_commit("terminal between turns")
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-2")
+        self.assertEqual(state["commits"], {})
+
+    def test_stop_during_a_retained_snapshot_keeps_reconciliation_armed(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        snapshot = next(iter(state["snapshots"]))
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.watched_bash("make more", lambda: self.empty_commit("hidden"))
+        self.hook("Stop", stop_hook_active=False)
+        self.assertNotIn("stop_watched", self.watched_state())
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_failed_turn_reconcile_is_reported_at_the_prompt(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        output = json.loads(self.next_turn().stdout)
+        self.assertIn(
+            "history check unavailable",
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+
+    def test_bash_after_stop_rearms_reconciliation(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.hook("Stop", stop_hook_active=False)
+        self.watched_bash("ls")
+        self.assertNotIn("stop_watched", self.watched_state())
+
+    def test_reflog_watch_failure_at_stop_is_reported_when_nothing_else_is(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertIn("history check unavailable", stopped["systemMessage"])
+
+    def test_hook_denies_commit_text_the_helper_rejects(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="deny-call",
+            tool_input={"command": "git commit -m {a,b}"},
+        )
+        specific = denied["hookSpecificOutput"]
+        self.assertEqual(specific["permissionDecision"], "deny")
+        self.assertIn("BRACE_EXPANSION_UNSUPPORTED", specific["permissionDecisionReason"])
+        self.assertIn("plain git commit", specific["permissionDecisionReason"])
+
+    def test_hook_preserves_apostrophe_heredoc_commands(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        command = "cat <<'EOF'\nit's fine\nEOF\n"
+        for name in ("PreToolUse", "PostToolUse"):
+            result = self.hook(
+                name,
+                tool_name="Bash",
+                tool_use_id="reuse-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(result, {})
+            self.assertNotIn(
+                "USER_CAPTURE_UNAVAILABLE", json.dumps(result)
+            )
+
+    def test_helper_down_denies_innocent_text_and_documents_the_trade_off(self):
+        """Regression naming the accepted over-fail-closed trade-off:
+
+        quote spelling is dropped before token matching, so with the helper
+        unavailable, innocent argument text carrying both tokens (e.g.
+        ``grep 'git commit' notes.md``) is denied rather than allowed past
+        the capture gate. Under-denying is the chosen failure direction;
+        see the README policy bullets.
+        """
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = "/nonexistent/shell-capture-parser"
+        try:
+            for command in (
+                "grep 'git commit' notes.md",
+                "echo git commit",
+                "echo 'git commit' fixture",
+            ):
+                with self.assertRaises(module.ShellParseError) as raised:
+                    module.analyze_shell_command(command)
+                self.assertIn("helper unavailable", str(raised.exception), command)
+                self.assertTrue(module.has_commit_evidence(command), command)
+        finally:
+            module.helper_path_override = original
+        readme = (ROOT / "packages/client/README.md").read_text()
+        self.assertIn("deliberate over-fail-closed trade-off", readme)
+        allowed = (self.bundle / "bin/obsidian-mcp-native")
+        self.assertTrue(allowed.is_file())
+
+    def test_hook_denies_ambiguous_heredoc_commands(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in ("cat <<'EOF\ngit commit\n", "cat <<EOF\ngit commit\n"):
+            denied = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="deny-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"], "deny"
+            )
+            self.assertNotIn(
+                "USER_CAPTURE_UNAVAILABLE",
+                denied["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+
+    def test_oversized_command_fails_closed_only_with_commit_evidence(self):
+        module = self.native()
+        huge = "echo " + "x" * 300000
+        self.assertGreater(len(json.dumps(huge)), module.HELPER_INPUT_BYTES)
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.analyze_shell_command(huge + " && git commit -m y")
+        self.assertIn("INPUT_TOO_LARGE", str(raised.exception))
+        with self.assertRaises(module.ShellParseError):
+            module.analyze_shell_command("git commit -m " + "x" * 300000)
+        self.assertEqual(
+            module.analyze_shell_command(huge)["kind"],
+            None,
+            "innocent oversized text stays allowed; the gate is not an allowlist",
+        )
+        self.assertTrue(
+            module.capture_pretool_needs_validation(
+                dict(
+                    hook_event_name="PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": "git commit -m " + "x" * 300000},
+                )
+            )
+        )
+        self.assertFalse(
+            module.capture_pretool_needs_validation(
+                dict(
+                    hook_event_name="PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": huge},
+                )
+            )
+        )
+
+    def test_production_timeout_constant_is_pinned(self):
+        self.assertEqual(
+            self.native().HELPER_TIMEOUT_SECONDS,
+            5,
+            "the shipped helper budget must not silently widen",
+        )
+
+    def test_simple_shape_cross_check_pins_each_branch(self):
+        shape = self.native().simple_git_shape
+        for words, expected in (
+            (["git", "commit", "-m", "x"], True),
+            (["/usr/bin/git", "commit", "-m", "x"], True),
+            (["'git'", "commit", "-m", "x"], False),
+            (["rtk", "git", "commit", "-m", "x"], True),
+            (["/weird/dir/rtk", "git", "commit", "-m", "x"], True),
+            (["rtk", "proxy", "git", "commit", "-m", "x"], True),
+            (["proxy", "git", "commit", "-m", "x"], False),
+            (["rtk", "list"], False),
+            (["rtk", "proxy", "extra", "git", "commit", "-m", "x"], False),
+            (["git", "-C", "root", "commit", "-m", "x"], True),
+            (["git", "-C", "a", "-C", "b", "commit", "-m", "x"], False),
+            (["git", "log", "--grep", "commit"], False),
+            (["git"], False),
+        ):
+            self.assertEqual(shape(words), expected, repr(words))
+
+    def test_rtk_prefixed_commits_still_wrap_for_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for index, command in enumerate(
+            ("rtk git commit -m first", "rtk proxy git commit -m second")
+        ):
+            args = dict(
+                tool_name="Bash",
+                tool_use_id=f"rtk-{index}",
+                tool_input={"command": command},
+            )
+            rewritten = self.hook("PreToolUse", **args)
+            self.assertEqual(
+                rewritten["hookSpecificOutput"]["permissionDecision"],
+                self.expected_rewrite_decision,
+                command,
+            )
+            self.assertIn(
+                "execute-commit",
+                rewritten["hookSpecificOutput"]["updatedInput"]["command"],
+            )
+            (self.project / "file.txt").write_text(f"fixture {index}\n")
+            self.git("add", "file.txt")
+            executed = self.execute_rewritten(rewritten)
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            self.hook("PostToolUse", **args, tool_response=executed.stdout)
+            path = next(iter(self.state_paths()))
+            commits = json.loads(path.read_text())["commits"]
+            pending = [
+                key
+                for key, entry in commits.items()
+                if entry.get("status") == "pending"
+            ]
+            self.assertEqual(len(pending), 1, json.dumps(commits)[:400])
+            prepared = self.prepare(path, pending[0])
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.append_event(json.loads(prepared.stdout)["arguments"])
+
+    def test_unicode_message_classifies_for_capture(self):
+        module = self.native()
+        command = 'git commit -m "café café"'
+        analysis = module.analyze_shell_command(command)
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(
+            module.parse_shell_script(command),
+            shlex.split(command),
+        )
+
+    def test_active_assembly_helper_timeout_text_uses_fixed_code(self):
+        module = self.native()
+        self.assertEqual(module.HELPER_TIMEOUT_CODE, "HELPER_TIMEOUT")
+        self.assertEqual(module.HELPER_UNAVAILABLE_CODE, "HELPER_UNAVAILABLE")
+        self.assertEqual(module.HELPER_FAILED_CODE, "HELPER_FAILED")
+        self.assertEqual(
+            module.HELPER_PROTOCOL_CODE, "HELPER_PROTOCOL_INVALID"
+        )
+
+    def test_hook_still_wraps_ordinary_commits(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="commit-call",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = self.hook("PreToolUse", **args)
+        self.assertEqual(
+            rewritten["hookSpecificOutput"]["permissionDecision"],
+            self.expected_rewrite_decision,
+        )
+        self.assertIn(
+            "execute-commit",
+            rewritten["hookSpecificOutput"]["updatedInput"]["command"],
+        )
+        self.assertEqual(
+            self.parse_shell_words("git commit -m fixture"),
+            ["git", "commit", "-m", "fixture"],
+        )
 
 
 if __name__ == "__main__":

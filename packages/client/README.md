@@ -650,7 +650,65 @@ work done since the retained turn began. Once prepared, the body stays frozen.
 Bash Pre/Post/failure events continue through the existing commit engine while
 paused; observed commits can make their first canonical daily append directly.
 Pending-commit gates and executor evidence still apply. Unrelated Bash commands
-proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores
+proceed and Stop reports a non-blocking `systemMessage`.
+
+Commit capture has two layers: the bundled parse-only `shell-capture-parser`
+helper classifies each Bash command before it runs, and the project's HEAD
+reflog proves what happened afterward. The parser can't see a commit inside a
+script, `eval`, or `python3 -c`, so the reflog is the evidence for every shape
+except the wrapped one. The hook handles each command in one of these ways:
+
+- It wraps one plain static `git commit` invocation for capture.
+- It lets the command run with a `not wrapped` note when commit words appear in
+  another shape, such as `-m "$MSG"`, a heredoc message, `-F -`, a compound
+  command, or a trailing comment. The reflog watch then captures the commit.
+- It denies the command when the text has standalone `git` and `commit` tokens
+  and the helper rejects the syntax or is unavailable. A heredoc with a
+  backslash-newline is one rejected shape. The token check ignores quote
+  spelling on purpose: with the helper down, argument text such as
+  `grep 'git commit' notes.md` or `echo git commit` is also denied. This is a
+  deliberate over-fail-closed trade-off — under-denying a commit lets it slip
+  past the capture receipt, while these false denies fail the run visibly and
+  cost only rerouting the text.
+- It allows any other command, including syntax the helper rejects. The reflog
+  watch still applies.
+
+The watch starts at the prompt and checks the reflog at every Bash call and at
+Stop:
+
+- One new commit at HEAD becomes a pending capture, with the same gates as a
+  wrapped commit. A commit made outside the agent during the turn, such as one
+  from your terminal, counts too. In a checkout shared by sessions, the first
+  session to observe a commit owns it, which may not be the session that made
+  it. A claim transfers when its owner has no record of the commit, so a crashed
+  session can't suppress a capture. A rare duplicate capture stays harmless,
+  because `skip_if_hash` keeps the first.
+- Reflog entries with a known non-commit reason need nothing: `am`, `bisect`,
+  `branch`, `checkout`, `cherry-pick`, `clone`, `initial`, `merge`, `pull`,
+  `rebase`, `reset`, and `revert`. Those operations can create commits, but they aren't
+  `git commit` events. A `git commit` that concludes a merge or cherry-pick is
+  captured.
+- Anything it can't prove keeps an unresolved snapshot: two commits in one
+  window, a commit HEAD has already left, a rewritten reflog, plumbing, or a
+  reflog reason outside that list. The snapshot denies commits the hook can
+  recognize until you inspect history and run `resolve-snapshot`, which appends
+  the record to `watch-resolutions.jsonl` in the capture home. A commit hidden
+  from the parser during that time is captured after you resolve it.
+
+The watch has these limits:
+
+- It doesn't cover commits in another repository or worktree.
+- It stops at a completed Stop, so a background command that finishes afterward
+  isn't observed, and neither is a terminal commit between turns. A turn whose
+  Stop never ran is reconciled at the next prompt.
+- With `core.logAllRefUpdates` off, a commit that HEAD has already left leaves
+  no evidence.
+- A reflog reason is self-reported, so `GIT_REFLOG_ACTION` set to a listed word
+  hides a commit from the watch.
+- If the check fails, the hook reports `history check unavailable` and the
+  command still runs.
+
+Claude Code ignores
 `StopFailure` output, so that event returns nothing and capture state is kept;
 the next prompt reports it. Unexpected exceptions report their class, never their
 text. Frozen requests and matching late receipts reach the existing validators.
