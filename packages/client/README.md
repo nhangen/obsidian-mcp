@@ -650,7 +650,23 @@ work done since the retained turn began. Once prepared, the body stays frozen.
 Bash Pre/Post/failure events continue through the existing commit engine while
 paused; observed commits can make their first canonical daily append directly.
 Pending-commit gates and executor evidence still apply. Unrelated Bash commands
-proceed and Stop reports a non-blocking `systemMessage`. Claude Code ignores
+proceed and Stop reports a non-blocking `systemMessage`.
+
+Bash classification comes from the bundled parse-only
+`shell-capture-parser` helper. It detects commits for capture; it isn't a shell
+sandbox, because a commit inside `timeout 5 sh -c '…'` or `python3 -c` passes
+unnoticed. The hook handles each command in one of these ways:
+
+- It wraps one plain static `git commit` invocation for capture.
+- It adds a `not captured` advisory and lets the command run when commit words
+  appear in another shape, such as `-m "$MSG"`, a heredoc message, `-F -`, a
+  compound command, or a trailing comment.
+- It denies the command when the text has standalone `git` and `commit` tokens
+  and the helper rejects the syntax or is unavailable. A heredoc with a
+  backslash-newline is one rejected shape.
+- It allows any other command, including syntax the helper rejects.
+
+Claude Code ignores
 `StopFailure` output, so that event returns nothing and capture state is kept;
 the next prompt reports it. Unexpected exceptions report their class, never their
 text. Frozen requests and matching late receipts reach the existing validators.

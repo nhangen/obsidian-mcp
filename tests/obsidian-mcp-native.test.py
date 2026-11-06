@@ -1096,19 +1096,17 @@ class NativeCaptureTest(NativeCaptureFixture):
             self.assertIn(
                 "unsupported", output["hookSpecificOutput"]["additionalContext"]
             )
-        # A dynamic Git subcommand is explicitly unsupported and denied.
-        denied = self.hook(
+        advisory = self.hook(
             "PreToolUse",
             tool_name="Bash",
             tool_use_id="unsupported",
             tool_input={"command": "git commit -m $(echo x)"},
         )
-        self.assertEqual(
-            denied["hookSpecificOutput"]["permissionDecision"], "deny"
-        )
         self.assertNotIn(
-            "USER_CAPTURE_UNAVAILABLE",
-            denied["hookSpecificOutput"]["permissionDecisionReason"],
+            "permissionDecision", advisory["hookSpecificOutput"]
+        )
+        self.assertIn(
+            "not captured", advisory["hookSpecificOutput"]["additionalContext"]
         )
         args = dict(
             tool_name="Bash",
@@ -6705,9 +6703,18 @@ class CaptureShellParserTest(NativeCaptureFixture):
         return self.native().analyze_shell_command(command)
 
     def assert_rejected(self, command, fragment):
-        with self.assertRaises(self.native().ShellParseError) as raised:
-            self.analyze(command)
-        self.assertIn(fragment, str(raised.exception), repr(command))
+        reply = self.native().helper_parse(command)
+        self.assertIn(reply["status"], ("deny", "unsupported"), repr(command))
+        self.assertEqual(reply["reason_code"], fragment, repr(command))
+
+    def stub_helper(self, body):
+        path = Path(tempfile.mkdtemp(dir=self.temp.name)) / "stub-helper"
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        module = self.native()
+        original = module.helper_path_override
+        module.helper_path_override = str(path)
+        self.addCleanup(setattr, module, "helper_path_override", original)
 
     def test_heredoc_variants_analyze_without_commits(self):
         for command in (
@@ -6728,7 +6735,6 @@ class CaptureShellParserTest(NativeCaptureFixture):
         return self.native().parse_shell_script(command)
 
     def test_substitution_interiors_are_swept_consistently(self):
-        words_shapes = {}
         for command in (
             "echo \"$(git commit -m x)\"",
             "cat <<EOF\n$(git commit -m x)\nEOF\n",
@@ -6754,10 +6760,139 @@ class CaptureShellParserTest(NativeCaptureFixture):
             ("x=$(( git ))", "ARITHMETIC_UNSUPPORTED"),
             ("git commit -m $\'x\'", "QUOTING_UNSUPPORTED"),
             ("g?t commit -m x", "DYNAMIC_COMMAND_NAME"),
-            ("git commit -m *", "GIT_DYNAMIC_INVOCATION"),
-            ("git -C ~/repo commit -m x", "GIT_DYNAMIC_INVOCATION"),
+            ("git \"${verb}\" -m x", "GIT_DYNAMIC_INVOCATION"),
         ):
             self.assert_rejected(command, fragment)
+
+    def test_rejected_commit_text_is_denied_and_other_rejections_allowed(self):
+        module = self.native()
+        for command in (
+            "git commit -m $\'x\'",
+            "git commit -m {a,b}",
+            "g\"i\"t c\\ommit -m $\'x\'",
+            "git com\\\nmit -m {a,b}",
+            "command git commit -m x",
+            "bash -c \'git commit -m x\'",
+            "cat <<\'EOF\ngit commit\n",
+        ):
+            with self.assertRaises(module.ShellParseError):
+                self.analyze(command)
+        for command in (
+            "echo $\'digit committed\'",
+            "cat <<\'EOF\nbody\n",
+            "bash scripts/test.sh",
+            "bash .git/hooks/pre-commit",
+            "sh scripts/git-commit-check.sh",
+            "git log --grep=commit -n $((1+1))",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], None, repr(command))
+
+    def test_dynamic_and_commented_commits_are_detected_not_simple(self):
+        for command in (
+            "git commit -m \"$MSG\"",
+            "git commit -m \"$(cat <<\'EOF\'\nit\'s fine\nEOF\n)\"",
+            "git commit -F - <<\'EOF\'\nit\'s fine\nEOF\n",
+            "git commit -m *",
+            "git -C ~/repo commit -m x",
+            "git commit -m x # --amend",
+            "git commit -m x # it\'s",
+            "git commit -m a[\"b\"]",
+            "git commit -m a=~/x",
+        ):
+            self.assertEqual(self.analyze(command)["kind"], "detected", repr(command))
+        analysis = self.analyze("git commit -m \"fix #12\"")
+        self.assertEqual(analysis["kind"], "simple")
+        self.assertEqual(analysis["words"], ["git", "commit", "-m", "fix #12"])
+
+    def test_simple_shape_cross_check_rejects_a_split_subcommand(self):
+        with self.assertRaises(self.native().ShellParseError) as raised:
+            self.analyze("git com\\\nmit -m x")
+        self.assertIn("helper shape", str(raised.exception))
+
+    def test_invalid_helper_outcomes_fail_closed_only_for_commit_text(self):
+        schema = "{\"schema\":\"shell-capture-parser@1\""
+        module = self.native()
+        for body, fragment in (
+            ("exit 3", "helper failed"),
+            ("head -c 5000 /dev/zero", "helper failed"),
+            ("echo not-json", "protocol invalid"),
+            ("echo null", "protocol invalid"),
+            ("echo \'[]\'", "protocol invalid"),
+            ("echo \'\"x\"\'", "protocol invalid"),
+            ("echo \'{\"schema\":\"other\",\"status\":\"analyze\"}\'", "protocol invalid"),
+            (f"echo \'{schema},\"status\":\"maybe\"}}\'", "protocol invalid"),
+            (
+                f"echo \'{schema},\"status\":\"analyze\",\"flags\":\"GIT_COMMIT_SIMPLE\"}}\'",
+                "protocol invalid",
+            ),
+        ):
+            self.stub_helper(body)
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn(fragment, str(raised.exception), body)
+            self.assertEqual(self.analyze("pwd")["kind"], None, body)
+
+    def test_helper_timeout_fails_closed_only_for_commit_text(self):
+        module = self.native()
+        self.stub_helper("exec sleep 30")
+        with mock.patch.object(module, "HELPER_TIMEOUT_SECONDS", 0.2):
+            with self.assertRaises(module.ShellParseError) as raised:
+                self.analyze("git commit -m x")
+            self.assertIn("timed out", str(raised.exception))
+            self.assertEqual(self.analyze("pwd")["kind"], None)
+
+    def test_helper_artifact_requires_a_matching_inventory_entry(self):
+        module = self.native()
+        original_bundle = module.BUNDLE
+        self.addCleanup(setattr, module, "BUNDLE", original_bundle)
+        bundle = Path(tempfile.mkdtemp(dir=self.temp.name)).resolve()
+        module.BUNDLE = bundle
+        system = module.platformlib.system().lower()
+        machine = module.platformlib.machine().lower()
+        machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+        relative = f"vendor/shell-capture-parser/shell-capture-parser-{system}-{machine}"
+        artifact = bundle / relative
+        artifact.parent.mkdir(parents=True)
+        contents = b"#!/bin/sh\nexit 3\n"
+        artifact.write_bytes(contents)
+        artifact.chmod(0o755)
+        good = dict(
+            path=relative,
+            mode=0o755,
+            size=len(contents),
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
+
+        def inventory(*entries):
+            (bundle / "release.json").write_text(json.dumps({"files": list(entries)}))
+
+        inventory(good)
+        self.assertEqual(module.helper_artifact_path(), artifact)
+        for entries, fragment in (
+            ((), "missing from release inventory"),
+            (({**good, "mode": 0o700},), "private plain file"),
+            (({**good, "size": 1},), "size does not match"),
+            (({**good, "sha256": "0" * 64},), "sha256 does not match"),
+        ):
+            inventory(*entries)
+            with self.assertRaises(module.ShellParseError) as raised:
+                module.helper_artifact_path()
+            self.assertIn(fragment, str(raised.exception))
+        inventory(good)
+        link = artifact.with_name("second-link")
+        link.hardlink_to(artifact)
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_artifact_path()
+        self.assertIn("private plain file", str(raised.exception))
+        link.unlink()
+        (bundle / "release.json").write_text("not json")
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_parse("git commit -m x")
+        self.assertIn("helper unavailable", str(raised.exception))
+        (bundle / "release.json").unlink()
+        with self.assertRaises(module.ShellParseError) as raised:
+            module.helper_parse("git commit -m x")
+        self.assertIn("helper unavailable", str(raised.exception))
 
     def test_deep_nesting_is_bounded(self):
         deep = "echo " + "$(" * 40 + "hi" + ")" * 40
@@ -6776,7 +6911,9 @@ class CaptureShellParserTest(NativeCaptureFixture):
             self.project.resolve(),
         )
         with self.assertRaises(module.ShellParseError) as raised:
-            module.shell_commit("cat <<'EOF'\nx\n", self.project, self.project)
+            module.shell_commit(
+                "cat <<'EOF'\ngit commit\n", self.project, self.project
+            )
         self.assertIn("PARSE_INVALID", str(raised.exception))
         for command in (
             "git commit -m msg <<'EOF'\nx\nEOF\n",
@@ -6796,8 +6933,11 @@ class CaptureShellParserTest(NativeCaptureFixture):
             ("cat <<'EOF'\nit's fine\nEOF\n", False),
             ("git commit -m x", True),
             ("''git commit -m x", True),
-            ("cat <<'EOF'\nx\n", True),
-            ("cat <<EOF\nmissing\n", True),
+            ("cat <<'EOF'\nx\n", False),
+            ("cat <<EOF\nmissing\n", False),
+            ("cat <<'EOF'\ngit commit\n", True),
+            ("bash scripts/test.sh", False),
+            ("git show HEAD@{1}", False),
             ("cat <<EOF\n$(git commit -m x)\nEOF\n", True),
             ("cat <<'EOF'\n$(git commit -m x)\nEOF\n", False),
         ):
@@ -6830,8 +6970,88 @@ class CaptureShellParserTest(NativeCaptureFixture):
                     )
                 )
             )
+            self.assertEqual(self.analyze("ls")["kind"], None)
+            self.assertFalse(
+                module.capture_pretool_needs_validation(
+                    dict(
+                        hook_event_name="PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": "ls"},
+                    )
+                )
+            )
         finally:
             module.helper_path_override = original
+
+    def test_hook_allows_ordinary_commands_the_helper_rejects(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in (
+            "bash scripts/test.sh",
+            "source venv/bin/activate && pytest",
+            "command -v jq",
+            "env FOO=1 node x.js",
+            "[ -f x ] && echo y",
+            "echo {a,b}",
+            "for i in {1..3}; do echo $i; done",
+            "find . -name x -exec ls {} \\;",
+            "git show HEAD@{1}",
+            "git stash apply stash@{0}",
+            "gh api repos/{owner}/{repo}/pulls",
+            "npm test &>/dev/null",
+            "cat <<< hi",
+            "x=$((1+1))",
+            "echo $'a'",
+            "arr=(a b)",
+            "foo() { ls; }; foo",
+            "git diff \"$BASE\"",
+            "git add *.py",
+            "git -C ~/repo status",
+            "echo 'open",
+            " && ".join(["true"] * 40),
+        ):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="ordinary-call",
+                tool_input={"command": command},
+            )
+            self.assertEqual(result, {}, repr(command))
+
+    def test_hook_advises_on_uncapturable_commit_forms(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for command in (
+            "git commit -m \"$MSG\"",
+            "git commit -m \"$(cat <<'EOF'\nit's fine\nEOF\n)\"",
+            "git commit -F - <<'EOF'\nit's fine\nEOF\n",
+            "git commit -m x # --amend",
+            "git commit -m x # it's",
+        ):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="advisory-call",
+                tool_input={"command": command},
+            )
+            specific = result["hookSpecificOutput"]
+            self.assertNotIn("permissionDecision", specific, repr(command))
+            self.assertNotIn("updatedInput", specific, repr(command))
+            self.assertIn("not captured", specific["additionalContext"], repr(command))
+
+    def test_hook_denies_commit_text_the_helper_rejects(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="deny-call",
+            tool_input={"command": "git commit -m {a,b}"},
+        )
+        specific = denied["hookSpecificOutput"]
+        self.assertEqual(specific["permissionDecision"], "deny")
+        self.assertIn("BRACE_EXPANSION_UNSUPPORTED", specific["permissionDecisionReason"])
+        self.assertIn("plain git commit", specific["permissionDecisionReason"])
 
     def test_hook_preserves_apostrophe_heredoc_commands(self):
         self.configure()
@@ -6852,7 +7072,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
     def test_hook_denies_ambiguous_heredoc_commands(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
-        for command in ("cat <<'EOF\nbody\n", "cat <<EOF\nbody\n"):
+        for command in ("cat <<'EOF\ngit commit\n", "cat <<EOF\ngit commit\n"):
             denied = self.hook(
                 "PreToolUse",
                 tool_name="Bash",
@@ -6886,7 +7106,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
         )
         self.assertEqual(
             self.parse_shell_words("git commit -m fixture"),
-            shlex.split("git commit -m fixture"),
+            ["git", "commit", "-m", "fixture"],
         )
 
 

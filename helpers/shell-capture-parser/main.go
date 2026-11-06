@@ -123,6 +123,9 @@ type walker struct {
 	// carries none of the extra statement features (background, negation,
 	// redirects, compound nesting) that disqualify the simple shape.
 	allowSimple bool
+	// sawComment disqualifies the simple shape: the parser drops comments,
+	// while the native word list keeps them as arguments.
+	sawComment bool
 	// sawHeredoc records any accepted here-document redirection, used by
 	// the raw-source backslash-newline discrepancy guard.
 	sawHeredoc bool
@@ -363,17 +366,76 @@ func (w *walker) word(word *syntax.Word, depth, nested int) string {
 	if word == nil {
 		return "UNSUPPORTED_SYNTAX"
 	}
+	if hasBraceExpansion(word) {
+		return "BRACE_EXPANSION_UNSUPPORTED"
+	}
 	for _, part := range word.Parts {
-		// Bare literal braces are brace-expansion candidates outside of
-		// quoting; quoted braces stay literal and must not deny.
-		if literal, ok := part.(*syntax.Lit); ok && strings.ContainsAny(literal.Value, "{}") {
-			return "BRACE_EXPANSION_UNSUPPORTED"
-		}
 		if failure := w.part(part, depth, nested); failure != "" {
 			return failure
 		}
 	}
 	return ""
+}
+
+// wordShape joins a word's raw unquoted literals. Each other part stands in
+// as one ordinary byte because it can sit inside an expansion or a pattern.
+func wordShape(word *syntax.Word) string {
+	var text strings.Builder
+	for _, part := range word.Parts {
+		if literal, ok := part.(*syntax.Lit); ok {
+			text.WriteString(literal.Value)
+		} else {
+			text.WriteByte('x')
+		}
+	}
+	return text.String()
+}
+
+// hasBracketGlob reports an unescaped [ with a later unescaped ] anywhere
+// in a word. An unclosed bracket is literal, including the [ builtin.
+func hasBracketGlob(word *syntax.Word) bool {
+	raw := wordShape(word)
+	opened := false
+	for index := 0; index < len(raw); index++ {
+		switch raw[index] {
+		case '\\':
+			index++
+		case '[':
+			opened = true
+		case ']':
+			if opened {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBraceExpansion reports whether a word would brace-expand in Bash.
+// Quoted, escaped, and unexpanding braces such as {}, @{1}, and {owner}
+// stay literal.
+func hasBraceExpansion(word *syntax.Word) bool {
+	raw := wordShape(word)
+	var separators []bool
+	for index := 0; index < len(raw); index++ {
+		switch {
+		case raw[index] == '\\':
+			index++
+		case raw[index] == '{':
+			separators = append(separators, false)
+		case len(separators) == 0:
+		case raw[index] == ',',
+			strings.HasPrefix(raw[index:], ".."):
+			separators[len(separators)-1] = true
+		case raw[index] == '}':
+			last := len(separators) - 1
+			if separators[last] {
+				return true
+			}
+			separators = separators[:last]
+		}
+	}
+	return false
 }
 
 // part sweeps one word part. It returns a failure code on unsupported
@@ -472,11 +534,10 @@ func unquoteDblQuoted(value string) string {
 }
 
 // bareLitExpansive reports whether an unquoted literal part carries
-// spinecase expansion candidates before quote removal: an unescaped glob
-// pattern metacharacter is a pathname expansion candidate, and a leading
-// tilde is a home-expansion candidate at word start. Escaped or quoted
-// characters stay literal; no filesystem or home expansion value is
-// computed.
+// expansion candidates before quote removal: an unescaped * or ? is a
+// pathname expansion candidate, and a tilde at word start or after = or :
+// is a home-expansion candidate. Escaped or quoted characters stay literal;
+// no filesystem or home expansion value is computed.
 func bareLitExpansive(raw string, leading bool) bool {
 	if leading && strings.HasPrefix(raw, "~") {
 		return true
@@ -488,7 +549,11 @@ func bareLitExpansive(raw string, leading bool) bool {
 			index++
 			continue
 		}
-		if raw[index] == '*' || raw[index] == '?' || raw[index] == '[' {
+		if raw[index] == '*' || raw[index] == '?' {
+			return true
+		}
+		if raw[index] == '~' && index > 0 &&
+			(raw[index-1] == '=' || raw[index-1] == ':') {
 			return true
 		}
 	}
@@ -504,7 +569,7 @@ func (w *walker) expandWord(word *syntax.Word) (string, bool, string) {
 		return "", false, "UNSUPPORTED_SYNTAX"
 	}
 	var builder strings.Builder
-	static := true
+	static := !hasBracketGlob(word)
 	for partIndex, part := range word.Parts {
 		switch node := part.(type) {
 		case *syntax.Lit:
@@ -591,12 +656,10 @@ func (w *walker) call(call *syntax.CallExpr, depth, nested int) string {
 		if !static {
 			dynamic = true
 		}
+		if hasBraceExpansion(word) {
+			return "BRACE_EXPANSION_UNSUPPORTED"
+		}
 		for _, part := range word.Parts {
-			// Bare literal braces are brace-expansion candidates; quoted
-			// braces stay literal and must not deny.
-			if literal, ok := part.(*syntax.Lit); ok && strings.ContainsAny(literal.Value, "{}") {
-				return "BRACE_EXPANSION_UNSUPPORTED"
-			}
 			if failure := w.part(part, depth, nested); failure != "" {
 				return failure
 			}
@@ -655,9 +718,6 @@ func (w *walker) call(call *syntax.CallExpr, depth, nested int) string {
 	if interpreterBuiltins[firstName] || interpreterBasenames[firstName] {
 		return "INTERPRETER_EXECUTOR"
 	}
-	if firstName == "git" && dynamic {
-		return "GIT_DYNAMIC_INVOCATION"
-	}
 	if containsCommitWords(wordValues(words)) {
 		banned := false
 		for _, record := range words {
@@ -666,14 +726,37 @@ func (w *walker) call(call *syntax.CallExpr, depth, nested int) string {
 			}
 		}
 		simple := !banned && nested == 0 && w.allowSimple && !dynamic &&
-			len(call.Assigns) == 0 && simpleGitShape(wordValues(words))
+			!w.sawComment && len(call.Assigns) == 0 &&
+			simpleGitShape(wordValues(words))
 		if simple {
 			w.flag("GIT_COMMIT_SIMPLE")
 		} else {
 			w.flag("COMMIT_WORDS_DETECTED")
 		}
+		return ""
+	}
+	if firstName == "git" && gitSubcommandDynamic(words) {
+		return "GIT_DYNAMIC_INVOCATION"
 	}
 	return ""
+}
+
+// gitSubcommandDynamic reports a dynamic word at the Git subcommand
+// position, past static global options and their -C and -c values.
+func gitSubcommandDynamic(words []wordRecord) bool {
+	for index := 1; index < len(words); index++ {
+		record := words[index]
+		if !record.static {
+			return true
+		}
+		if !strings.HasPrefix(record.value, "-") {
+			return false
+		}
+		if record.value == "-C" || record.value == "-c" {
+			index++
+		}
+	}
+	return false
 }
 
 // simpleGitShape mirrors the native shell_commit word prefix: an optional
@@ -749,15 +832,17 @@ func (w *walker) nodeBounds(file *syntax.File) string {
 			depth--
 			return false
 		}
+		if _, comment := node.(*syntax.Comment); comment {
+			w.sawComment = true
+		}
 		depth++
 		w.nodes++
 		if w.nodes > maxNodes || depth > maxDepth {
 			if violation == "" {
 				violation = "AST_LIMIT_EXCEEDED"
 			}
-			// Stopping descent here skips matched child visits but
-			// this node's own f(nil) still arrives, keeping the
-			// counter balanced; the run is rejected regardless.
+			// Walk sends no nil-leave for this node, so the counter
+			// stays high; the latched violation rejects the run.
 			return false
 		}
 		return true
@@ -800,7 +885,7 @@ func analyze(command string) (result, string) {
 		return outcome("deny", "INPUT_TOO_LARGE"), ""
 	}
 	w := &walker{flags: map[string]bool{}, startedAt: time.Now()}
-	parser := syntax.NewParser(syntax.Variant(syntax.LangBash))
+	parser := syntax.NewParser(syntax.Variant(syntax.LangBash), syntax.KeepComments(true))
 	file, err := parser.Parse(strings.NewReader(command), "command")
 	// Parse wall clock: parsing happens first and unpreemptably, so the
 	// whole-process budget includes it and is also rechecked here.
@@ -856,7 +941,7 @@ func emit(value result) {
 }
 
 func main() {
-	// Fail closed: convert any panic (exhausted stack, parser fault,
+	// Fail closed: convert any panic (parser fault,
 	// runtime fault) into the fixed helper-failure code, one line only.
 	defer func() {
 		if recovered := recover(); recovered != nil {

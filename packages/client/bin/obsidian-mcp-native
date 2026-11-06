@@ -15,7 +15,6 @@ import platform as platformlib
 import shlex
 import signal
 import stat
-import stat as statlib
 import subprocess
 import sys
 import tempfile
@@ -1193,18 +1192,18 @@ def helper_artifact_path():
         raise ShellParseError("helper artifact missing from release inventory")
     item = artifact.lstat()
     mode = item.st_mode
-    if entry.get("mode") in (None, "0755"):
-        expected_mode = 0o755
-    else:
-        expected_mode = entry.get("mode")
     if (
-        not (statlib.S_IMODE(mode) == expected_mode and statlib.S_ISREG(mode))
+        not (
+            stat.S_IMODE(mode) == entry.get("mode", 0o755)
+            and stat.S_ISREG(mode)
+        )
         or item.st_nlink != 1
     ):
         raise ShellParseError("helper artifact is not a private plain file")
-    if len(artifact.read_bytes()) != entry.get("size"):
+    contents = artifact.read_bytes()
+    if len(contents) != entry.get("size"):
         raise ShellParseError("helper artifact size does not match inventory")
-    if digest(artifact.read_bytes()) != entry.get("sha256"):
+    if digest(contents) != entry.get("sha256"):
         raise ShellParseError("helper artifact sha256 does not match inventory")
     return artifact
 
@@ -1213,16 +1212,15 @@ def helper_parse(command):
     """Run the pinned parse-only helper with bounded I/O and timeout.
 
     Bugs, timeouts, oversized payloads, and any schema deviation raise
-    ShellParseError so every caller fails closed; nothing from the helper
-    is echoed into executor argv.
+    ShellParseError; nothing from the helper is echoed into executor argv.
     """
     payload = json.dumps(
         {"schema": SCHEMA, "command": command}, sort_keys=True
     ).encode()
     if len(payload) > HELPER_INPUT_BYTES:
         raise ShellParseError("INPUT_TOO_LARGE")
-    artifact = helper_artifact_path()
     try:
+        artifact = helper_artifact_path()
         finished = subprocess.run(
             [str(artifact)],
             input=payload,
@@ -1232,7 +1230,7 @@ def helper_parse(command):
         )
     except subprocess.TimeoutExpired:
         raise ShellParseError("helper parse timed out") from None
-    except OSError:
+    except (OSError, ValueError):
         raise ShellParseError("helper unavailable") from None
     if finished.returncode != 0 or len(finished.stdout) > HELPER_OUTPUT_BYTES:
         raise ShellParseError("helper failed")
@@ -1240,9 +1238,12 @@ def helper_parse(command):
         result = json.loads(finished.stdout)
     except ValueError:
         raise ShellParseError("helper protocol invalid") from None
-    if result.get("schema") != SCHEMA:
-        raise ShellParseError("helper protocol invalid")
-    if result.get("status") not in ("analyze", "deny", "unsupported"):
+    if (
+        not isinstance(result, dict)
+        or result.get("schema") != SCHEMA
+        or result.get("status") not in ("analyze", "deny", "unsupported")
+        or not isinstance(result.get("flags", []), list)
+    ):
         raise ShellParseError("helper protocol invalid")
     return result
 
@@ -1262,17 +1263,33 @@ def simple_git_shape(words):
     return index < len(words) and words[index] == "commit"
 
 
+def has_commit_evidence(command):
+    """Report standalone git and commit tokens, ignoring quote spelling."""
+    text = re.sub(r"\\\r?\n", "", command)
+    text = text.translate(str.maketrans("", "", "'\"\\"))
+    return bool(
+        re.search(r"(?:^|[\s;&|()`])(?:[^\s;&|()`]*/)?git(?=[\s;&|()`]|$)", text)
+        and re.search(r"(?:^|[\s;&|()`])commit(?=[\s;&|()`]|$)", text)
+    )
+
+
 def analyze_shell_command(command):
     """Classify through the helper and return the analyzed word list.
 
     Returns {kind, words} where kind is "simple" (single supported static
     Git commit shape), "detected" (commit words in an unsupported shape),
-    or None (no commit semantics). Deny, unsupported statuses, and helper
-    failures raise ShellParseError.
+    or None (no commit semantics). A helper rejection or failure raises
+    ShellParseError only with commit evidence: this gate protects capture
+    integrity and is not a shell allowlist.
     """
-    result = helper_parse(command)
-    if result["status"] != "analyze":
-        raise ShellParseError(result.get("reason_code", "helper failure"))
+    try:
+        result = helper_parse(command)
+        if result["status"] != "analyze":
+            raise ShellParseError(result.get("reason_code", "helper failure"))
+    except ShellParseError:
+        if has_commit_evidence(command):
+            raise
+        return dict(kind=None, words=[])
     flags = result.get("flags") or []
     if "GIT_COMMIT_SIMPLE" in flags:
         try:
@@ -1297,9 +1314,8 @@ def parse_shell_script(command):
     The helper decides the classification; the recognized-word list only
     ever comes back for the graded static Git commit shape, in which case
     it is computed on the unparsed original with shlex and cross-checked
-    against the helper's word-prefix rules. Every other outcome raises
-    ShellParseError (deny, unsupported, ambiguous, or helper failure) so
-    callers fail closed instead of guessing.
+    against the helper's word-prefix rules. Rejections follow
+    analyze_shell_command.
     """
     analysis = analyze_shell_command(command)
     if analysis["kind"] is None:
@@ -1309,6 +1325,8 @@ def parse_shell_script(command):
             "unsupported commit command; use one git -C <root> commit invocation"
         )
     return analysis["words"]
+
+
 def capture_pretool_needs_validation(event):
     if event.get("hook_event_name") != "PreToolUse":
         return False
@@ -2295,10 +2313,6 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         if words and words[0] == "proxy":
             words.pop(0)
     if not words or words[0] not in ("git", "/usr/bin/git"):
-        if has_commit_words(words):
-            raise NativeError(
-                "unsupported commit command; use one git -C <root> commit invocation"
-            )
         return None
     words.pop(0)
     root = Path(cwd).resolve()
@@ -3200,9 +3214,9 @@ def engine_hook(home, profile, event):
                         "hookEventName": name,
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            "Obsidian capture could not safely analyze this "
-                            "Bash command; resolve the shell syntax before "
-                            "running it: " + str(error)
+                            "Obsidian capture could not analyze this "
+                            "commit-related Bash command; use one plain "
+                            "git commit invocation: " + str(error)
                         ),
                     }
                 }
