@@ -6,6 +6,8 @@ on:
     branches: [master]
     paths:
       - 'packages/client/**'
+      - 'helpers/**'
+      - 'scripts/build-shell-capture-parser.py'
       - 'scripts/pack-obsidian-mcp-client.py'
       - 'tests/obsidian-mcp-*'
       - 'integrations/**'
@@ -17,6 +19,30 @@ permissions:
   contents: read
 
 jobs:
+  shell-capture-helper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Verify pinned helper dependency
+        working-directory: helpers/shell-capture-parser
+        run: |
+          go mod download
+          go mod verify
+      - name: Run helper tests
+        working-directory: helpers/shell-capture-parser
+        run: go test ./...
+      - name: Run helper pack suite with rebuild comparison
+        run: bash tests/obsidian-mcp-helper-pack.test.sh
+
   portable-client:
     runs-on: ubuntu-latest
     timeout-minutes: 20

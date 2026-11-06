@@ -73,12 +73,11 @@ class HelperVendorStateTest(unittest.TestCase):
         command = json.dumps(
             {"schema": "shell-capture-parser@1", "command": "git commit -m x"}
         )
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+        machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
         native = subprocess.run(
-            [
-                str(VENDOR / "shell-capture-parser-darwin-arm64")
-                if Path(VENDOR / "shell-capture-parser-darwin-arm64").exists()
-                else str(VENDOR / "shell-capture-parser-darwin-amd64")
-            ],
+            [str(VENDOR / f"shell-capture-parser-{system}-{machine}")],
             input=command,
             capture_output=True,
             text=True,
@@ -113,6 +112,11 @@ class HelperBuildDeterminismTest(unittest.TestCase):
                         (first / "out" / artifact).read_bytes(),
                         (second / "out" / artifact).read_bytes(),
                         artifact,
+                    )
+                    self.assertEqual(
+                        (first / "out" / artifact).read_bytes(),
+                        (VENDOR / artifact).read_bytes(),
+                        f"vendored {artifact} is not the source's rebuild",
                     )
                     self.assertTrue(stat.S_IMODE(
                         (first / "out" / artifact).stat().st_mode
@@ -200,6 +204,59 @@ class PackerHelperValidationTest(unittest.TestCase):
         ).encode()
         with self.assertRaisesRegex(ValueError, "binary magic"):
             packer.validate_helper_vendor(files)
+
+    def forged_provenance(self, files, change):
+        key = "vendor/shell-capture-parser/BUILD-PROVENANCE.json"
+        provenance = json.loads(files[key])
+        change(provenance)
+        files[key] = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
+
+    def test_rejects_wrong_architecture_in_a_platform_slot(self):
+        packer = self.load_packer()
+        files = self.files_from_vendor(packer)
+        path = "vendor/shell-capture-parser/shell-capture-parser-linux-arm64"
+        contents = files["vendor/shell-capture-parser/shell-capture-parser-linux-amd64"]
+        files[path] = contents
+
+        def change(provenance):
+            for entry in provenance["build"]["platforms"]:
+                if entry["path"] == "shell-capture-parser-linux-arm64":
+                    entry["sha256"] = hashlib.sha256(contents).hexdigest()
+                    entry["size"] = len(contents)
+
+        self.forged_provenance(files, change)
+        with self.assertRaisesRegex(ValueError, "wrong CPU type"):
+            packer.validate_helper_vendor(files)
+
+    def test_rejects_mislabeled_platform_entry(self):
+        packer = self.load_packer()
+        files = self.files_from_vendor(packer)
+
+        def change(provenance):
+            provenance["build"]["platforms"][0]["goarch"] = "arm64"
+
+        self.forged_provenance(files, change)
+        with self.assertRaisesRegex(ValueError, "mislabels platform"):
+            packer.validate_helper_vendor(files)
+
+    def test_rejects_forged_toolchain_and_go_sum(self):
+        packer = self.load_packer()
+        for field, value, message in (
+            ("toolchain", {"goVersion": "go1.26.0"}, "does not pin go"),
+            (
+                "module",
+                {
+                    "name": packer.HELPER_MODULE,
+                    "version": packer.HELPER_MODULE_VERSION,
+                    "goSum": "forged",
+                },
+                "goSum does not match",
+            ),
+        ):
+            files = self.files_from_vendor(packer)
+            self.forged_provenance(files, lambda doc: doc.update({field: value}))
+            with self.assertRaisesRegex(ValueError, message):
+                packer.validate_helper_vendor(files)
 
     def test_rejects_symlink_sources(self):
         packer = self.load_packer()

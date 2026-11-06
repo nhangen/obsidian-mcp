@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "packages/client"
 CATALOG = ROOT / "packages/client/catalog.json"
-CONTRACT = ROOT / "packages/client/contract.json"
+CONTRACT = ROOT / "contract.json"
 EXIT_FAILURE = 64
 FILES = (
     "README.md",
@@ -69,6 +69,13 @@ HELPER_PLATFORMS = (
 )
 MACHO_MAGIC = b"\xcf\xfa\xed\xfe"
 ELF_MAGIC = b"\x7fELF"
+HELPER_GO_VERSION = "go1.27.3"
+HELPER_CPU_FIELDS = {
+    ("darwin", "amd64"): (4, 4, 0x01000007),
+    ("darwin", "arm64"): (4, 4, 0x0100000C),
+    ("linux", "amd64"): (18, 2, 62),
+    ("linux", "arm64"): (18, 2, 183),
+}
 
 
 def fail(message: str) -> None:
@@ -132,6 +139,11 @@ def validate_helper_vendor(files: dict[str, bytes]) -> dict:
             f"helper provenance does not pin {HELPER_MODULE} "
             f"{HELPER_MODULE_VERSION}"
         )
+    if provenance.get("toolchain", {}).get("goVersion") != HELPER_GO_VERSION:
+        fail(f"helper provenance does not pin {HELPER_GO_VERSION}")
+    go_sum = regular_file_bytes(HELPER_SOURCE / "go.sum", "helper go.sum")
+    if module.get("goSum") not in go_sum.decode().splitlines():
+        fail("helper provenance goSum does not match go.sum")
     source = provenance.get("source")
     if not isinstance(source, dict) or set(source) != set(HELPER_SOURCE_FILES):
         fail("helper provenance does not carry the pinned helper sources")
@@ -165,6 +177,10 @@ def validate_helper_vendor(files: dict[str, bytes]) -> dict:
             or not isinstance(artifact.get("goarch"), str)
         ):
             fail("helper provenance carries a malformed platform entry")
+        if artifact["path"] != (
+            f"shell-capture-parser-{artifact['goos']}-{artifact['goarch']}"
+        ):
+            fail(f"helper provenance mislabels platform: {artifact['path']}")
         listed[f"{HELPER_VENDOR}/{artifact['path']}"] = artifact
     expected_paths = {
         f"{HELPER_VENDOR}/shell-capture-parser-{goos}-{goarch}"
@@ -186,6 +202,11 @@ def validate_helper_vendor(files: dict[str, bytes]) -> dict:
                 f"helper artifact does not carry the "
                 f"{artifact['goos']} binary magic: {platform_path}"
             )
+        offset, width, cpu = HELPER_CPU_FIELDS[
+            (artifact["goos"], artifact["goarch"])
+        ]
+        if int.from_bytes(contents[offset : offset + width], "little") != cpu:
+            fail(f"helper artifact has the wrong CPU type: {platform_path}")
     licenses = {
         f"{HELPER_VENDOR}/{item.get('path')}": item
         for item in provenance.get("licenses", [])
