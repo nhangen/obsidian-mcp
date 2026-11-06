@@ -34,6 +34,9 @@ LIMIT = 262144
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
 REFLOG_WINDOW = 65536
+WATCH_UNAVAILABLE = (
+    "Obsidian commit history check unavailable; commits may be uncaptured."
+)
 NON_COMMIT_REFLOG = (
     b"am",
     b"bisect",
@@ -2406,6 +2409,9 @@ def producer_event(root, before):
     return event, consumer["run_producer"](BUNDLE, event, sys.executable)
 
 
+WATCH_ERRORS = (NativeError, OSError, subprocess.SubprocessError)
+
+
 def git_position(root):
     return dict(
         head=git(root, "rev-parse", "--verify", "HEAD", allow_failure=True).strip(),
@@ -2442,21 +2448,51 @@ def reflog_entries(root, before):
     return entries
 
 
+def session_records_commit(home, owner, commit):
+    if HEX.fullmatch(owner) is None:
+        return False
+    try:
+        state = json.loads(private_read(home / "capture-state" / (owner + ".json")))
+        return any(
+            pending["event"].get("commit") == commit
+            for pending in state["commits"].values()
+        ) or any(
+            (snapshot.get("captured") or [{}])[0].get("commit") == commit
+            for snapshot in state["snapshots"].values()
+        )
+    except (NativeError, OSError, ValueError, LookupError, TypeError, AttributeError):
+        return False
+
+
 def claim_commit(home, session, commit):
-    """Give one commit a single owning session across a shared checkout."""
+    """Give one commit a single owning session across a shared checkout.
+
+    A claim whose owner does not record the commit transfers, because a crash
+    can orphan it. Two captures of one commit are harmless: skip_if_hash
+    keeps the first, while a suppressed commit would be lost.
+    """
     directory = home / "commit-claims"
     directory.mkdir(mode=0o700, exist_ok=True)
     private_directory(directory)
     target = directory / commit
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".claim-")
     try:
-        descriptor = os.open(
-            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-        )
-    except FileExistsError:
-        return target.read_text() == session
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(session)
-    return True
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(session)
+        try:
+            os.link(temporary, target)
+            return True
+        except FileExistsError:
+            pass
+        owner = target.read_text()
+        if owner == session:
+            return True
+        if session_records_commit(home, owner, commit):
+            return False
+        os.replace(temporary, target)
+        return True
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def record_watch_result(home, session, state, path):
@@ -2510,7 +2546,7 @@ def watch_git_history(home, session, state, path, profile, routes):
                     unproven = True
                 elif commit not in accounted and claim_commit(home, session, commit):
                     fresh.append(commit)
-            elif (reason.split(None, 1) or [b""])[0].rstrip(b":") not in (
+            elif (reason.split(None, 1) or [b""])[0].rstrip(b":").lower() not in (
                 NON_COMMIT_REFLOG
             ):
                 unproven = True
@@ -3221,6 +3257,13 @@ def engine_hook(home, profile, event):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if state and attached_profile(profile) and drain_reasons(state):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
+                if state and mode == "git" and not state.get("stop_watched"):
+                    try:
+                        watch_git_history(home, session, state, path, profile, routes)
+                    except WATCH_ERRORS:
+                        pass
+                    if has_pending_capture(state):
+                        raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 state = initial_session_state(
                     profile,
                     session,
@@ -3234,7 +3277,7 @@ def engine_hook(home, profile, event):
                 if mode == "git":
                     try:
                         state["git_watch"] = git_position(Path(profile["project"]))
-                    except (NativeError, OSError):
+                    except WATCH_ERRORS:
                         pass
             atomic_write(path, encode(state))
             return context(
@@ -3257,18 +3300,15 @@ def engine_hook(home, profile, event):
             if mode == "git":
                 try:
                     watch_git_history(home, session, state, path, profile, routes)
-                except (NativeError, OSError):
+                    state["stop_watched"] = True
+                    atomic_write(path, encode(state))
+                except WATCH_ERRORS:
                     watch_failed = True
             guidance = capture_guidance(home, state, profile["host"], routes)
             if not guidance:
-                return (
-                    dict(
-                        systemMessage="Obsidian commit history check unavailable; "
-                        "commits from this turn may be uncaptured."
-                    )
-                    if watch_failed
-                    else {}
-                )
+                return dict(systemMessage=WATCH_UNAVAILABLE) if watch_failed else {}
+            if watch_failed:
+                guidance += "\n" + WATCH_UNAVAILABLE
             if event.get("stop_hook_active") is not False or state.get(
                 "continuation_requested"
             ):
@@ -3328,13 +3368,16 @@ def engine_hook(home, profile, event):
             None,
         )
         watched = None
+        watch_failed = False
+        if state.pop("stop_watched", None):
+            atomic_write(path, encode(state))
         if not wrapped_snapshot:
             try:
                 watched = watch_git_history(
                     home, session, state, path, profile, routes
                 )
-            except (NativeError, OSError):
-                pass
+            except WATCH_ERRORS:
+                watch_failed = True
         if name == "PostToolUse" and wrapped_snapshot:
             fingerprint, before = wrapped_snapshot
             if event.get("host_tool_failed"):
@@ -3437,6 +3480,8 @@ def engine_hook(home, profile, event):
                 capture_guidance(home, state, profile["host"], routes) + watched,
             )
         if root is None:
+            if name == "PostToolUse" and watch_failed:
+                return context(name, WATCH_UNAVAILABLE)
             return {}
         fingerprint = digest(encode([call, command]))
         if name == "PreToolUse":
@@ -4130,6 +4175,14 @@ def dispatch_command(args, extra, locks):
                         status="not_captured",
                     )
                 )
+                if history is state.get("watch_resolutions"):
+                    descriptor = os.open(
+                        home / "watch-resolutions.jsonl",
+                        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(encode(history[-1]) + b"\n")
                 atomic_write(path, encode(state))
                 note = settle_gate(home, args.session, state)
             result = {"status": "not_captured", "snapshot": args.snapshot}

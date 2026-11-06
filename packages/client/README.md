@@ -674,7 +674,10 @@ Stop:
 - One new commit at HEAD becomes a pending capture, with the same gates as a
   wrapped commit. A commit made outside the agent during the turn, such as one
   from your terminal, counts too. In a checkout shared by sessions, the first
-  session to observe a commit owns it, which may not be the session that made it.
+  session to observe a commit owns it, which may not be the session that made
+  it. A claim transfers when its owner has no record of the commit, so a crashed
+  session can't suppress a capture. A rare duplicate capture stays harmless,
+  because `skip_if_hash` keeps the first.
 - Reflog entries with a known non-commit reason need nothing: `am`, `bisect`,
   `branch`, `checkout`, `cherry-pick`, `clone`, `merge`, `pull`, `rebase`,
   `reset`, and `revert`. Those operations can create commits, but they aren't
@@ -682,17 +685,23 @@ Stop:
   captured.
 - Anything it can't prove keeps an unresolved snapshot: two commits in one
   window, a commit HEAD has already left, a rewritten reflog, plumbing, or a
-  custom reflog reason. The snapshot denies commits the hook can recognize until
-  you inspect history and run `resolve-snapshot`. A commit hidden from the parser
-  during that time is captured after you resolve it.
+  reflog reason outside that list. The snapshot denies commits the hook can
+  recognize until you inspect history and run `resolve-snapshot`, which appends
+  the record to `watch-resolutions.jsonl` in the capture home. A commit hidden
+  from the parser during that time is captured after you resolve it.
 
 The watch has these limits:
 
 - It doesn't cover commits in another repository or worktree.
-- It stops at the turn boundary, so a background command that finishes after
-  Stop isn't observed, and neither is a terminal commit between turns.
+- It stops at a completed Stop, so a background command that finishes afterward
+  isn't observed, and neither is a terminal commit between turns. A turn whose
+  Stop never ran is reconciled at the next prompt.
 - With `core.logAllRefUpdates` off, a commit that HEAD has already left leaves
   no evidence.
+- A reflog reason is self-reported, so `GIT_REFLOG_ACTION` set to a listed word
+  hides a commit from the watch.
+- If the check fails, the hook reports `history check unavailable` and the
+  command still runs.
 
 Claude Code ignores
 `StopFailure` output, so that event returns nothing and capture state is kept;

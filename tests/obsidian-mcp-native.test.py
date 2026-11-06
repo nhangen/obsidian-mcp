@@ -7324,16 +7324,14 @@ class CaptureShellParserTest(NativeCaptureFixture):
         state = self.watched_state()
         state["disposition"] = "saved"
         path.write_text(json.dumps(state))
-        next_turn = self.cli(
-            "hook",
-            "--home",
-            str(self.home),
-            payload=dict(
-                self.event("UserPromptSubmit", prompt="more"), turn_id="turn-2"
-            ),
-        )
+        next_turn = self.next_turn()
         self.assertEqual(next_turn.returncode, 0, next_turn.stderr)
         self.assertEqual(self.watched_state()["turn"], "turn-2")
+        [record] = (
+            (self.home / "watch-resolutions.jsonl").read_text().splitlines()
+        )
+        self.assertEqual(json.loads(record)["snapshot"], snapshot)
+        self.assertEqual(json.loads(record)["status"], "not_captured")
 
     def test_reflog_watch_gives_a_commit_one_owning_session(self):
         self.configure()
@@ -7408,10 +7406,101 @@ class CaptureShellParserTest(NativeCaptureFixture):
         (self.project / ".git/logs/HEAD").mkdir()
         before, after = self.watched_bash("ls")
         self.assertEqual(before, {})
-        self.assertEqual(after, {})
+        self.assertIn(
+            "history check unavailable",
+            after["hookSpecificOutput"]["additionalContext"],
+        )
         stopped = self.hook("Stop", stop_hook_active=False)
         self.assertEqual(stopped["decision"], "block")
         self.assertIn("obsidian_keeper_save", stopped["reason"])
+        self.assertIn("history check unavailable", stopped["reason"])
+
+    def test_reflog_watch_transfers_an_orphaned_or_empty_claim(self):
+        for owner in ("0" * 64, ""):
+            with self.subTest(owner=owner):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.empty_commit("one")
+                claims = self.home / "commit-claims"
+                claims.mkdir(mode=0o700)
+                (claims / self.head()).write_text(owner)
+                self.watched_bash("ls")
+                state = self.watched_state()
+                self.assertEqual(
+                    [p["event"]["commit"] for p in state["commits"].values()],
+                    [self.head()],
+                )
+                self.assertEqual((claims / self.head()).read_text(), state["session"])
+
+    def test_reflog_watch_accepts_a_branch_rename(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash(
+            "git branch -m renamed", lambda: self.git("branch", "-m", "renamed")
+        )
+        state = self.watched_state()
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+
+    def next_turn(self):
+        return self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=dict(
+                self.event("UserPromptSubmit", prompt="more"), turn_id="turn-2"
+            ),
+        )
+
+    def test_turn_without_a_completed_stop_reconciles_the_reflog(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.empty_commit("no stop ran")
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_terminal_commit_after_a_completed_stop_is_not_captured(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.empty_commit("terminal between turns")
+        self.next_turn()
+        state = self.watched_state()
+        self.assertEqual(state["turn"], "turn-2")
+        self.assertEqual(state["commits"], {})
+
+    def test_bash_after_stop_rearms_reconciliation(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.hook("Stop", stop_hook_active=False)
+        self.watched_bash("ls")
+        self.assertNotIn("stop_watched", self.watched_state())
 
     def test_reflog_watch_failure_at_stop_is_reported_when_nothing_else_is(self):
         self.configure()
