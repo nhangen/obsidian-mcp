@@ -1767,8 +1767,8 @@ class NativeCaptureTest(NativeCaptureFixture):
 
     def test_takeover_carries_live_snapshots(self):
         self.configure()
-        self.hook("UserPromptSubmit", prompt="session A")
         self.git("commit", "--allow-empty", "-m", "base")
+        self.hook("UserPromptSubmit", prompt="session A")
         path, snapshot = self.live_snapshot()
         head = self.git("rev-parse", "HEAD").stdout.strip()
         second_key = self.session_key("session-2")
@@ -7214,13 +7214,218 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.watched_bash("ls")
         self.assertEqual(self.watched_state()["commits"], {})
 
-    def test_reflog_watch_ignores_commits_before_the_first_bash_call(self):
+    def test_reflog_watch_captures_a_commit_with_no_bash_call_in_the_turn(self):
         self.configure()
         self.empty_commit("base")
         self.hook("UserPromptSubmit", prompt="work")
+        self.empty_commit("from a subagent script")
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertEqual(
+            [p["event"]["commit"] for p in self.watched_state()["commits"].values()],
+            [self.head()],
+        )
+
+    def test_reflog_watch_ignores_commits_before_the_turn(self):
+        self.configure()
+        self.empty_commit("base")
         self.empty_commit("terminal")
+        self.hook("UserPromptSubmit", prompt="work")
         self.watched_bash("ls")
         self.assertEqual(self.watched_state()["commits"], {})
+
+    def test_reflog_watch_retains_unknown_reflog_reasons(self):
+        def custom_reason():
+            subprocess.run(
+                ["git", "-C", str(self.project), "commit", "--allow-empty", "-m", "x"],
+                env=dict(self.environment, GIT_REFLOG_ACTION="custom"),
+                check=True,
+                capture_output=True,
+            )
+
+        def plumbing():
+            tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+            made = self.git("commit-tree", tree, "-p", "HEAD", "-m", "x").stdout.strip()
+            self.git("update-ref", "HEAD", made)
+
+        def unchanged_head_rewritten_log():
+            self.empty_commit("one")
+            self.git("reset", "--hard", "HEAD~1")
+            (self.project / ".git/logs/HEAD").write_bytes(b"")
+
+        for change in (custom_reason, plumbing, unchanged_head_rewritten_log):
+            with self.subTest(change.__name__):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.watched_bash("make release", change)
+                state = self.watched_state()
+                self.assertEqual(state["commits"], {})
+                [record] = state["snapshots"].values()
+                self.assertEqual(record["capture_error"], "COMMIT_AMBIGUOUS")
+
+    def test_reflog_watch_captures_a_commit_made_during_a_retained_snapshot(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        snapshot = next(iter(self.watched_state()["snapshots"]))
+        self.watched_bash("make more", lambda: self.empty_commit("three"))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.watched_bash("ls")
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_resolved_watch_snapshot_does_not_block_the_next_turn(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        self.watched_bash("make release", two_commits)
+        path = next(iter(self.state_paths()))
+        snapshot = next(iter(self.watched_state()["snapshots"]))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        state = self.watched_state()
+        state["disposition"] = "saved"
+        path.write_text(json.dumps(state))
+        next_turn = self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=dict(
+                self.event("UserPromptSubmit", prompt="more"), turn_id="turn-2"
+            ),
+        )
+        self.assertEqual(next_turn.returncode, 0, next_turn.stderr)
+        self.assertEqual(self.watched_state()["turn"], "turn-2")
+
+    def test_reflog_watch_gives_a_commit_one_owning_session(self):
+        self.configure()
+        self.empty_commit("base")
+
+        def session_hook(session, name, **extra):
+            result = self.cli(
+                "hook",
+                "--home",
+                str(self.home),
+                payload=dict(self.event(name, **extra), session_id=session),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout or "{}")
+
+        session_hook("session-1", "UserPromptSubmit", prompt="work")
+        session_hook("session-2", "UserPromptSubmit", prompt="work")
+        self.empty_commit("one")
+        args = dict(
+            tool_name="Bash", tool_use_id="owner-call", tool_input={"command": "ls"}
+        )
+        session_hook("session-1", "PreToolUse", **args)
+        output = session_hook("session-2", "PreToolUse", **args)
+        self.assertEqual(output, {})
+        posted = session_hook(
+            "session-2", "PostToolUse", **args, tool_response={"exit_code": 0}
+        )
+        self.assertNotIn("takeover", json.dumps(posted))
+        pending = [
+            state["commits"]
+            for state in (json.loads(p.read_text()) for p in self.state_paths())
+        ]
+        self.assertEqual(sorted(len(commits) for commits in pending), [0, 1])
+
+    def test_reflog_watch_keeps_takeover_text_from_a_second_session(self):
+        self.configure()
+        self.empty_commit("base")
+
+        def session_hook(session, name, **extra):
+            result = self.cli(
+                "hook",
+                "--home",
+                str(self.home),
+                payload=dict(self.event(name, **extra), session_id=session),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout or "{}")
+
+        args = dict(
+            tool_name="Bash", tool_use_id="gate-call", tool_input={"command": "ls"}
+        )
+        session_hook("session-1", "UserPromptSubmit", prompt="work")
+        session_hook("session-2", "UserPromptSubmit", prompt="work")
+        self.empty_commit("first")
+        session_hook("session-1", "PreToolUse", **args)
+        session_hook("session-2", "PreToolUse", **args)
+        self.empty_commit("second")
+        posted = session_hook(
+            "session-2", "PostToolUse", **args, tool_response={"exit_code": 0}
+        )
+        self.assertIn(
+            "pending commit before another commit",
+            posted["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("takeover", json.dumps(posted))
+
+    def test_reflog_watch_failure_leaves_ordinary_bash_and_stop_working(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        before, after = self.watched_bash("ls")
+        self.assertEqual(before, {})
+        self.assertEqual(after, {})
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("obsidian_keeper_save", stopped["reason"])
+
+    def test_reflog_watch_failure_at_stop_is_reported_when_nothing_else_is(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertIn("history check unavailable", stopped["systemMessage"])
 
     def test_hook_denies_commit_text_the_helper_rejects(self):
         self.configure()

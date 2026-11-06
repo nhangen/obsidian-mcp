@@ -34,6 +34,20 @@ LIMIT = 262144
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
 REFLOG_WINDOW = 65536
+NON_COMMIT_REFLOG = (
+    b"am",
+    b"bisect",
+    b"branch",
+    b"checkout",
+    b"cherry-pick",
+    b"clone",
+    b"initial",
+    b"merge",
+    b"pull",
+    b"rebase",
+    b"reset",
+    b"revert",
+)
 CLAUDE_PRODUCER_TIMEOUT = 3.0
 COMMIT_CONTEXT_TEMPLATE = (
     "<replace with the goal and implemented change>",
@@ -1469,7 +1483,8 @@ def validate_initial_state(profile, session, state):
         not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
         or datetime.date.fromisoformat(date).isoformat() != date
-        or state != initial_session_state(profile, session, turn, transcript, date=date)
+        or {key: value for key, value in state.items() if key != "git_watch"}
+        != initial_session_state(profile, session, turn, transcript, date=date)
     ):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
 
@@ -2427,6 +2442,33 @@ def reflog_entries(root, before):
     return entries
 
 
+def claim_commit(home, session, commit):
+    """Give one commit a single owning session across a shared checkout."""
+    directory = home / "commit-claims"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    target = directory / commit
+    try:
+        descriptor = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+    except FileExistsError:
+        return target.read_text() == session
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(session)
+    return True
+
+
+def record_watch_result(home, session, state, path):
+    """Persist first: a busy or foreign gate must not lose the observation."""
+    atomic_write(path, encode(state))
+    try:
+        claim_gate(home, session, state)
+    except (NativeError, OSError):
+        pass
+    return ""
+
+
 def accounted_commits(state):
     commits = {pending["event"].get("commit") for pending in state["commits"].values()}
     commits.update(
@@ -2451,26 +2493,33 @@ def watch_git_history(home, session, state, path, profile, routes):
     before = state.get("git_watch")
     if before == current:
         return None
-    state["git_watch"] = current
     if before is None:
+        state["git_watch"] = current
         atomic_write(path, encode(state))
         return None
     entries = reflog_entries(root, before)
-    if entries is None or (not entries and before["head"] != current["head"]):
-        fresh = None if before["head"] != current["head"] else []
-    else:
+    unproven = entries is None or (
+        not entries and before["head"] != current["head"]
+    )
+    fresh = []
+    if not unproven:
         accounted = accounted_commits(state)
-        fresh = [
-            commit
-            for commit, reason in entries
-            if reason.startswith((b"commit: ", b"commit ("))
-            and commit not in accounted
-        ]
-    if fresh == []:
+        for commit, reason in entries:
+            if reason.startswith((b"commit: ", b"commit (")):
+                if HASH.fullmatch(commit) is None:
+                    unproven = True
+                elif commit not in accounted and claim_commit(home, session, commit):
+                    fresh.append(commit)
+            elif (reason.split(None, 1) or [b""])[0].rstrip(b":") not in (
+                NON_COMMIT_REFLOG
+            ):
+                unproven = True
+    state["git_watch"] = current
+    if not unproven and not fresh:
         atomic_write(path, encode(state))
         return None
     failure = "COMMIT_AMBIGUOUS"
-    if fresh == [current["head"]]:
+    if not unproven and fresh == [current["head"]]:
         event = dict(
             schemaVersion=1,
             event="git.commit",
@@ -2487,7 +2536,7 @@ def watch_git_history(home, session, state, path, profile, routes):
                 status="pending",
                 capture_path=consumer["capture_target"](metadata, routes),
             )
-            return persist_with_gate(home, session, state, path)
+            return record_watch_result(home, session, state, path)
         except Exception as error:
             failure = type(error).__name__
     fingerprint = digest(encode(["git-watch", before, current]))
@@ -2501,7 +2550,7 @@ def watch_git_history(home, session, state, path, profile, routes):
         exit_code=0,
         capture_error=failure,
     )
-    return persist_with_gate(home, session, state, path)
+    return record_watch_result(home, session, state, path)
 
 
 def session_plan(profile, session, turn, *, date=None):
@@ -3182,6 +3231,11 @@ def engine_hook(home, profile, event):
                         else None
                     ),
                 )
+                if mode == "git":
+                    try:
+                        state["git_watch"] = git_position(Path(profile["project"]))
+                    except (NativeError, OSError):
+                        pass
             atomic_write(path, encode(state))
             return context(
                 name,
@@ -3199,11 +3253,22 @@ def engine_hook(home, profile, event):
         if state is None:
             raise NativeError("PROMPT_EVENT_REQUIRED")
         if name == "Stop":
+            watch_failed = False
             if mode == "git":
-                watch_git_history(home, session, state, path, profile, routes)
+                try:
+                    watch_git_history(home, session, state, path, profile, routes)
+                except (NativeError, OSError):
+                    watch_failed = True
             guidance = capture_guidance(home, state, profile["host"], routes)
             if not guidance:
-                return {}
+                return (
+                    dict(
+                        systemMessage="Obsidian commit history check unavailable; "
+                        "commits from this turn may be uncaptured."
+                    )
+                    if watch_failed
+                    else {}
+                )
             if event.get("stop_hook_active") is not False or state.get(
                 "continuation_requested"
             ):
@@ -3262,11 +3327,14 @@ def engine_hook(home, profile, event):
             ),
             None,
         )
-        watched = (
-            None
-            if wrapped_snapshot
-            else watch_git_history(home, session, state, path, profile, routes)
-        )
+        watched = None
+        if not wrapped_snapshot:
+            try:
+                watched = watch_git_history(
+                    home, session, state, path, profile, routes
+                )
+            except (NativeError, OSError):
+                pass
         if name == "PostToolUse" and wrapped_snapshot:
             fingerprint, before = wrapped_snapshot
             if event.get("host_tool_failed"):
@@ -3596,6 +3664,8 @@ def execute_commit(home, profile, args, parent_locks=None):
                 )
             before["captured"] = observed
             before["effects_verified"] = True
+            if observed is not None:
+                claim_commit(home, args.session, observed[0]["commit"])
         except Exception as error:
             before["capture_error"] = type(error).__name__
             atomic_write(path, encode(state))
@@ -4035,7 +4105,12 @@ def dispatch_command(args, extra, locks):
             with state_lock(home, args.session) as (state, path):
                 if not state or args.snapshot not in state["snapshots"]:
                     raise NativeError("SNAPSHOT_UNAVAILABLE")
-                history = state.setdefault("snapshot_resolutions", [])
+                history = state.setdefault(
+                    "watch_resolutions"
+                    if state["snapshots"][args.snapshot].get("call") == ""
+                    else "snapshot_resolutions",
+                    [],
+                )
                 if len(history) >= MAX_PENDING:
                     raise NativeError("SNAPSHOT_RESOLUTION_LIMIT")
                 snapshot = state["snapshots"].pop(args.snapshot)

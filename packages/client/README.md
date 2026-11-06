@@ -668,22 +668,31 @@ except the wrapped one. The hook handles each command in one of these ways:
 - It allows any other command, including syntax the helper rejects. The reflog
   watch still applies.
 
-The watch starts at the first Bash call of a turn and checks the reflog at every
-later Bash call and at Stop:
+The watch starts at the prompt and checks the reflog at every Bash call and at
+Stop:
 
 - One new commit at HEAD becomes a pending capture, with the same gates as a
   wrapped commit. A commit made outside the agent during the turn, such as one
-  from your terminal, counts too.
-- HEAD movement without a commit, such as a switch or reset, needs nothing.
-- Anything it can't prove keeps an unresolved snapshot and blocks further
-  commits until you inspect history and run `resolve-snapshot`. Examples are two
-  commits in one window, a commit HEAD has already left, and a rewritten reflog.
+  from your terminal, counts too. In a checkout shared by sessions, the first
+  session to observe a commit owns it, which may not be the session that made it.
+- Reflog entries with a known non-commit reason need nothing: `am`, `bisect`,
+  `branch`, `checkout`, `cherry-pick`, `clone`, `merge`, `pull`, `rebase`,
+  `reset`, and `revert`. Those operations can create commits, but they aren't
+  `git commit` events. A `git commit` that concludes a merge or cherry-pick is
+  captured.
+- Anything it can't prove keeps an unresolved snapshot: two commits in one
+  window, a commit HEAD has already left, a rewritten reflog, plumbing, or a
+  custom reflog reason. The snapshot denies commits the hook can recognize until
+  you inspect history and run `resolve-snapshot`. A commit hidden from the parser
+  during that time is captured after you resolve it.
 
-The watch covers `git commit` in this project's checkout. It doesn't cover
-commits in another repository or worktree, or a background command that finishes
-after the turn stops. Its `commit` reflog test also excludes `git merge`,
-`git cherry-pick`, `git revert`, and `git rebase`, which were never commit-capture
-events.
+The watch has these limits:
+
+- It doesn't cover commits in another repository or worktree.
+- It stops at the turn boundary, so a background command that finishes after
+  Stop isn't observed, and neither is a terminal commit between turns.
+- With `core.logAllRefUpdates` off, a commit that HEAD has already left leaves
+  no evidence.
 
 Claude Code ignores
 `StopFailure` output, so that event returns nothing and capture state is kept;
