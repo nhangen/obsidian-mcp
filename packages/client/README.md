@@ -652,19 +652,38 @@ paused; observed commits can make their first canonical daily append directly.
 Pending-commit gates and executor evidence still apply. Unrelated Bash commands
 proceed and Stop reports a non-blocking `systemMessage`.
 
-Bash classification comes from the bundled parse-only
-`shell-capture-parser` helper. It detects commits for capture; it isn't a shell
-sandbox, because a commit inside `timeout 5 sh -c '…'` or `python3 -c` passes
-unnoticed. The hook handles each command in one of these ways:
+Commit capture has two layers: the bundled parse-only `shell-capture-parser`
+helper classifies each Bash command before it runs, and the project's HEAD
+reflog proves what happened afterward. The parser can't see a commit inside a
+script, `eval`, or `python3 -c`, so the reflog is the evidence for every shape
+except the wrapped one. The hook handles each command in one of these ways:
 
 - It wraps one plain static `git commit` invocation for capture.
-- It adds a `not captured` advisory and lets the command run when commit words
-  appear in another shape, such as `-m "$MSG"`, a heredoc message, `-F -`, a
-  compound command, or a trailing comment.
+- It lets the command run with a `not wrapped` note when commit words appear in
+  another shape, such as `-m "$MSG"`, a heredoc message, `-F -`, a compound
+  command, or a trailing comment. The reflog watch then captures the commit.
 - It denies the command when the text has standalone `git` and `commit` tokens
   and the helper rejects the syntax or is unavailable. A heredoc with a
   backslash-newline is one rejected shape.
-- It allows any other command, including syntax the helper rejects.
+- It allows any other command, including syntax the helper rejects. The reflog
+  watch still applies.
+
+The watch starts at the first Bash call of a turn and checks the reflog at every
+later Bash call and at Stop:
+
+- One new commit at HEAD becomes a pending capture, with the same gates as a
+  wrapped commit. A commit made outside the agent during the turn, such as one
+  from your terminal, counts too.
+- HEAD movement without a commit, such as a switch or reset, needs nothing.
+- Anything it can't prove keeps an unresolved snapshot and blocks further
+  commits until you inspect history and run `resolve-snapshot`. Examples are two
+  commits in one window, a commit HEAD has already left, and a rewritten reflog.
+
+The watch covers `git commit` in this project's checkout. It doesn't cover
+commits in another repository or worktree, or a background command that finishes
+after the turn stops. Its `commit` reflog test also excludes `git merge`,
+`git cherry-pick`, `git revert`, and `git rebase`, which were never commit-capture
+events.
 
 Claude Code ignores
 `StopFailure` output, so that event returns nothing and capture state is kept;

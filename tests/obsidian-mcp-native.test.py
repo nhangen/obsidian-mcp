@@ -1106,7 +1106,7 @@ class NativeCaptureTest(NativeCaptureFixture):
             "permissionDecision", advisory["hookSpecificOutput"]
         )
         self.assertIn(
-            "not captured", advisory["hookSpecificOutput"]["additionalContext"]
+            "not wrapped", advisory["hookSpecificOutput"]["additionalContext"]
         )
         args = dict(
             tool_name="Bash",
@@ -7018,7 +7018,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
             )
             self.assertEqual(result, {}, repr(command))
 
-    def test_hook_advises_on_uncapturable_commit_forms(self):
+    def test_hook_runs_unwrapped_commit_forms_under_reflog_capture(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
         for command in (
@@ -7031,13 +7031,196 @@ class CaptureShellParserTest(NativeCaptureFixture):
             result = self.hook(
                 "PreToolUse",
                 tool_name="Bash",
-                tool_use_id="advisory-call",
+                tool_use_id="unwrapped-call",
                 tool_input={"command": command},
             )
             specific = result["hookSpecificOutput"]
             self.assertNotIn("permissionDecision", specific, repr(command))
             self.assertNotIn("updatedInput", specific, repr(command))
-            self.assertIn("not captured", specific["additionalContext"], repr(command))
+            self.assertIn("HEAD reflog", specific["additionalContext"], repr(command))
+
+    def watched_bash(self, command, change=None):
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="watched-call",
+            tool_input={"command": command},
+        )
+        before = self.hook("PreToolUse", **args)
+        if change is not None:
+            change()
+        after = self.hook("PostToolUse", **args, tool_response={"exit_code": 0})
+        return before, after
+
+    def watched_state(self):
+        return json.loads(next(iter(self.state_paths())).read_text())
+
+    def empty_commit(self, message="watched"):
+        self.git("commit", "--allow-empty", "-m", message)
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def test_reflog_watch_captures_commits_the_parser_cannot_see(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        seen = []
+        for command in (
+            'eval "$X"',
+            'bash -c "$CMD"',
+            "sh script.sh",
+            "source x",
+            '"$TOOL" go',
+            "timeout 5 sh -c 'run it'",
+            "python3 -c 'run()'",
+            "make release",
+        ):
+            before, after = self.watched_bash(command, self.empty_commit)
+            self.assertNotIn("permissionDecision", before.get("hookSpecificOutput", {}))
+            self.assertIn(
+                "pending commit before another commit",
+                after["hookSpecificOutput"]["additionalContext"],
+                repr(command),
+            )
+            seen.append(self.head())
+        state = self.watched_state()
+        self.assertEqual(
+            sorted(p["event"]["commit"] for p in state["commits"].values()),
+            sorted(seen),
+        )
+        self.assertTrue(all(p["status"] == "pending" for p in state["commits"].values()))
+        self.assertEqual(state["snapshots"], {})
+
+    def test_reflog_watch_captures_dynamic_commit_message(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash('git commit -m "$MSG"', self.empty_commit)
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="second-call",
+            tool_input={"command": 'git commit -m "$MSG"'},
+        )
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+
+    def test_reflog_watch_ignores_head_movement_without_a_commit(self):
+        self.configure()
+        self.empty_commit("base")
+        self.empty_commit("second")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("git switch -c other", lambda: self.git("switch", "-c", "other"))
+        self.watched_bash("git reset HEAD~1", lambda: self.git("reset", "HEAD~1"))
+        state = self.watched_state()
+        self.assertEqual(state["commits"], {})
+        self.assertEqual(state["snapshots"], {})
+
+    def test_reflog_watch_retains_commits_it_cannot_prove(self):
+        def two_commits():
+            self.empty_commit("one")
+            self.empty_commit("two")
+
+        def commit_then_leave():
+            self.empty_commit("one")
+            self.git("reset", "--hard", "HEAD~1")
+
+        def rewritten_log():
+            self.empty_commit("one")
+            log = self.project / ".git/logs/HEAD"
+            log.write_bytes(b"")
+
+        for change in (two_commits, commit_then_leave, rewritten_log):
+            with self.subTest(change.__name__):
+                self.tearDown()
+                self.setUp()
+                self.configure()
+                self.empty_commit("base")
+                self.hook("UserPromptSubmit", prompt="work")
+                self.watched_bash("make release", change)
+                state = self.watched_state()
+                self.assertEqual(state["commits"], {})
+                [(snapshot, record)] = state["snapshots"].items()
+                self.assertEqual(record["capture_error"], "COMMIT_AMBIGUOUS")
+                denied = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="next-call",
+                    tool_input={"command": "git commit -m next"},
+                )
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                allowed = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="ordinary-call",
+                    tool_input={"command": "ls"},
+                )
+                self.assertEqual(allowed, {})
+                resolved = self.cli(
+                    "resolve-snapshot",
+                    "--home",
+                    str(self.home),
+                    "--session",
+                    self.session_key("session-1"),
+                    "--snapshot",
+                    snapshot,
+                    "--verification",
+                    "command-stopped-and-history-inspected",
+                )
+                self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                self.watched_bash("ls")
+                self.assertEqual(self.watched_state()["snapshots"], {})
+
+    def test_reflog_watch_sees_a_commit_at_stop(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("long-task &")
+        self.empty_commit()
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("pending commit before another commit", stopped["reason"])
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+
+    def test_reflog_watch_does_not_recapture_a_wrapped_commit(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.watched_bash("ls")
+        baseline = self.watched_state()["git_watch"]
+        path, state, key = self.pending_commit()
+        state["commits"][key]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.watched_bash("ls")
+        after = self.watched_state()
+        self.assertEqual(list(after["commits"]), [key])
+        self.assertEqual(after["commits"][key]["status"], "committed")
+        self.assertEqual(after["snapshots"], {})
+
+        after["commits"] = {}
+        after["git_watch"] = baseline
+        after["snapshot_resolutions"] = [dict(observed_head=self.head())]
+        path.write_text(json.dumps(after))
+        self.watched_bash("ls")
+        self.assertEqual(self.watched_state()["commits"], {})
+
+    def test_reflog_watch_ignores_commits_before_the_first_bash_call(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        self.empty_commit("terminal")
+        self.watched_bash("ls")
+        self.assertEqual(self.watched_state()["commits"], {})
 
     def test_hook_denies_commit_text_the_helper_rejects(self):
         self.configure()
