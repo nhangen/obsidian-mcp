@@ -282,11 +282,15 @@ Pre/Post hooks require matching call IDs, arguments and validated receipts.
 No second shell-based network or approval path is introduced.
 Commit capture is serialized at project scope. The session that prepares an
 eligible commit owns the capture window: while one of its executor snapshots or
-pending commit events is unresolved, the hooks deny other sessions in the same
-profile new commit tool calls instead of letting them advance HEAD and strand
-the earlier capture. External Git processes outside the hooks bypass this gate
-and will still leave the earlier capture unresolved. `status --home <profile>
---session <key>` reports `gate` naming the owning session when denial applies.
+pending commit events is unresolved, new commit tool calls run unchanged with
+an advisory instead of receiving another capture wrapper. Pending evidence stays
+unresolved and is never promoted to a successful capture. Further HEAD movement
+can leave the earlier event unprovable. `status --home <profile>
+--session <key>` reports `gate` naming the capture owner. Capture failures do not
+change a completed Git command's exit code, and replay never executes Git twice.
+An already-rewritten executor still refuses to run if it cannot persist its
+execution-start marker or prove it has not started. A new commit tool call runs
+unchanged with the retained snapshot reported as unresolved.
 An interrupted owner is recoverable: `takeover --home <profile> --session
 <your-key> --verification command-stopped-and-history-inspected` records the
 owner's snapshots and pending commits as `not_captured` evidence, releases the
@@ -649,7 +653,7 @@ the first canonical keeper save can still be prepared, and its body may summariz
 work done since the retained turn began. Once prepared, the body stays frozen.
 Bash Pre/Post/failure events continue through the existing commit engine while
 paused; observed commits can make their first canonical daily append directly.
-Pending-commit gates and executor evidence still apply. Unrelated Bash commands
+Capture ownership and executor evidence still apply. Ordinary Bash commands
 proceed and Stop reports a non-blocking `systemMessage`.
 
 Commit capture has two layers: the bundled parse-only `shell-capture-parser`
@@ -662,14 +666,10 @@ except the wrapped one. The hook handles each command in one of these ways:
 - It lets the command run with a `not wrapped` note when commit words appear in
   another shape, such as `-m "$MSG"`, a heredoc message, `-F -`, a compound
   command, or a trailing comment. The reflog watch then captures the commit.
-- It denies the command when the text has standalone `git` and `commit` tokens
-  and the helper rejects the syntax or is unavailable. A heredoc with a
-  backslash-newline is one rejected shape. The token check ignores quote
-  spelling on purpose: with the helper down, argument text such as
-  `grep 'git commit' notes.md` or `echo git commit` is also denied. This is a
-  deliberate over-fail-closed trade-off — under-denying a commit lets it slip
-  past the capture receipt, while these false denies fail the run visibly and
-  cost only rerouting the text.
+- It lets the original command run with a capture advisory when the helper
+  rejects the syntax or is unavailable, including innocent text such as
+  `grep 'git commit' notes.md`. Capture is not guaranteed while the parser or
+  capture state is unavailable; no successful receipt is inferred.
 - It allows any other command, including syntax the helper rejects. The reflog
   watch still applies.
 
@@ -690,8 +690,8 @@ Stop:
   captured.
 - Anything it can't prove keeps an unresolved snapshot: two commits in one
   window, a commit HEAD has already left, a rewritten reflog, plumbing, or a
-  reflog reason outside that list. The snapshot denies commits the hook can
-  recognize until you inspect history and run `resolve-snapshot`, which appends
+  reflog reason outside that list. Further commits run unchanged with an advisory
+  while the snapshot is retained. Inspect history and run `resolve-snapshot`, which appends
   the record to `watch-resolutions.jsonl` in the capture home. A commit hidden
   from the parser during that time is captured after you resolve it.
 

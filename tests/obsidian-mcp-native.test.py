@@ -165,9 +165,7 @@ class NativeCaptureFixture(unittest.TestCase):
                             tool_use_id="second-commit",
                             tool_input={"command": command},
                         )
-                        self.assertEqual(
-                            denied["hookSpecificOutput"]["permissionDecision"], "deny"
-                        )
+                        self.assert_bash_advisory(denied)
                         self.assertIn("BlockingIOError", json.dumps(denied))
                 for command in ("pwd", "git status"):
                     advisory = self.hook(
@@ -195,6 +193,162 @@ class NativeCaptureFixture(unittest.TestCase):
             timeout=30,
         )
 
+    def assert_bash_advisory(self, output):
+        specific = output["hookSpecificOutput"]
+        self.assertEqual(specific["hookEventName"], "PreToolUse")
+        self.assertNotIn("permissionDecision", specific)
+        self.assertNotIn("updatedInput", specific)
+        self.assertNotIn("decision", output)
+        self.assertTrue(specific["additionalContext"])
+        return specific["additionalContext"]
+
+    def assert_next_commit_preserves_pending_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        path, state, commit = self.pending_commit()
+        pending = state["commits"][commit]
+        command = "git commit --allow-empty -m next"
+        event = dict(
+            tool_name="Bash",
+            tool_use_id="next-commit",
+            tool_input={"command": command},
+        )
+        self.assert_bash_advisory(self.hook("PreToolUse", **event))
+        executed = subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=self.project,
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        self.assertNotEqual(
+            self.git("rev-parse", "HEAD").stdout.strip(), pending["metadata"]["hash"]
+        )
+        self.assertEqual(self.git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+        self.hook("PostToolUse", **event, tool_response=executed.stdout)
+        remaining = json.loads(path.read_bytes())
+        self.assertEqual(remaining["commits"][commit], pending)
+        self.assertEqual(pending["status"], "pending")
+        self.assertNotEqual(remaining["disposition"], "saved")
+
+    def assert_executor_capture_failure_preserves_git_result(
+        self, *, persist_failure=False
+    ):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for status in (0, 1):
+            with self.subTest(git_exit=status):
+                if status:
+                    self.tearDown()
+                    self.setUp()
+                    self.configure()
+                    self.hook("UserPromptSubmit", prompt="work")
+                command = (
+                    "git commit --allow-empty -m first"
+                    if status == 0
+                    else "git commit -m empty"
+                )
+                event = dict(
+                    tool_name="Bash",
+                    tool_use_id="proof-failure",
+                    tool_input={"command": command},
+                )
+                rewritten = self.hook("PreToolUse", **event)
+                argv = shlex.split(
+                    rewritten["hookSpecificOutput"]["updatedInput"]["command"]
+                )
+                program = """
+import runpy, sys
+script, failure, *arguments = sys.argv[1:]
+namespace = runpy.run_path(script)
+def unproven(*args, **kwargs):
+    raise RuntimeError('fixture proof failure')
+globals_ = namespace['execute_commit'].__globals__
+if failure == 'persist':
+    import json
+    original = globals_['atomic_write']
+    def write(path, contents):
+        state = json.loads(contents)
+        if any('exit_code' in item for item in state.get('snapshots', {}).values()):
+            raise OSError('fixture post-Git persistence failure')
+        return original(path, contents)
+    globals_['atomic_write'] = write
+else:
+    globals_['producer_event'] = unproven
+sys.argv = [script, *arguments]
+try:
+    raise SystemExit(namespace['main']())
+except namespace['NativeError'] as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(64)
+"""
+                executed = subprocess.run(
+                    [
+                        argv[0], "-B", "-c", program, argv[1],
+                        "persist" if persist_failure else "proof", *argv[2:],
+                    ],
+                    cwd=self.project,
+                    env=self.environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(executed.returncode, status, executed.stderr)
+                self.assertIn("COMMIT_EVENT_UNPROVEN", executed.stderr)
+                if persist_failure:
+                    self.assertIn("state could not be updated", executed.stderr)
+                path = next(iter(self.state_paths()))
+                state = json.loads(path.read_bytes())
+                (key, snapshot), = state["snapshots"].items()
+                if persist_failure:
+                    self.assertNotIn("exit_code", snapshot)
+                    self.assertNotIn("capture_error", snapshot)
+                else:
+                    self.assertEqual(snapshot["exit_code"], status)
+                    self.assertEqual(snapshot["capture_error"], "RuntimeError")
+                self.assertTrue(snapshot["execution_started"])
+                self.assertFalse(snapshot.get("effects_verified"))
+                self.assertEqual(state["commits"], {})
+                if status:
+                    self.git("commit", "--allow-empty", "-m", "baseline")
+                    (self.project / "retry.txt").write_text("must remain staged\n")
+                    self.git("add", "retry.txt")
+                else:
+                    self.assertEqual(
+                        self.git("log", "-1", "--format=%s").stdout.strip(), "first"
+                    )
+                self.assertEqual(
+                    self.git("rev-list", "--count", "HEAD").stdout.strip(), "1"
+                )
+                head = self.git("rev-parse", "HEAD").stdout
+                replay = self.execute_rewritten(rewritten)
+                self.assertEqual(
+                    replay.returncode, 64 if persist_failure else status, replay.stderr
+                )
+                self.assertIn(
+                    "COMMIT_EXECUTION_UNRESOLVED" if persist_failure else "not rerun",
+                    replay.stderr,
+                )
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
+                self.assertEqual(
+                    json.loads(path.read_bytes())["snapshots"][key], snapshot
+                )
+                self.hook("PostToolUse", **event, tool_response=executed.stdout)
+                next_command = "git commit --allow-empty -m next"
+                next_event = dict(
+                    tool_name="Bash", tool_use_id="next-call",
+                    tool_input={"command": next_command},
+                )
+                self.assert_bash_advisory(self.hook("PreToolUse", **next_event))
+                self.git("commit", "--allow-empty", "-m", "next")
+                self.hook("PostToolUse", **next_event, tool_response={"exit_code": 0})
+                remaining = json.loads(path.read_bytes())
+                self.assertEqual(remaining["snapshots"][key], snapshot)
+                self.assertEqual(remaining["commits"], {})
+                self.assertNotEqual(self.git("rev-parse", "HEAD").stdout, head)
+
     def load_native(self):
         script = self.bundle / "bin/obsidian-mcp-native"
         module = types.ModuleType("native_under_test")
@@ -214,6 +368,15 @@ class NativeCaptureFixture(unittest.TestCase):
                 tool_name="Bash",
                 tool_use_id="ordinary",
                 tool_input={"command": "pwd"},
+            ),
+            *(
+                self.event(
+                    name,
+                    tool_name="Bash",
+                    tool_use_id="commit-error",
+                    tool_input={"command": "git commit -m next"},
+                )
+                for name in ("PreToolUse", "PostToolUse", "PostToolUseFailure")
             ),
             *(
                 self.event(
@@ -270,6 +433,7 @@ class NativeCaptureFixture(unittest.TestCase):
                             self.assertIn(message, envelope["permissionDecisionReason"])
                         else:
                             self.assertNotIn("permissionDecision", envelope)
+                            self.assertNotIn("updatedInput", envelope)
                             self.assertIn(message, envelope["additionalContext"])
                         self.assertNotIn("decision", output)
                     self.assertNotIn("PRIVATE-", json.dumps(output) + stderr.getvalue())
@@ -413,7 +577,7 @@ class NativeCaptureTest(NativeCaptureFixture):
         )
         self.git("reset", "--soft", "HEAD~")
         executed = self.execute_rewritten(rewritten)
-        self.assertEqual(executed.returncode, 64, executed.stderr)
+        self.assertEqual(executed.returncode, 0 if staged else 1, executed.stderr)
         self.hook("PostToolUse", **event, tool_response=executed.stdout)
         state = json.loads(path.read_text())
         self.assertTrue(state["snapshots"])
@@ -426,7 +590,9 @@ class NativeCaptureTest(NativeCaptureFixture):
                 "quiescent"
             ]
         )
-        self.assertEqual(self.execute_rewritten(rewritten).returncode, 64)
+        replay = self.execute_rewritten(rewritten)
+        self.assertEqual(replay.returncode, 0 if staged else 1, replay.stderr)
+        self.assertIn("not rerun", replay.stderr)
 
     def test_successful_dry_run_cannot_clear_transient_history(self):
         self.assert_transient_history_retained(staged=True)
@@ -651,7 +817,7 @@ class NativeCaptureTest(NativeCaptureFixture):
             if number == 0:
                 self.git("commit", "-m", "fixture")
         executed = self.execute_rewritten(rewritten)
-        self.assertEqual(executed.returncode, 64)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
         result = self.cli(
             "hook",
             "--home",
@@ -1143,19 +1309,14 @@ class NativeCaptureTest(NativeCaptureFixture):
             "executor did not run", observed["hookSpecificOutput"]["additionalContext"]
         )
 
-    def test_pending_capture_denies_next_commit_before_head_can_move(self):
-        self.configure()
-        self.hook("UserPromptSubmit", prompt="work")
-        self.pending_commit()
-        before = self.git("rev-parse", "HEAD").stdout
-        result = self.hook(
-            "PreToolUse",
-            tool_name="Bash",
-            tool_use_id="next-commit",
-            tool_input={"command": "git commit -m next"},
-        )
-        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(self.git("rev-parse", "HEAD").stdout, before)
+    def test_pending_capture_allows_next_commit_without_promoting_old_evidence(self):
+        self.assert_next_commit_preserves_pending_capture()
+
+    def test_capture_proof_failure_preserves_git_exit_and_never_executes_twice(self):
+        self.assert_executor_capture_failure_preserves_git_result()
+
+    def test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution(self):
+        self.assert_executor_capture_failure_preserves_git_result(persist_failure=True)
 
     def test_git_environment_overrides_cannot_redirect_native_execution(self):
         self.configure()
@@ -1220,7 +1381,7 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(pending["status"], "pending")
         self.assertNotIn("native_arguments", pending)
 
-    def test_sibling_commit_waits_until_pending_capture_is_resolved_by_owner(self):
+    def test_sibling_commit_advisory_wraps_again_after_owner_resolves_capture(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="session A")
         path, _state, commit = self.pending_commit()
@@ -1241,10 +1402,9 @@ class NativeCaptureTest(NativeCaptureFixture):
         )
         before = self.cli("hook", "--home", str(self.home), payload=commit_event)
         self.assertEqual(before.returncode, 0, before.stderr)
-        decision = json.loads(before.stdout)["hookSpecificOutput"]
-        self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn(path.stem, decision["permissionDecisionReason"])
-        self.assertIn(second_key, decision["permissionDecisionReason"])
+        guidance = self.assert_bash_advisory(json.loads(before.stdout))
+        self.assertIn(path.stem, guidance)
+        self.assertIn(second_key, guidance)
         status = self.cli("status", "--home", str(self.home), "--session", path.stem)
         self.assertEqual(json.loads(status.stdout)["gate"]["session"], path.stem)
         prepared = self.prepare(path, commit)
@@ -1306,8 +1466,7 @@ class NativeCaptureTest(NativeCaptureFixture):
             session_id="session-2",
         )
         denied = self.cli("hook", "--home", str(self.home), payload=commit_event)
-        decision = json.loads(denied.stdout)["hookSpecificOutput"]
-        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assert_bash_advisory(json.loads(denied.stdout))
         unsigned = self.cli(
             "takeover", "--home", str(self.home), "--session", second_key
         )
@@ -1392,7 +1551,7 @@ class NativeCaptureTest(NativeCaptureFixture):
             session_id="session-2",
         )
 
-    def test_losing_second_claim_rolls_back_its_snapshot_and_denies(self):
+    def test_losing_second_claim_rolls_back_its_snapshot_and_advises(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="session A")
         path, _state, _commit = self.pending_commit()
@@ -1408,10 +1567,7 @@ class NativeCaptureTest(NativeCaptureFixture):
 
         with mock.patch.object(native, "active_request", unowned_at_first_check):
             decision = native.hook(home, profile, commit_event)
-        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn(
-            path.stem, decision["hookSpecificOutput"]["permissionDecisionReason"]
-        )
+        self.assertIn(path.stem, self.assert_bash_advisory(decision))
         second_path = next(p for p in self.state_paths() if p != path)
         self.assertEqual(json.loads(second_path.read_text())["snapshots"], {})
 
@@ -1641,7 +1797,7 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(next_prompt.returncode, 64)
         self.assertEqual(json.loads(path.read_text())["session_request"], args)
 
-    def test_interleaved_pre_events_deny_second_call_and_canceled_snapshot_is_resolvable(
+    def test_interleaved_pre_events_advise_second_call_and_canceled_snapshot_is_resolvable(
         self,
     ):
         self.configure()
@@ -1660,7 +1816,7 @@ class NativeCaptureTest(NativeCaptureFixture):
             tool_use_id="second",
             tool_input={"command": "git commit -m second"},
         )
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assert_bash_advisory(denied)
         path = next(iter(self.state_paths()))
         snapshot = next(iter(json.loads(path.read_text())["snapshots"]))
         result = self.cli(
@@ -2055,6 +2211,16 @@ class NativeCaptureTest(NativeCaptureFixture):
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
+
+    test_pending_capture_allows_next_commit_without_promoting_old_evidence = (
+        NativeCaptureTest.test_pending_capture_allows_next_commit_without_promoting_old_evidence
+    )
+    test_capture_proof_failure_preserves_git_exit_and_never_executes_twice = (
+        NativeCaptureTest.test_capture_proof_failure_preserves_git_exit_and_never_executes_twice
+    )
+    test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution = (
+        NativeCaptureTest.test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution
+    )
 
     def test_busy_state_keeps_commit_gate_and_unrelated_shell_advisory(self):
         self.start()
@@ -2726,7 +2892,7 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             tool_use_id="orphan",
             tool_input={"command": "git commit -m fixture"},
         )
-        self.assertEqual(orphan["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assert_bash_advisory(orphan)
         self.assertIn("PROMPT_EVENT_REQUIRED", json.dumps(orphan))
         self.assertFalse(self.state_paths())
         self.hook("UserPromptSubmit", prompt="Work")
@@ -3761,6 +3927,15 @@ class DirectoryCaptureTest(NativeCaptureFixture):
 
 class UserCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
+    test_pending_capture_allows_next_commit_without_promoting_old_evidence = (
+        NativeCaptureTest.test_pending_capture_allows_next_commit_without_promoting_old_evidence
+    )
+    test_capture_proof_failure_preserves_git_exit_and_never_executes_twice = (
+        NativeCaptureTest.test_capture_proof_failure_preserves_git_exit_and_never_executes_twice
+    )
+    test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution = (
+        NativeCaptureTest.test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution
+    )
     event = ClaudePluginCaptureTest.event
     session_arguments = ClaudePluginCaptureTest.session_arguments
     save = ClaudePluginCaptureTest.save
@@ -4784,7 +4959,7 @@ module.hook(profile_home, descriptor, json.loads(event))
             tool_use_id="second",
             tool_input={"command": "git commit -m second"},
         )
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assert_bash_advisory(denied)
         output = self.hook("UserPromptSubmit", prompt="Capture continued work")
         arguments = ClaudePluginCaptureTest.commit_arguments(
             self, path, ["Recorded continued work"], output=output
@@ -4834,7 +5009,7 @@ module.hook(profile_home, descriptor, json.loads(event))
         )
         self.assertFalse(state["commits"])
         denied = self.hook("PreToolUse", **dict(call, tool_use_id="second"))
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assert_bash_advisory(denied)
         self.hook("PostToolUse", **call, tool_response=executed.stdout)
         state = json.loads(path.read_bytes())
         self.assertFalse(state["snapshots"])
@@ -7082,7 +7257,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
             before, after = self.watched_bash(command, self.empty_commit)
             self.assertNotIn("permissionDecision", before.get("hookSpecificOutput", {}))
             self.assertIn(
-                "pending commit before another commit",
+                "Prepare the pending capture:",
                 after["hookSpecificOutput"]["additionalContext"],
                 repr(command),
             )
@@ -7110,9 +7285,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
             tool_use_id="second-call",
             tool_input={"command": 'git commit -m "$MSG"'},
         )
-        self.assertEqual(
-            denied["hookSpecificOutput"]["permissionDecision"], "deny"
-        )
+        self.assert_bash_advisory(denied)
 
     def test_reflog_watch_ignores_head_movement_without_a_commit(self):
         self.configure()
@@ -7157,9 +7330,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
                     tool_use_id="next-call",
                     tool_input={"command": "git commit -m next"},
                 )
-                self.assertEqual(
-                    denied["hookSpecificOutput"]["permissionDecision"], "deny"
-                )
+                self.assert_bash_advisory(denied)
                 allowed = self.hook(
                     "PreToolUse",
                     tool_name="Bash",
@@ -7190,7 +7361,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.empty_commit()
         stopped = self.hook("Stop", stop_hook_active=False)
         self.assertEqual(stopped["decision"], "block")
-        self.assertIn("pending commit before another commit", stopped["reason"])
+        self.assertIn("Prepare the pending capture:", stopped["reason"])
         state = self.watched_state()
         self.assertEqual(
             [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
@@ -7397,7 +7568,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
             "session-2", "PostToolUse", **args, tool_response={"exit_code": 0}
         )
         self.assertIn(
-            "pending commit before another commit",
+            "Prepare the pending capture:",
             posted["hookSpecificOutput"]["additionalContext"],
         )
         self.assertNotIn("takeover", json.dumps(posted))
@@ -7575,7 +7746,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
         stopped = self.hook("Stop", stop_hook_active=False)
         self.assertIn("history check unavailable", stopped["systemMessage"])
 
-    def test_hook_denies_commit_text_the_helper_rejects(self):
+    def test_hook_advises_for_commit_text_the_helper_rejects(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
         denied = self.hook(
@@ -7584,10 +7755,9 @@ class CaptureShellParserTest(NativeCaptureFixture):
             tool_use_id="deny-call",
             tool_input={"command": "git commit -m {a,b}"},
         )
-        specific = denied["hookSpecificOutput"]
-        self.assertEqual(specific["permissionDecision"], "deny")
-        self.assertIn("BRACE_EXPANSION_UNSUPPORTED", specific["permissionDecisionReason"])
-        self.assertIn("plain git commit", specific["permissionDecisionReason"])
+        guidance = self.assert_bash_advisory(denied)
+        self.assertIn("BRACE_EXPANSION_UNSUPPORTED", guidance)
+        self.assertIn("plain git commit", guidance)
 
     def test_hook_preserves_apostrophe_heredoc_commands(self):
         self.configure()
@@ -7605,15 +7775,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 "USER_CAPTURE_UNAVAILABLE", json.dumps(result)
             )
 
-    def test_helper_down_denies_innocent_text_and_documents_the_trade_off(self):
-        """Regression naming the accepted over-fail-closed trade-off:
-
-        quote spelling is dropped before token matching, so with the helper
-        unavailable, innocent argument text carrying both tokens (e.g.
-        ``grep 'git commit' notes.md``) is denied rather than allowed past
-        the capture gate. Under-denying is the chosen failure direction;
-        see the README policy bullets.
-        """
+    def test_helper_down_rejects_innocent_commit_text_for_capture_only(self):
         module = self.native()
         original = module.helper_path_override
         module.helper_path_override = "/nonexistent/shell-capture-parser"
@@ -7629,12 +7791,10 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 self.assertTrue(module.has_commit_evidence(command), command)
         finally:
             module.helper_path_override = original
-        readme = (ROOT / "packages/client/README.md").read_text()
-        self.assertIn("deliberate over-fail-closed trade-off", readme)
         allowed = (self.bundle / "bin/obsidian-mcp-native")
         self.assertTrue(allowed.is_file())
 
-    def test_hook_denies_ambiguous_heredoc_commands(self):
+    def test_hook_advises_for_ambiguous_heredoc_commands(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
         for command in ("cat <<'EOF\ngit commit\n", "cat <<EOF\ngit commit\n"):
@@ -7644,12 +7804,10 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 tool_use_id="deny-call",
                 tool_input={"command": command},
             )
-            self.assertEqual(
-                denied["hookSpecificOutput"]["permissionDecision"], "deny"
-            )
+            guidance = self.assert_bash_advisory(denied)
             self.assertNotIn(
                 "USER_CAPTURE_UNAVAILABLE",
-                denied["hookSpecificOutput"]["permissionDecisionReason"],
+                guidance,
             )
 
     def test_oversized_command_fails_closed_only_with_commit_evidence(self):
