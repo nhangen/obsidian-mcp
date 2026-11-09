@@ -32,9 +32,10 @@ Status omits saved content. `request` explicitly retrieves the original session
 payload. After inspecting authoritative paths, `retry` with the recorded payload
 digest and verification flag returns only the original arguments for native MCP
 retry. It does not itself verify the vault or mark a write successful.
-Another session in the same profile may be denied while this profile owns an
-unresolved commit capture; wait until it resolves, or rescue an interrupted owner
-only after inspecting it, using the takeover command the denial names.
+Unresolved capture may prevent another capture wrapper, but ordinary Git work
+can continue unchanged with an advisory. Retain and report unresolved evidence;
+rescue an interrupted capture owner only after inspecting it with the supported
+takeover command. Never rerun an executor whose outcome is unknown.
 
 This profile requires a clean project without inherited agent settings or capture
 instructions. It does not disable another session or migrate an existing profile.

@@ -2340,7 +2340,7 @@ def settle_gate(home, session, state):
             raise
         return (
             "\nThe capture gate file is invalid (ACTIVE_STATE_INVALID), so commits"
-            " from other sessions fail until it is cleared. Clear it with takeover --home "
+            " from other sessions run without capture wrapping until it is cleared. Clear it with takeover --home "
             + str(home)
             + " --session "
             + session
@@ -2351,7 +2351,7 @@ def settle_gate(home, session, state):
     return (
         "\nUnexpected capture-gate owner "
         + owner["session"]
-        + ": commits from other sessions fail until it is cleared. Clear it with takeover --home "
+        + ": other sessions run commits without capture wrapping until it is cleared. Clear it with takeover --home "
         + str(home)
         + " --session "
         + session
@@ -2986,7 +2986,7 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
                             + " "
                         )
                 commands.append(
-                    f"Capture the pending commit through {tool_prefix}obsidian_daily_append before another commit. "
+                    f"Capture the pending commit through {tool_prefix}obsidian_daily_append. Further Git work may continue without capture wrapping. "
                     + instruction
                     + "Call MCP directly; no shell preparation is needed. Inspect the result; do not claim capture on failure. "
                     "An in-flight or recovery outcome requires inspection before retry.\n"
@@ -3008,7 +3008,7 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
                 ]
             )
             commands.append(
-                f'Prepare the pending commit before another commit: pipe JSON {{"context":[3-8 concise factual context bullets]}} to {command}, then call mcp__obsidian_write__obsidian_daily_append with the returned exact arguments. Inspect its result; do not claim capture on failure.'
+                f'Prepare the pending capture: pipe JSON {{"context":[3-8 concise factual context bullets]}} to {command}, then call mcp__obsidian_write__obsidian_daily_append with the returned exact arguments. Further Git work may continue without capture wrapping. Inspect its result; do not claim capture on failure.'
             )
     if state["disposition"] == "pending" and "session_request" in state:
         if state.get("session_in_flight") or state.get("session_recovery"):
@@ -3257,6 +3257,40 @@ def claude_output(value, name):
 
 
 def hook(home, profile, event):
+    ordinary = isinstance(event, dict) and event.get("tool_name") == "Bash"
+    name = event.get("hook_event_name") if isinstance(event, dict) else None
+    try:
+        result = capture_hook(home, profile, event)
+    except Exception as error:
+        if not ordinary or name not in (
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+        ):
+            raise
+        code = str(error) if isinstance(error, NativeError) else type(error).__name__
+        return context(
+            name,
+            "Obsidian capture unavailable: "
+            + code
+            + "; ordinary work may continue, no capture inferred.",
+        )
+    specific = result.get("hookSpecificOutput", {})
+    if (
+        ordinary
+        and name == "PreToolUse"
+        and specific.get("permissionDecision") == "deny"
+    ):
+        return context(
+            name,
+            "Obsidian capture advisory: "
+            + specific.get("permissionDecisionReason", "Capture unavailable")
+            + "\nThe original command may proceed unchanged. Capture remains unresolved; retained evidence is not a successful capture.",
+        )
+    return result
+
+
+def capture_hook(home, profile, event):
     if capture_scope(profile) == "user":
         return user_hook(home, profile, event)
     if profile["host"] != "claude-plugin":
@@ -3563,7 +3597,7 @@ def engine_hook(home, profile, event):
                     "hookSpecificOutput": {
                         "hookEventName": name,
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "Resolve the outstanding commit event before another commit.",
+                        "permissionDecisionReason": "An outstanding commit event prevents capture wrapping.",
                     }
                 }
             if name == "PreToolUse":
@@ -3602,7 +3636,7 @@ def engine_hook(home, profile, event):
                     "hookSpecificOutput": {
                         "hookEventName": name,
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "A previous commit tool call has not completed; wait or inspect its outcome.",
+                        "permissionDecisionReason": "An earlier commit execution remains unresolved; capture wrapping is unavailable.",
                     }
                 }
             if any(p["status"] == "pending" for p in state["commits"].values()):
@@ -3610,7 +3644,7 @@ def engine_hook(home, profile, event):
                     "hookSpecificOutput": {
                         "hookEventName": name,
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "Capture or resolve the pending commit before creating another commit.\n"
+                        "permissionDecisionReason": "A pending commit prevents capture wrapping.\n"
                         + capture_guidance(home, state, profile["host"], routes),
                     }
                 }
@@ -3761,7 +3795,10 @@ def execute_commit(home, profile, args, parent_locks=None):
                 before.get("capture_error")
                 or before.get("effects_verified") is not True
             ):
-                raise NativeError("COMMIT_EXECUTION_UNRESOLVED")
+                print(
+                    "Obsidian capture unresolved; retained executor result, Git was not rerun.",
+                    file=sys.stderr,
+                )
             return before["exit_code"]
         if before.get("execution_started"):
             raise NativeError("COMMIT_EXECUTION_UNRESOLVED")
@@ -3812,11 +3849,20 @@ def execute_commit(home, profile, args, parent_locks=None):
             before["effects_verified"] = True
             if observed is not None:
                 claim_commit(home, args.session, observed[0]["commit"])
+            atomic_write(path, encode(state))
         except Exception as error:
             before["capture_error"] = type(error).__name__
-            atomic_write(path, encode(state))
-            raise NativeError("COMMIT_EVENT_UNPROVEN; inspect snapshot") from None
-        atomic_write(path, encode(state))
+            try:
+                atomic_write(path, encode(state))
+            except Exception:
+                print(
+                    "Obsidian capture state could not be updated; inspect retained execution-started evidence.",
+                    file=sys.stderr,
+                )
+            print(
+                "Obsidian capture not confirmed: COMMIT_EVENT_UNPROVEN; inspect retained snapshot. Git's exit code is preserved.",
+                file=sys.stderr,
+            )
         return result.returncode
 
 

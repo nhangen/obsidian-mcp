@@ -83,7 +83,7 @@ For automated session and commit capture without relying on the Claude plugin:
 4. **Failure & Concurrency Handling**:
    - Replay skips duplicate appends idempotently.
    - Changed context conflicts locally and blocks automatic re-writes.
-   - A pending event locks commit capture for that session; other sessions in the profile are denied until resolved.
+   - A pending event retains capture ownership; later Git commands run unchanged with an advisory until capture is resolved. Capture failures preserve Git's actual exit code and never count as successful capture.
    - Bounded recovery: `obsidian-mcp-native takeover` safely releases an interrupted owner's lock without reconstructing git history.
 
 ### 2. Attached user-wide runtime state

@@ -13,6 +13,16 @@ NativeCaptureFixture = fixture["NativeCaptureFixture"]
 
 
 class CodexUserCaptureTest(NativeCaptureFixture):
+    test_pending_capture_allows_next_commit_without_promoting_old_evidence = (
+        fixture["NativeCaptureTest"].test_pending_capture_allows_next_commit_without_promoting_old_evidence
+    )
+    test_capture_proof_failure_preserves_git_exit_and_never_executes_twice = (
+        fixture["NativeCaptureTest"].test_capture_proof_failure_preserves_git_exit_and_never_executes_twice
+    )
+    test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution = (
+        fixture["NativeCaptureTest"].test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution
+    )
+
     def event(self, name, **extra):
         return {**super().event(name), **extra}
 
