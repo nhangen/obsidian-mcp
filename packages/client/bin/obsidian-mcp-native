@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 try:
     import tomllib
@@ -30,6 +31,7 @@ BUNDLE = Path(__file__).resolve().parent.parent
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
+HOOK_LOCK_WAIT = 2.0
 # Two accepted JSON components may expand when Unicode is canonicalized.
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
@@ -1790,7 +1792,7 @@ def retained_capture_event(home, profile, event):
 
 def user_hook(home, profile, event):
     try:
-        with gate_lock(home, nonblocking=True):
+        with gate_lock(home, nonblocking=True, wait=HOOK_LOCK_WAIT):
             check_user_state(home)
             reconcile_retention(home)
             reconcile_enrollment(home, profile)
@@ -1815,7 +1817,7 @@ def user_hook(home, profile, event):
                 else:
                     child = home / "workspaces" / hot["workspace"]
                     private_directory(child)
-                    with state_lock(child, session) as (state, _):
+                    with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (state, _):
                         activation = state is None or not drain_reasons(state)
             if activation:
                 if event.get("hook_event_name") == "UserPromptSubmit":
@@ -1873,7 +1875,7 @@ def user_hook(home, profile, event):
                         isinstance(error, NativeError)
                         and str(error) == "PREVIOUS_CAPTURE_UNRESOLVED"
                     ):
-                        with state_lock(child, session) as (retained, _):
+                        with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (retained, _):
                             normalize_host_event(descriptor, event, retained)
                             guidance = capture_guidance(
                                 child,
@@ -1892,7 +1894,7 @@ def user_hook(home, profile, event):
             if event.get("hook_event_name") == "UserPromptSubmit" and (
                 record["paused"] or not record["enrolled"]
             ):
-                with state_lock(child, session) as (admitted, _):
+                with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (admitted, _):
                     if (
                         admitted is not None
                         and record["enrolled"]
@@ -2127,8 +2129,20 @@ def checked_state_directory(home):
     return directory
 
 
+def exclusive_flock(fd, wait):
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
 @contextmanager
-def state_lock(home, key, *, create=True):
+def state_lock(home, key, *, create=True, wait=0):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
@@ -2138,7 +2152,7 @@ def state_lock(home, key, *, create=True):
         0o600,
     )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        exclusive_flock(fd, wait)
         path = directory / (key + ".json")
         state = (
             json.loads(private_read(path))
@@ -2157,13 +2171,16 @@ def state_lock(home, key, *, create=True):
 
 
 @contextmanager
-def gate_lock(home, *, nonblocking=False):
+def gate_lock(home, *, nonblocking=False, wait=0):
     directory = checked_state_directory(home)
     fd = os.open(
         directory / "active.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
     )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+        if nonblocking:
+            exclusive_flock(fd, wait)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX)
         yield directory
     finally:
         os.close(fd)

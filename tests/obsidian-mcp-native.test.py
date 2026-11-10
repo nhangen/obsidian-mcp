@@ -5078,6 +5078,45 @@ module.hook(profile_home, descriptor, json.loads(event))
                 json.loads(path.read_bytes())["session_request"], arguments
             )
 
+    def test_briefly_held_gate_lock_waits_instead_of_denying_capture_tool(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        lock = self.home / "capture-state" / "active.lock"
+        holder = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                "import fcntl,os,sys,time\n"
+                "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR)\n"
+                "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                "print('HELD',flush=True)\n"
+                "time.sleep(0.4)\n"
+                "fcntl.flock(fd,fcntl.LOCK_UN)\n",
+                str(lock),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            result = self.hook(
+                "PreToolUse",
+                tool_name="mcp__obsidian_write__obsidian_keeper_save",
+                tool_use_id="contended-save",
+                tool_input={},
+            )
+        finally:
+            holder.wait(timeout=10)
+            holder.stdout.close()
+        uncontended = self.hook(
+            "PreToolUse",
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="uncontended-save",
+            tool_input={},
+        )
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(uncontended))
+        self.assertEqual(result, uncontended)
+
     def test_busy_parent_or_child_keeps_paused_commit_gate(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="Original")
