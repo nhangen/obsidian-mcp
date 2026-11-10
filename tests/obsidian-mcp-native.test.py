@@ -5119,7 +5119,11 @@ module.hook(profile_home, descriptor, json.loads(event))
     def test_briefly_held_session_lock_waits_on_post_tool_use_and_stop(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
-        (lock,) = self.home.glob("workspaces/*/capture-state/*.lock")
+        (lock,) = (
+            path
+            for path in self.home.glob("workspaces/*/capture-state/*.lock")
+            if path.name != "active.lock"
+        )
         for name, extra in (
             (
                 "PostToolUse",
@@ -5135,6 +5139,19 @@ module.hook(profile_home, descriptor, json.loads(event))
             with self.subTest(event=name), self.briefly_held(lock):
                 result = self.hook(name, **extra)
                 self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(result))
+
+    def test_briefly_held_gate_lock_waits_for_user_scope_cli(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (session,) = (
+            path.stem
+            for path in self.home.glob("workspaces/*/capture-state/*.lock")
+            if path.name != "active.lock"
+        )
+        with self.briefly_held(self.home / "capture-state" / "active.lock"):
+            status = self.cli("status", "--home", str(self.home), "--session", session)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertNotIn("BlockingIOError", status.stdout + status.stderr)
 
     def test_busy_parent_or_child_keeps_paused_commit_gate(self):
         self.configure()
