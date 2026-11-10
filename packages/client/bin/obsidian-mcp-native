@@ -32,6 +32,7 @@ HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
 HOOK_LOCK_WAIT = 2.0
+LOCK_DEADLINE = None
 # Two accepted JSON components may expand when Unicode is canonicalized.
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
@@ -1124,7 +1125,7 @@ def retire_terminal_sessions(home, profile):
             active += 1
             continue
         try:
-            with state_lock(child, entry.stem) as (state, _):
+            with state_lock(child, entry.stem, wait=0) as (state, _):
                 if (state is not None and drain_reasons(state)) or (
                     active_request(child) or {}
                 ).get("session") == entry.stem:
@@ -1792,7 +1793,7 @@ def retained_capture_event(home, profile, event):
 
 def user_hook(home, profile, event):
     try:
-        with gate_lock(home, nonblocking=True, wait=HOOK_LOCK_WAIT):
+        with lock_budget(HOOK_LOCK_WAIT), gate_lock(home, nonblocking=True):
             check_user_state(home)
             reconcile_retention(home)
             reconcile_enrollment(home, profile)
@@ -1817,7 +1818,7 @@ def user_hook(home, profile, event):
                 else:
                     child = home / "workspaces" / hot["workspace"]
                     private_directory(child)
-                    with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (state, _):
+                    with state_lock(child, session) as (state, _):
                         activation = state is None or not drain_reasons(state)
             if activation:
                 if event.get("hook_event_name") == "UserPromptSubmit":
@@ -1875,7 +1876,7 @@ def user_hook(home, profile, event):
                         isinstance(error, NativeError)
                         and str(error) == "PREVIOUS_CAPTURE_UNRESOLVED"
                     ):
-                        with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (retained, _):
+                        with state_lock(child, session) as (retained, _):
                             normalize_host_event(descriptor, event, retained)
                             guidance = capture_guidance(
                                 child,
@@ -1894,7 +1895,7 @@ def user_hook(home, profile, event):
             if event.get("hook_event_name") == "UserPromptSubmit" and (
                 record["paused"] or not record["enrolled"]
             ):
-                with state_lock(child, session, wait=HOOK_LOCK_WAIT) as (admitted, _):
+                with state_lock(child, session) as (admitted, _):
                     if (
                         admitted is not None
                         and record["enrolled"]
@@ -2129,8 +2130,24 @@ def checked_state_directory(home):
     return directory
 
 
-def exclusive_flock(fd, wait):
-    deadline = time.monotonic() + wait
+@contextmanager
+def lock_budget(seconds):
+    global LOCK_DEADLINE
+    previous = LOCK_DEADLINE
+    LOCK_DEADLINE = time.monotonic() + seconds
+    try:
+        yield
+    finally:
+        LOCK_DEADLINE = previous
+
+
+def exclusive_flock(fd, wait=None):
+    if wait is not None:
+        deadline = time.monotonic() + wait
+    elif LOCK_DEADLINE is not None:
+        deadline = LOCK_DEADLINE
+    else:
+        deadline = 0
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2142,7 +2159,7 @@ def exclusive_flock(fd, wait):
 
 
 @contextmanager
-def state_lock(home, key, *, create=True, wait=0):
+def state_lock(home, key, *, create=True, wait=None):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
@@ -2171,14 +2188,14 @@ def state_lock(home, key, *, create=True, wait=0):
 
 
 @contextmanager
-def gate_lock(home, *, nonblocking=False, wait=0):
+def gate_lock(home, *, nonblocking=False):
     directory = checked_state_directory(home)
     fd = os.open(
         directory / "active.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
     )
     try:
         if nonblocking:
-            exclusive_flock(fd, wait)
+            exclusive_flock(fd)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield directory
@@ -4215,6 +4232,7 @@ def dispatch_command(args, extra, locks):
             "drain-status",
             "hook",
         ):
+            locks.enter_context(lock_budget(HOOK_LOCK_WAIT))
             locks.enter_context(gate_lock(home, nonblocking=True))
             if inspection and unpublished_user_state(home):
                 raise NativeError("PUBLICATION_PENDING")
