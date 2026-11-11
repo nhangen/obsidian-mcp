@@ -5078,6 +5078,81 @@ module.hook(profile_home, descriptor, json.loads(event))
                 json.loads(path.read_bytes())["session_request"], arguments
             )
 
+    @contextmanager
+    def briefly_held(self, lock, seconds=0.4):
+        holder = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                "import fcntl,os,sys,time\n"
+                "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR)\n"
+                "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                "print('HELD',flush=True)\n"
+                "time.sleep(float(sys.argv[2]))\n"
+                "fcntl.flock(fd,fcntl.LOCK_UN)\n",
+                str(lock),
+                str(seconds),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            yield
+        finally:
+            holder.wait(timeout=10)
+            holder.stdout.close()
+
+    def test_briefly_held_gate_lock_waits_instead_of_denying_capture_tool(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        with self.briefly_held(self.home / "capture-state" / "active.lock"):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                tool_use_id="contended-save",
+                tool_input={},
+            )
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(result))
+        self.assertNotIn("permissionDecision", result.get("hookSpecificOutput", {}))
+
+    def test_briefly_held_session_lock_waits_on_post_tool_use_and_stop(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (lock,) = (
+            path
+            for path in self.home.glob("workspaces/*/capture-state/*.lock")
+            if path.name != "active.lock"
+        )
+        for name, extra in (
+            (
+                "PostToolUse",
+                dict(
+                    tool_name="Bash",
+                    tool_use_id="contended-post",
+                    tool_input={"command": "pwd"},
+                    tool_response="",
+                ),
+            ),
+            ("Stop", {}),
+        ):
+            with self.subTest(event=name), self.briefly_held(lock):
+                result = self.hook(name, **extra)
+                self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(result))
+
+    def test_briefly_held_gate_lock_waits_for_user_scope_cli(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (session,) = (
+            path.stem
+            for path in self.home.glob("workspaces/*/capture-state/*.lock")
+            if path.name != "active.lock"
+        )
+        with self.briefly_held(self.home / "capture-state" / "active.lock"):
+            status = self.cli("status", "--home", str(self.home), "--session", session)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertNotIn("BlockingIOError", status.stdout + status.stderr)
+
     def test_busy_parent_or_child_keeps_paused_commit_gate(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="Original")
