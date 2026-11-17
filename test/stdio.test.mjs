@@ -284,7 +284,9 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
     81,
   );
   assert.equal(outOfScope.result?.isError, true);
-  assert.equal(JSON.parse(outOfScope.result.content[0].text).code, "PATH_INVALID");
+  const outOfScopePayload = JSON.parse(outOfScope.result.content[0].text);
+  assert.equal(outOfScopePayload.code, "PATH_INVALID");
+  assert.match(outOfScopePayload.detail, /outside the approved repository roots/);
 
   const invalid = await server.request(
     {

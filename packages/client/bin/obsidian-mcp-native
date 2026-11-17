@@ -1183,6 +1183,102 @@ def event_workspace(event):
     )
 
 
+def worktree_origin(root):
+    """Return the primary checkout of a managed worktree, else None."""
+    try:
+        common_text = git(root, "rev-parse", "--git-common-dir", allow_failure=True)
+    except (NativeError, OSError, subprocess.SubprocessError):
+        return None
+    common = common_text.strip()
+    if not common or "\n" in common or "\0" in common:
+        return None
+    candidate = Path(common)
+    if not candidate.is_absolute():
+        candidate = Path(root) / candidate
+    try:
+        common = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    origin = common.parent
+    if origin == Path(root).resolve():
+        return None
+    try:
+        return str(origin.resolve(strict=True))
+    except (OSError, RuntimeError):
+        return None
+
+
+def verify_managed_worktree_transition(record, project, mode):
+    """Whether project is the managed-worktree counterpart of the bound project."""
+    if record.get("projectMode") != "git" or mode != "git":
+        return False
+    if record.get("project") == project:
+        return False
+    if worktree_origin(project) == record.get("project"):
+        return True
+    return worktree_origin(record.get("project")) == project
+
+
+def rebind_workspace(home, profile, record, path, project, mode):
+    """Carry one session across a verified managed-worktree transition.
+
+    Returns the rebound record, or None when the old child is contested or
+    keeps pending evidence for a repository outside the transition. Pending
+    evidence, idempotency keys, receipts and the session's busy-commit gate
+    claim travel with the state; the old child keeps nothing for the
+    session afterwards.
+    """
+    session = record["session"]
+    old_child = home / "workspaces" / record["workspace"]
+    try:
+        state_directory = checked_state_directory(old_child)
+    except NativeError:
+        state_directory = None
+    active = active_request(old_child) if state_directory is not None else None
+    carries_gate = active is not None and active.get("session") == session
+    try:
+        if state_directory is None:
+            state = None
+        else:
+            with state_lock(old_child, session, wait=0) as (state, _):
+                for pending in (state or {}).get("commits", {}).values():
+                    if not isinstance(pending, dict) or pending.get("status") != "pending":
+                        continue
+                    event = pending.get("event")
+                    # Carried evidence keeps the checkout it was captured in,
+                    # so both bound and destination repositories are safe.
+                    if (
+                        not isinstance(event, dict)
+                        or event.get("repository")
+                        not in (record.get("project"), project)
+                    ):
+                        return None
+        new_child = provision_child(home, profile, project, mode)
+        if state is not None:
+            atomic_write(
+                checked_state_directory(new_child) / (session + ".json"),
+                encode(state),
+            )
+        if carries_gate:
+            atomic_write(
+                checked_state_directory(new_child) / ACTIVE, encode(active)
+            )
+        if state_directory is not None:
+            if carries_gate:
+                release_gate(state_directory)
+            for name in (session + ".json", session + ".lock"):
+                candidate = state_directory / name
+                if candidate.exists() or candidate.is_symlink():
+                    os.remove(candidate)
+        record["workspace"] = workspace_key(project, mode)
+        record["project"] = project
+        record["projectMode"] = mode
+        atomic_write(path, encode(record))
+    except BlockingIOError:
+        return None
+    return record
+
+
 SCHEMA = "shell-capture-parser@1"
 HELPER_INPUT_BYTES = 262144
 HELPER_OUTPUT_BYTES = 4096
@@ -1832,7 +1928,19 @@ def user_hook(home, profile, event):
             project, mode = event_workspace(event)
             key = workspace_key(project, mode)
             if record is not None and record["workspace"] != key:
-                raise NativeError("SESSION_WORKSPACE_CHANGED")
+                if not verify_managed_worktree_transition(record, project, mode):
+                    raise NativeError("SESSION_WORKSPACE_CHANGED")
+                if "archiveGeneration" in record:
+                    raise NativeError(
+                        "SESSION_WORKSPACE_CHANGED (retained archive must be "
+                        "restored before a workspace transition)"
+                    )
+                rebound = rebind_workspace(
+                    home, profile, record, path, project, mode
+                )
+                if rebound is None:
+                    raise NativeError("SESSION_WORKSPACE_CHANGED")
+                record = rebound
             if record is None:
                 if event.get("hook_event_name") != "UserPromptSubmit":
                     raise NativeError("PROMPT_EVENT_REQUIRED")
