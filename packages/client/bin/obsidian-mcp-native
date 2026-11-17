@@ -1234,64 +1234,156 @@ def verify_managed_worktree_transition(record, project, mode):
     return False
 
 
+REBIND_JOURNAL = "rebind-journal"
+
+
+def carried_evidence_refusal(state, repositories):
+    if state is None:
+        return None
+    if state.get("snapshots") or state.get("snapshot_resolutions"):
+        return "resolve pending command snapshots before a workspace transition"
+    for pending in (state.get("commits") or {}).values():
+        if not isinstance(pending, dict):
+            return "commit evidence is invalid"
+        if pending.get("in_flight") or pending.get("recovery"):
+            return "resolve in-flight commit capture before a workspace transition"
+        if pending.get("status") not in ("pending", "not_captured"):
+            continue
+        event = pending.get("event")
+        # Carried evidence keeps the checkout it was captured in, so only
+        # the bound and destination repositories are safe to carry.
+        if not isinstance(event, dict) or event.get("repository") not in repositories:
+            return "pending evidence belongs to another repository"
+    return None
+
+
+def clear_session_files(child, session):
+    if not (child / "capture-state").exists():
+        return
+    directory = checked_state_directory(child)
+    with gate_lock(child) as gate:
+        if (active_request(child) or {}).get("session") == session:
+            release_gate(gate)
+    for name in (session + ".json", session + ".lock"):
+        candidate = directory / name
+        if candidate.exists() or candidate.is_symlink():
+            os.remove(candidate)
+    sync_directory(directory)
+
+
+def reconcile_rebinds(home):
+    """Finish or roll back interrupted rebinds; the binding is the commit point."""
+    directory = home / REBIND_JOURNAL
+    if not directory.exists() and not directory.is_symlink():
+        return
+    for entry in list(streamed_entries(directory)):
+        if entry.name.startswith(".capture-"):
+            entry.unlink()
+            continue
+        if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+            raise NativeError("REBIND_JOURNAL_INVALID")
+        try:
+            value = json.loads(private_read(entry))
+        except ValueError:
+            raise NativeError("REBIND_JOURNAL_INVALID") from None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schemaVersion", "session", "source", "target"}
+            or value["schemaVersion"] != 1
+            or value["session"] != entry.stem
+            or not all(
+                isinstance(value[k], str) and HEX.fullmatch(value[k])
+                for k in ("source", "target")
+            )
+            or value["source"] == value["target"]
+        ):
+            raise NativeError("REBIND_JOURNAL_INVALID")
+        record, _ = read_hot_binding(home, entry.stem)
+        if record is None or record["workspace"] not in (
+            value["source"],
+            value["target"],
+        ):
+            raise NativeError("REBIND_JOURNAL_INVALID")
+        stale = value["source"] if record["workspace"] == value["target"] else value["target"]
+        clear_session_files(home / "workspaces" / stale, entry.stem)
+        entry.unlink()
+        sync_directory(directory)
+
+
 def rebind_workspace(home, profile, record, path, project, mode):
     """Carry one session across a verified managed-worktree transition.
 
-    Returns the rebound record, or None when the old child is contested or
-    keeps pending evidence for a repository outside the transition. Pending
-    evidence, idempotency keys, receipts and the session's busy-commit gate
-    claim travel with the state; the old child keeps nothing for the
-    session afterwards.
+    Pending evidence, idempotency keys, receipts and the session's busy-commit
+    gate claim travel with the state. A journal names both children before
+    anything is copied, so an interrupted rebind is rolled back or finished by
+    reconcile_rebinds on the next event.
     """
     session = record["session"]
     old_child = home / "workspaces" / record["workspace"]
+    checked_state_directory(old_child)
+    target = workspace_key(project, mode)
+    journal = home / REBIND_JOURNAL / (session + ".json")
+    rebound = None
     try:
-        state_directory = checked_state_directory(old_child)
-    except NativeError:
-        state_directory = None
-    active = active_request(old_child) if state_directory is not None else None
-    carries_gate = active is not None and active.get("session") == session
-    try:
-        if state_directory is None:
-            state = None
-        else:
-            with state_lock(old_child, session, wait=0) as (state, _):
-                for pending in (state or {}).get("commits", {}).values():
-                    if not isinstance(pending, dict) or pending.get("status") != "pending":
-                        continue
-                    event = pending.get("event")
-                    # Carried evidence keeps the checkout it was captured in,
-                    # so both bound and destination repositories are safe.
-                    if (
-                        not isinstance(event, dict)
-                        or event.get("repository")
-                        not in (record.get("project"), project)
-                    ):
-                        return None
-        new_child = provision_child(home, profile, project, mode)
-        if state is not None:
-            atomic_write(
-                checked_state_directory(new_child) / (session + ".json"),
-                encode(state),
-            )
-        if carries_gate:
-            atomic_write(
-                checked_state_directory(new_child) / ACTIVE, encode(active)
-            )
-        if state_directory is not None:
+        with state_lock(old_child, session, wait=0) as (state, _):
+            refusal = carried_evidence_refusal(state, (record["project"], project))
+            if refusal is not None:
+                raise NativeError("SESSION_WORKSPACE_CHANGED; " + refusal)
+            new_child = provision_child(home, profile, project, mode)
+            new_directory = checked_state_directory(new_child)
+            if (new_directory / (session + ".json")).exists() or (
+                new_directory / (session + ".json")
+            ).is_symlink():
+                raise NativeError(
+                    "SESSION_WORKSPACE_CHANGED; destination already holds state for this session"
+                )
+            with gate_lock(old_child):
+                active = active_request(old_child)
+            carries_gate = active is not None and active["session"] == session
             if carries_gate:
-                release_gate(state_directory)
-            for name in (session + ".json", session + ".lock"):
-                candidate = state_directory / name
-                if candidate.exists() or candidate.is_symlink():
-                    os.remove(candidate)
-        record["workspace"] = workspace_key(project, mode)
-        record["project"] = project
-        record["projectMode"] = mode
-        atomic_write(path, encode(record))
+                with gate_lock(new_child):
+                    owner = active_request(new_child)
+                if owner is not None and owner["session"] != session:
+                    raise NativeError(
+                        "SESSION_WORKSPACE_CHANGED; destination capture gate is held by another session"
+                    )
+            journal.parent.mkdir(mode=0o700, exist_ok=True)
+            private_directory(journal.parent)
+            atomic_write(
+                journal,
+                encode(
+                    dict(
+                        schemaVersion=1,
+                        session=session,
+                        source=record["workspace"],
+                        target=target,
+                    )
+                ),
+            )
+            try:
+                if state is not None:
+                    atomic_write(new_directory / (session + ".json"), encode(state))
+                if carries_gate:
+                    with gate_lock(new_child) as gate:
+                        owner = active_request(new_child)
+                        if owner is not None and owner["session"] != session:
+                            raise NativeError(
+                                "SESSION_WORKSPACE_CHANGED; destination capture gate is held by another session"
+                            )
+                        atomic_write(gate / ACTIVE, encode(active))
+                rebound = dict(
+                    record, workspace=target, project=project, projectMode=mode
+                )
+                atomic_write(path, encode(rebound))
+            except NativeError:
+                reconcile_rebinds(home)
+                raise
     except BlockingIOError:
-        return None
-    return record
+        raise NativeError(
+            "SESSION_WORKSPACE_CHANGED; capture state is busy, retry the transition"
+        ) from None
+    reconcile_rebinds(home)
+    return rebound
 
 
 SCHEMA = "shell-capture-parser@1"
@@ -1907,6 +1999,7 @@ def user_hook(home, profile, event):
         with lock_budget(HOOK_LOCK_WAIT), gate_lock(home, nonblocking=True):
             check_user_state(home)
             reconcile_retention(home)
+            reconcile_rebinds(home)
             reconcile_enrollment(home, profile)
             session = digest(identifier(event.get("session_id")).encode())
             hot, _ = read_hot_binding(home, session)
@@ -1947,15 +2040,10 @@ def user_hook(home, profile, event):
                     raise NativeError("SESSION_WORKSPACE_CHANGED")
                 if "archiveGeneration" in record:
                     raise NativeError(
-                        "SESSION_WORKSPACE_CHANGED (retained archive must be "
-                        "restored before a workspace transition)"
+                        "SESSION_WORKSPACE_CHANGED; restore the retained archive "
+                        "before a workspace transition"
                     )
-                rebound = rebind_workspace(
-                    home, profile, record, path, project, mode
-                )
-                if rebound is None:
-                    raise NativeError("SESSION_WORKSPACE_CHANGED")
-                record = rebound
+                record = rebind_workspace(home, profile, record, path, project, mode)
             if record is None:
                 if event.get("hook_event_name") != "UserPromptSubmit":
                     raise NativeError("PROMPT_EVENT_REQUIRED")
@@ -2147,6 +2235,16 @@ def user_drain_status(home, profile):
                 quiescent=False,
                 complete=False,
                 reason="RETENTION_JOURNAL_PENDING",
+            )
+        rebinds = home / REBIND_JOURNAL
+        if (rebinds.exists() or rebinds.is_symlink()) and any(
+            streamed_entries(rebinds)
+        ):
+            return dict(
+                status="incomplete",
+                quiescent=False,
+                complete=False,
+                reason="REBIND_JOURNAL_PENDING",
             )
         inspect_provisioning(home, profile)
         hot_count = archive_count = workspace_count = unresolved_count = 0
@@ -4361,8 +4459,12 @@ def dispatch_command(args, extra, locks):
                 raise NativeError("PUBLICATION_PENDING")
             if inspection and (home / "retention-journal.json").exists():
                 raise NativeError("RETENTION_JOURNAL_PENDING")
+            if inspection and (home / REBIND_JOURNAL).exists():
+                if any(streamed_entries(home / REBIND_JOURNAL)):
+                    raise NativeError("REBIND_JOURNAL_PENDING")
             if not inspection:
                 reconcile_retention(home)
+                reconcile_rebinds(home)
                 reconcile_enrollment(home, profile)
             record, _ = read_binding(home, args.session, restore=not inspection)
             if record is None:
