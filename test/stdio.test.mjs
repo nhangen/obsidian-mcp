@@ -544,7 +544,9 @@ test("commit metadata never reports filesystem detail for paths that resolve out
   assert.match(outsideDetail, /outside the approved repository roots/);
   assert.equal(await detail(3, join(root, "escape", "missing")), outsideDetail);
   assert.equal(await detail(4, join(root, "escape", "secret.txt")), outsideDetail);
-  assert.equal(await detail(5, join(root, "..", "outside", "missing")), outsideDetail);
+  for (const [id, repository] of [[5, `${root}/../outside/missing`], [7, `${root}/escape/../missing`], [8, `${root}/./missing`]]) {
+    assert.match(await detail(id, repository), /must not contain \. or \.\. segments/);
+  }
   assert.match(await detail(6, join(root, "missing")), /machine that owns the checkout/);
 });
 

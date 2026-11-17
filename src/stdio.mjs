@@ -316,11 +316,14 @@ function commitMetadata(repository, approvedRoots, signal) {
   if (!repository || !isAbsolute(repository) || repository.length > maxRepositoryPathCharacters) {
     return Promise.reject(codedError("PATH_INVALID", "repository must be an absolute path within the path limit"));
   }
+  if (repository.split(/[\\/]/).some((segment) => segment === "." || segment === "..")) {
+    return Promise.reject(codedError("PATH_INVALID", "repository must not contain . or .. segments", null, "repository must not contain . or .. segments"));
+  }
   const outsideRoots = () => codedError("PATH_INVALID", "repository is outside the approved roots", null, "repository is outside the approved repository roots; set MCP_REPOSITORY_ROOTS on this host to the roots that own the checkout");
   // Filesystem-specific detail only for paths inside an approved root, so the
   // public message cannot probe whether arbitrary paths exist.
   const canonicalAncestor = () => {
-    let candidate = resolve(repository);
+    let candidate = repository;
     for (;;) {
       try {
         return realpathSync(candidate);
