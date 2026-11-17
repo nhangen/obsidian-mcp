@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, readFile, writeFile, rm, symlink } from "node:fs/promises";
+import { readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -505,6 +505,47 @@ test("cancellation stops active child work and shutdown reaps it", async (t) => 
   server.child.stdin.end();
   await once(server.child, "close");
   await pendingHandled;
+});
+
+test("commit metadata never reports filesystem detail for paths that resolve outside the roots", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-meta-roots-")));
+  const vault = join(fixture, "vault");
+  const root = join(fixture, "root");
+  const outside = join(fixture, "outside");
+  const config = join(fixture, "obsidian.local.md");
+  await mkdir(vault);
+  await mkdir(root);
+  await mkdir(outside);
+  await writeFile(join(outside, "secret.txt"), "x");
+  await symlink(outside, join(root, "escape"));
+  await writeFile(config, `---\nvault_path: ${vault}\n---\n`);
+  const server = startServer(config, { MCP_REPOSITORY_ROOTS: root });
+  t.after(async () => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+    await Promise.race([once(server.child, "close").catch(() => {}), delay(500)]);
+    await rm(fixture, { recursive: true, force: true });
+  });
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "meta-roots-test", version: "1.0.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const detail = async (id, repository) => {
+    const response = await server.request({
+      jsonrpc: "2.0", id, method: "tools/call",
+      params: { name: "obsidian_commit_meta", arguments: { repository } },
+    }, id);
+    const payload = JSON.parse(response.result.content[0].text);
+    assert.equal(payload.code, "PATH_INVALID");
+    assert.ok(!payload.detail.includes(fixture));
+    return payload.detail;
+  };
+  const outsideDetail = await detail(2, join(outside, "missing"));
+  assert.match(outsideDetail, /outside the approved repository roots/);
+  assert.equal(await detail(3, join(root, "escape", "missing")), outsideDetail);
+  assert.equal(await detail(4, join(root, "escape", "secret.txt")), outsideDetail);
+  assert.equal(await detail(5, join(root, "..", "outside", "missing")), outsideDetail);
+  assert.match(await detail(6, join(root, "missing")), /machine that owns the checkout/);
 });
 
 test("MCP_COMMIT_META_TIMEOUT_MS caps commit metadata independently of the keeper caps", { timeout: 30_000 }, async (t) => {
