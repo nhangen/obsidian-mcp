@@ -320,8 +320,11 @@ function commitMetadata(repository, approvedRoots, signal) {
   try {
     canonicalRepository = realpathSync(repository);
     if (!statSync(canonicalRepository).isDirectory()) throw new Error("not a directory");
-  } catch {
-    return Promise.reject(codedError("PATH_INVALID", "repository is not an existing directory", null, "repository is not an existing directory on this host; read commit metadata from the machine that owns the checkout"));
+  } catch (error) {
+    const publicDetail = error?.code === "ENOENT"
+      ? "repository is not an existing directory on this host; read commit metadata from the machine that owns the checkout"
+      : "repository is not a readable directory on this host";
+    return Promise.reject(codedError("PATH_INVALID", "repository is not an existing directory", null, publicDetail));
   }
   if (!approvedRoots.some((root) => isContained(root, canonicalRepository))) {
     return Promise.reject(codedError("PATH_INVALID", "repository is outside the approved roots", null, "repository is outside the approved repository roots; set MCP_REPOSITORY_ROOTS on this host to the roots that own the checkout"));

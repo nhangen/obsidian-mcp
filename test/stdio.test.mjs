@@ -287,6 +287,38 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
   const outOfScopePayload = JSON.parse(outOfScope.result.content[0].text);
   assert.equal(outOfScopePayload.code, "PATH_INVALID");
   assert.match(outOfScopePayload.detail, /outside the approved repository roots/);
+  assert.ok(!outOfScopePayload.detail.includes(tmpdir()));
+
+  const missingRepository = join(tmpdir(), "obsidian-mcp-missing-checkout");
+  const missing = await server.request(
+    {
+      jsonrpc: "2.0",
+      id: 82,
+      method: "tools/call",
+      params: { name: "obsidian_commit_meta", arguments: { repository: missingRepository } },
+    },
+    82,
+  );
+  assert.equal(missing.result?.isError, true);
+  const missingPayload = JSON.parse(missing.result.content[0].text);
+  assert.equal(missingPayload.code, "PATH_INVALID");
+  assert.match(missingPayload.detail, /machine that owns the checkout/);
+  assert.ok(!missingPayload.detail.includes(missingRepository));
+
+  const fileRepository = join(vault, "mcp-note.md");
+  const notDirectory = await server.request(
+    {
+      jsonrpc: "2.0",
+      id: 83,
+      method: "tools/call",
+      params: { name: "obsidian_commit_meta", arguments: { repository: fileRepository } },
+    },
+    83,
+  );
+  const notDirectoryPayload = JSON.parse(notDirectory.result.content[0].text);
+  assert.equal(notDirectoryPayload.code, "PATH_INVALID");
+  assert.match(notDirectoryPayload.detail, /not a readable directory on this host/);
+  assert.ok(!notDirectoryPayload.detail.includes(fileRepository));
 
   const invalid = await server.request(
     {
