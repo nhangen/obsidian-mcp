@@ -316,18 +316,23 @@ function commitMetadata(repository, approvedRoots, signal) {
   if (!repository || !isAbsolute(repository) || repository.length > maxRepositoryPathCharacters) {
     return Promise.reject(codedError("PATH_INVALID", "repository must be an absolute path within the path limit"));
   }
+  const outsideRoots = () => codedError("PATH_INVALID", "repository is outside the approved roots", null, "repository is outside the approved repository roots; set MCP_REPOSITORY_ROOTS on this host to the roots that own the checkout");
+  // Filesystem-specific detail only for paths inside an approved root, so the
+  // public message cannot probe whether arbitrary paths exist.
+  const lexicallyApproved = approvedRoots.some((root) => isContained(root, resolve(repository)));
   let canonicalRepository;
   try {
     canonicalRepository = realpathSync(repository);
     if (!statSync(canonicalRepository).isDirectory()) throw new Error("not a directory");
   } catch (error) {
+    if (!lexicallyApproved) return Promise.reject(outsideRoots());
     const publicDetail = error?.code === "ENOENT"
       ? "repository is not an existing directory on this host; read commit metadata from the machine that owns the checkout"
       : "repository is not a readable directory on this host";
     return Promise.reject(codedError("PATH_INVALID", "repository is not an existing directory", null, publicDetail));
   }
   if (!approvedRoots.some((root) => isContained(root, canonicalRepository))) {
-    return Promise.reject(codedError("PATH_INVALID", "repository is outside the approved roots", null, "repository is outside the approved repository roots; set MCP_REPOSITORY_ROOTS on this host to the roots that own the checkout"));
+    return Promise.reject(outsideRoots());
   }
   throwIfAborted(signal);
   return new Promise((resolveResult, reject) => {

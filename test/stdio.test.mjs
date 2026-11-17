@@ -289,7 +289,7 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
   assert.match(outOfScopePayload.detail, /outside the approved repository roots/);
   assert.ok(!outOfScopePayload.detail.includes(tmpdir()));
 
-  const missingRepository = join(tmpdir(), "obsidian-mcp-missing-checkout");
+  const missingRepository = join(repositoryRoot, "obsidian-mcp-missing-checkout");
   const missing = await server.request(
     {
       jsonrpc: "2.0",
@@ -305,7 +305,20 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
   assert.match(missingPayload.detail, /machine that owns the checkout/);
   assert.ok(!missingPayload.detail.includes(missingRepository));
 
-  const fileRepository = join(vault, "mcp-note.md");
+  const missingOutside = join(tmpdir(), "obsidian-mcp-missing-checkout");
+  const probe = await server.request(
+    {
+      jsonrpc: "2.0",
+      id: 84,
+      method: "tools/call",
+      params: { name: "obsidian_commit_meta", arguments: { repository: missingOutside } },
+    },
+    84,
+  );
+  const probePayload = JSON.parse(probe.result.content[0].text);
+  assert.equal(probePayload.detail, outOfScopePayload.detail);
+
+  const fileRepository = join(repositoryRoot, "package.json");
   const notDirectory = await server.request(
     {
       jsonrpc: "2.0",
