@@ -6017,6 +6017,22 @@ module.hook(home, descriptor, json.loads(event))
             / (self.session_key("session-1") + ".json")
         )
 
+    def gate_owner(self, child):
+        active = child / "capture-state" / "active.json"
+        return json.loads(active.read_bytes())["session"] if active.exists() else None
+
+    def binding(self):
+        return json.loads(
+            (
+                self.home / "bindings" / (self.session_key("session-1") + ".json")
+            ).read_bytes()
+        )
+
+    def add_worktree(self):
+        worktree = self.directory / "managed-worktree"
+        self.git("worktree", "add", str(worktree))
+        return worktree.resolve()
+
     def test_managed_worktree_transition_rebinds_and_preserves_pending_capture(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
@@ -6056,10 +6072,18 @@ module.hook(home, descriptor, json.loads(event))
         )
         self.assertEqual(record["project"], str(self.project))
         self.assertEqual(record["workspace"], original_key)
-        other = self.directory / "other"
-        other.mkdir()
-        advisory = self.hook("UserPromptSubmit", cwd=str(other), prompt="next")
+        unrelated = self.directory / "unrelated-repository"
+        unrelated.mkdir()
+        subprocess.run(
+            ["git", "-C", str(unrelated), "init"],
+            env=self.environment,
+            capture_output=True,
+            check=True,
+        )
+        advisory = self.hook("UserPromptSubmit", cwd=str(unrelated), prompt="next")
         self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(advisory))
+        self.assertEqual(self.binding()["workspace"], original_key)
+
 
     def test_managed_worktree_transition_refuses_foreign_pending_evidence(self):
         self.configure()
@@ -6096,6 +6120,19 @@ module.hook(home, descriptor, json.loads(event))
         self.assertFalse(
             (self.home / "workspaces" / self.workspace_key(worktree)).exists()
         )
+
+    def test_unregistered_gitfile_is_not_a_managed_worktree(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        original_child = self.home / "workspaces" / self.workspace_key(self.project)
+        before = self.session_state(original_child).read_bytes()
+        forged = self.directory / "forged"
+        forged.mkdir()
+        (forged / ".git").write_text("gitdir: " + str(self.project / ".git") + "\n")
+        advisory = self.hook("UserPromptSubmit", cwd=str(forged), prompt="next")
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(advisory))
+        self.assertEqual(self.session_state(original_child).read_bytes(), before)
+        self.assertEqual(self.binding()["project"], str(self.project))
 
     def test_unresolved_previous_turn_is_retained_and_next_prompt_is_advisory(self):
         self.configure()

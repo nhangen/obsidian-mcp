@@ -1208,15 +1208,30 @@ def worktree_origin(root):
         return None
 
 
+def registered_worktrees(origin):
+    try:
+        text = git(origin, "worktree", "list", "--porcelain", allow_failure=True)
+    except (NativeError, OSError, subprocess.SubprocessError):
+        return set()
+    return {
+        str(Path(line[len("worktree ") :]).resolve())
+        for line in text.splitlines()
+        if line.startswith("worktree ")
+    }
+
+
 def verify_managed_worktree_transition(record, project, mode):
     """Whether project is the managed-worktree counterpart of the bound project."""
     if record.get("projectMode") != "git" or mode != "git":
         return False
-    if record.get("project") == project:
+    bound = record.get("project")
+    if bound == project:
         return False
-    if worktree_origin(project) == record.get("project"):
-        return True
-    return worktree_origin(record.get("project")) == project
+    if worktree_origin(project) == bound:
+        return project in registered_worktrees(bound)
+    if worktree_origin(bound) == project:
+        return bound in registered_worktrees(project)
+    return False
 
 
 def rebind_workspace(home, profile, record, path, project, mode):
