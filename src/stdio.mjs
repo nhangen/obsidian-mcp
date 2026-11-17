@@ -81,10 +81,11 @@ function stderr(message) {
   process.stderr.write(`mcp-server: ${message}\n`);
 }
 
-function codedError(code, detail, outcome) {
+function codedError(code, detail, outcome, publicDetail) {
   const error = new Error(detail);
   error.code = code;
   if (outcome) error.outcome = outcome;
+  if (publicDetail) error.publicDetail = publicDetail;
   return error;
 }
 
@@ -315,15 +316,38 @@ function commitMetadata(repository, approvedRoots, signal) {
   if (!repository || !isAbsolute(repository) || repository.length > maxRepositoryPathCharacters) {
     return Promise.reject(codedError("PATH_INVALID", "repository must be an absolute path within the path limit"));
   }
+  if (repository.split(/[\\/]/).some((segment) => segment === "." || segment === "..")) {
+    return Promise.reject(codedError("PATH_INVALID", "repository must not contain . or .. segments", null, "repository must not contain . or .. segments"));
+  }
+  const outsideRoots = () => codedError("PATH_INVALID", "repository is outside the approved roots", null, "repository is outside the approved repository roots; set MCP_REPOSITORY_ROOTS on this host to the roots that own the checkout");
+  // Filesystem-specific detail only for paths inside an approved root, so the
+  // public message cannot probe whether arbitrary paths exist.
+  const canonicalAncestor = () => {
+    let candidate = repository;
+    for (;;) {
+      try {
+        return realpathSync(candidate);
+      } catch {
+        const parent = dirname(candidate);
+        if (parent === candidate) return null;
+        candidate = parent;
+      }
+    }
+  };
   let canonicalRepository;
   try {
     canonicalRepository = realpathSync(repository);
     if (!statSync(canonicalRepository).isDirectory()) throw new Error("not a directory");
-  } catch {
-    return Promise.reject(codedError("PATH_INVALID", "repository is not an existing directory"));
+  } catch (error) {
+    const ancestor = canonicalAncestor();
+    if (!ancestor || !approvedRoots.some((root) => isContained(root, ancestor))) return Promise.reject(outsideRoots());
+    const publicDetail = error?.code === "ENOENT"
+      ? "repository is not an existing directory on this host; read commit metadata from the machine that owns the checkout"
+      : "repository is not a readable directory on this host";
+    return Promise.reject(codedError("PATH_INVALID", "repository is not an existing directory", null, publicDetail));
   }
   if (!approvedRoots.some((root) => isContained(root, canonicalRepository))) {
-    return Promise.reject(codedError("PATH_INVALID", "repository is outside the approved roots"));
+    return Promise.reject(outsideRoots());
   }
   throwIfAborted(signal);
   return new Promise((resolveResult, reject) => {
@@ -951,6 +975,8 @@ function errorResult(error) {
   }[code];
   const detail = code === "INVALID_INPUT" && typeof error?.inputDetail === "string"
     ? error.inputDetail.slice(0, 240)
+    : typeof error?.publicDetail === "string"
+    ? error.publicDetail.slice(0, 240)
     : genericDetail;
   const payload = error?.outcome ? { code, detail, ...error.outcome } : { code, detail };
   return { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true, ...(error?.outcome ? { structuredContent: error.outcome } : {}) };
