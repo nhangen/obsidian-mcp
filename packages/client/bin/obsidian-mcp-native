@@ -2862,8 +2862,12 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         if "commit" in words:
             raise NativeError("unsupported git options before commit")
         return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in command):
+        raise NativeError(
+            "unsupported commit command; control characters are not wrapped"
+        )
     if (
-        any(ord(c) < 32 or ord(c) == 127 or c in ";$`|&<>" for c in command)
+        any(c in ";$`|&<>" for c in command)
         or (root != Path(project) and not allow_subdirectory)
         or any(w in ("-c", "--config-env") for w in words)
     ):

@@ -8079,15 +8079,25 @@ class CaptureShellParserTest(NativeCaptureFixture):
             "git commit -m msg <<'EOF'\nx\nEOF\n",
             "cat <<EOF\n$(git commit -m x)\nEOF\n",
             "echo \"$(git commit -m x)\"",
-            "git commit -m \"foo\x00bar\"",
-            "git commit -m \"foo\x01bar\"",
-            "git commit -m \"foo\x1fbar\"",
-            "git commit -m \"foo\x7fbar\"",
         ):
             with self.assertRaises(module.NativeError) as raised:
                 module.shell_commit(command, self.project, self.project)
             self.assertIn(
                 "unsupported commit command", str(raised.exception), repr(command)
+            )
+        for command in (
+            "git commit -m \"foo\x00bar\"",
+            "git commit -m \"foo\x01bar\"",
+            "git commit -m \"foo\tbar\"",
+            "git commit -m \"foo\x1fbar\"",
+            "git commit -m \"foo\x7fbar\"",
+        ):
+            with self.assertRaises(module.NativeError) as raised:
+                module.shell_commit(command, self.project, self.project)
+            self.assertEqual(
+                str(raised.exception),
+                "unsupported commit command; control characters are not wrapped",
+                repr(command),
             )
 
     def test_needs_validation_matches_helper_outcome(self):
