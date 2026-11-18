@@ -85,14 +85,14 @@ class NativeCaptureFixture(unittest.TestCase):
             check=True,
         )
 
-    def cli(self, *args, payload=None):
+    def cli(self, *args, payload=None, timeout=30):
         return subprocess.run(
             [str(self.bundle / "bin/obsidian-mcp-native"), *args],
             input=json.dumps(payload) if payload is not None else "",
             env=self.environment,
             text=True,
             capture_output=True,
-            timeout=30,
+            timeout=timeout,
         )
 
     def configure(self, **extra):
@@ -130,11 +130,15 @@ class NativeCaptureFixture(unittest.TestCase):
             if path.name != "active.json"
         ]
 
-    def hook(self, name, **extra):
+    def hook(self, name, *, timeout=30, **extra):
         if extra.get("tool_name", "").startswith("mcp__"):
             extra.setdefault("tool_use_id", "fixture-mcp-call")
         result = self.cli(
-            "hook", "--home", str(self.home), payload=self.event(name, **extra)
+            "hook",
+            "--home",
+            str(self.home),
+            payload=self.event(name, **extra),
+            timeout=timeout,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout or "{}")
@@ -3899,14 +3903,17 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
         (self.project / "file.txt").write_text("content\n")
         self.git("add", "file.txt")
         native = self.load_native()
+        start = time.monotonic()
         with self.lock_wait_override("0.05"), native.gate_lock(self.home):
             denied = self.hook(
                 "PreToolUse",
                 tool_name="Bash",
                 tool_use_id="commit-call",
                 tool_input={"command": "git commit -m test"},
+                timeout=10,
             )
             self.assertIn("BlockingIOError", json.dumps(denied))
+        self.assertLess(time.monotonic() - start, 5.0)
 
     def test_busy_gate_after_wrapped_commit_still_persists_pending_capture(self):
         self.configure()
