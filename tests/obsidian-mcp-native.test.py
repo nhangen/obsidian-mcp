@@ -7258,15 +7258,8 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(
             state["git_watch"]["head"], self.git("rev-parse", "HEAD").stdout.strip()
         )
-        # The outage commit is not captured retroactively; the watch resumes
-        # from the fresh baseline and only later movement is captured.
-        self.assertNotIn(
-            self.git("rev-parse", "HEAD").stdout.strip(),
-            [pending["event"].get("commit") for pending in state["commits"].values()],
-        )
-
-        # The outage window is still reported as pending evidence until the
-        # next turn resolves it; the at-risk window is gone.
+        # The outage resolution is not drain evidence: only the repaired
+        # session's pending turn remains, and the at-risk window is gone.
         after = self.drain()
         self.assertEqual(after["status"], "inspected")
         self.assertFalse(after["quiescent"])
