@@ -3908,6 +3908,31 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
             )
             self.assertIn("BlockingIOError", json.dumps(denied))
 
+    def test_busy_gate_after_wrapped_commit_still_persists_pending_capture(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        args = dict(
+            tool_name="Bash",
+            tool_use_id="commit-call",
+            tool_input={"command": "git commit -m fixture"},
+        )
+        rewritten = self.hook("PreToolUse", **args)
+        (self.project / "file.txt").write_text("fixture\n")
+        self.git("add", "file.txt")
+        executed = self.execute_rewritten(rewritten)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        native = self.load_native()
+        with self.lock_wait_override("0.05"), native.gate_lock(self.home):
+            result = self.hook("PostToolUse", **args, tool_response=executed.stdout)
+        self.assertNotIn("HOOK_STATE_OR_EVENT_INVALID", json.dumps(result))
+        self.assertIn("CAPTURE_GATE_BUSY", json.dumps(result))
+        (path,) = self.state_paths()
+        state = json.loads(path.read_text())
+        self.assertEqual(
+            [commit["status"] for commit in state["commits"].values()], ["pending"]
+        )
+        self.assertEqual(state["snapshots"], {})
+
     def test_hook_lock_wait_override_bounds_duration(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")

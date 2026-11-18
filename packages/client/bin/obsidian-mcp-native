@@ -2784,6 +2784,11 @@ def claim_gate(home, session, state):
 def settle_gate(home, session, state):
     try:
         owner = claim_gate(home, session, state)
+    except BlockingIOError:
+        return (
+            "\nThe capture gate is busy (CAPTURE_GATE_BUSY), so it was not updated for"
+            " this session; the session state was still saved and the next event retries."
+        )
     except NativeError as error:
         if str(error) != "ACTIVE_STATE_INVALID":
             raise
