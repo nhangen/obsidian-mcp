@@ -9051,7 +9051,7 @@ def write(path, contents, *args, **kwargs):
         state = json.loads(contents)
     except ValueError:
         state = {}
-    if remaining and state.get('snapshots') and 'stop_watched' not in state:
+    if remaining and state.get('snapshots'):
         remaining -= 1
         raise OSError('fixture state write failure')
     return original(path, contents, *args, **kwargs)
