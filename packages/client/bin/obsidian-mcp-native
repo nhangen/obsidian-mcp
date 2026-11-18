@@ -1295,10 +1295,27 @@ def verify_managed_worktree_transition(record, project, mode):
 REBIND_JOURNAL = "rebind-journal"
 
 
+def is_outage_resolution(resolution):
+    """A resolution written by takeover --repair-state for an unparseable state."""
+    return isinstance(resolution, dict) and resolution.get("reason") == "state_invalid"
+
+
+def has_outage_resolution(state):
+    return any(
+        is_outage_resolution(r) for r in (state.get("snapshot_resolutions") or [])
+    )
+
+
+def has_unresolved_snapshot(state):
+    return any(
+        not is_outage_resolution(r) for r in (state.get("snapshot_resolutions") or [])
+    )
+
+
 def carried_evidence_refusal(state, repositories):
     if state is None:
         return None
-    if state.get("snapshots") or state.get("snapshot_resolutions"):
+    if state.get("snapshots") or has_unresolved_snapshot(state):
         return "resolve pending command snapshots before a workspace transition"
     for pending in (state.get("commits") or {}).values():
         if not isinstance(pending, dict):
@@ -2643,10 +2660,7 @@ def drain_reasons(state):
             or pending.get("recovery")
         ):
             reasons.append("commit_pending_or_unresolved")
-    if any(
-        r.get("reason") != "state_invalid"
-        for r in state.get("snapshot_resolutions", [])
-    ):
+    if has_unresolved_snapshot(state):
         reasons.append("uncaptured_snapshot_evidence")
     return sorted(set(reasons))
 
@@ -3526,11 +3540,7 @@ def normalize_claude(event, state):
         drain_reasons(state)
     identity = claude_transcript(event)
     if state and state.get("claude_transcript") != identity:
-        outage_repair = any(
-            r.get("reason") == "state_invalid"
-            for r in (state.get("snapshot_resolutions") or [])
-        )
-        if not (outage_repair and state.get("claude_transcript") is None):
+        if not (has_outage_resolution(state) and state.get("claude_transcript") is None):
             raise NativeError("TRANSCRIPT_IDENTITY_CHANGED")
         state["claude_transcript"] = identity
     normalized = dict(event)
@@ -3788,13 +3798,7 @@ def engine_hook(home, profile, event):
             )
             reconcile_note = ""
             if not continuation and (state is None or state["turn"] != turn):
-                outage_repair = bool(
-                    state
-                    and any(
-                        r.get("reason") == "state_invalid"
-                        for r in (state.get("snapshot_resolutions") or [])
-                    )
-                )
+                outage_repair = bool(state and has_outage_resolution(state))
                 if state and not outage_repair and (
                     state["disposition"] == "pending"
                     or state.get("session_recovery")
@@ -3803,10 +3807,7 @@ def engine_hook(home, profile, event):
                         p["status"] in ("pending", "not_captured")
                         for p in state["commits"].values()
                     )
-                    or any(
-                        r.get("reason") != "state_invalid"
-                        for r in state.get("snapshot_resolutions", [])
-                    )
+                    or has_unresolved_snapshot(state)
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if (

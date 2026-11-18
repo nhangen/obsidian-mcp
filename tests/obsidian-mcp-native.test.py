@@ -7248,6 +7248,23 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse(path.with_name(path.name + ".invalid").exists())
 
+    def test_outage_resolution_alone_does_not_refuse_a_workspace_transition(self):
+        native = self.load_native()
+        outage = dict(status="not_captured", reason="state_invalid", observed_head=None)
+        other = dict(status="not_captured", reason="snapshot_lost")
+
+        self.assertIsNone(
+            native.carried_evidence_refusal(
+                dict(snapshots={}, commits={}, snapshot_resolutions=[outage]), ()
+            )
+        )
+        self.assertIsNotNone(
+            native.carried_evidence_refusal(
+                dict(snapshots={}, commits={}, snapshot_resolutions=[outage, other]),
+                (),
+            )
+        )
+
     def test_missing_enrolled_state_reports_stable_code(self):
         self.configure()
         self.terminal_session()
