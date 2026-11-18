@@ -8096,7 +8096,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
                 module.shell_commit(command, self.project, self.project)
             self.assertEqual(
                 str(raised.exception),
-                "unsupported commit command; control characters are not wrapped",
+                "unsupported commit command; contains control characters",
                 repr(command),
             )
 

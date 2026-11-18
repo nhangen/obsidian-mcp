@@ -2864,7 +2864,7 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         return None
     if any(ord(c) < 32 or ord(c) == 127 for c in command):
         raise NativeError(
-            "unsupported commit command; control characters are not wrapped"
+            "unsupported commit command; contains control characters"
         )
     if (
         any(c in ";$`|&<>" for c in command)
