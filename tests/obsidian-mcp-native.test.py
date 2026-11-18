@@ -155,11 +155,21 @@ class NativeCaptureFixture(unittest.TestCase):
         state = json.loads(path.read_text())
         return path, state, next(iter(state["commits"]))
 
+    @contextmanager
+    def lock_wait_override(self, seconds):
+        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
+        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = seconds
+        try:
+            yield
+        finally:
+            if old_wait is None:
+                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
+            else:
+                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+
     def assert_busy_commit_guard(self, path, lockers):
         before = path.read_bytes()
-        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
-        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
-        try:
+        with self.lock_wait_override("0.05"):
             for label, acquire in lockers:
                 with acquire():
                     for command in (
@@ -188,11 +198,6 @@ class NativeCaptureFixture(unittest.TestCase):
                             "permissionDecision", advisory.get("hookSpecificOutput", {})
                         )
             self.assertEqual(path.read_bytes(), before)
-        finally:
-            if old_wait is None:
-                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
-            else:
-                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
 
     @contextmanager
     def briefly_held(self, lock, seconds=0.4):
@@ -3894,22 +3899,14 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
         (self.project / "file.txt").write_text("content\n")
         self.git("add", "file.txt")
         native = self.load_native()
-        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
-        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
-        try:
-            with native.gate_lock(self.home):
-                denied = self.hook(
-                    "PreToolUse",
-                    tool_name="Bash",
-                    tool_use_id="commit-call",
-                    tool_input={"command": "git commit -m test"},
-                )
-                self.assertIn("BlockingIOError", json.dumps(denied))
-        finally:
-            if old_wait is None:
-                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
-            else:
-                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+        with self.lock_wait_override("0.05"), native.gate_lock(self.home):
+            denied = self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="commit-call",
+                tool_input={"command": "git commit -m test"},
+            )
+            self.assertIn("BlockingIOError", json.dumps(denied))
 
     def test_hook_lock_wait_override_bounds_duration(self):
         self.configure()
@@ -3920,23 +3917,15 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
             if path.name != "active.lock"
         )
         native = self.load_native()
-        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
-        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
         start = time.monotonic()
-        try:
-            with native.state_lock(self.home, lock.stem):
-                result = self.hook(
-                    "PreToolUse",
-                    tool_name="mcp__obsidian-write__obsidian_keeper_save",
-                    tool_use_id="busy-save",
-                    tool_input={},
-                )
-                self.assertIn("BlockingIOError", json.dumps(result))
-        finally:
-            if old_wait is None:
-                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
-            else:
-                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+        with self.lock_wait_override("0.05"), native.state_lock(self.home, lock.stem):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                tool_use_id="busy-save",
+                tool_input={},
+            )
+            self.assertIn("BlockingIOError", json.dumps(result))
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 1.0)
 
