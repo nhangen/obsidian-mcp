@@ -318,9 +318,22 @@ enrollment date (`ENROLLMENT_PUBLICATION_INVALID`,
 A commit-shaped tool call during such a failure runs unchanged with the code in
 its advisory, but the HEAD reflog watch does not run while the file stays
 damaged. Restoring the original file lets the next hook event record the commit.
-Deleting or rebuilding session state takes a fresh reflog baseline, so a commit
-made during the failure is not captured; there is no supported repair for
-`STATE_INVALID` yet (#44).
+When the original bytes cannot be restored,
+`takeover --repair-state --session <session> --verification command-stopped-and-history-inspected`
+moves the unparseable file aside (`.json.invalid`), rebuilds a minimal valid state,
+and records a `snapshot_resolutions` entry with `status="not_captured"` and the
+current HEAD as `observed_head`. The outage commit is not captured retroactively;
+the loss is named explicitly, and the reflog watch resumes from the fresh baseline.
+That record is short-lived and partial: `observed_head` names only the HEAD at
+repair time, not each commit made during the outage, and the next
+`UserPromptSubmit` replaces the state that holds it. The command's JSON output and
+the `.json.invalid` file are what remain, so keep the output if the outage
+matters (#49).
+A missing state file under an enrolled binding reports `ENROLLED_STATE_MISSING`
+instead of a leaked filesystem error. User-scope `drain-status` and
+`profile-status` surface at-risk sessions with the repair command; project-scope
+`drain-status` fails closed with `STATE_INVALID`, and project-scope `status` and
+`profile-status --session` name the repair.
 If `daily-append` or `resolve-snapshot` finish their local write and then find
 the gate corrupt or owned by another session, they report it (`note` in the
 result, one context line in the hook) without raising, so a completed capture

@@ -22,6 +22,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 
+REPAIR_STATE_HINT = (
+    "takeover --repair-state --session <session> "
+    "--verification command-stopped-and-history-inspected"
+)
+
+
 class NativeCaptureFixture(unittest.TestCase):
     expected_rewrite_decision = "allow"
     initialize_git = True
@@ -349,6 +355,18 @@ except namespace['NativeError'] as error:
                 self.assertEqual(remaining["snapshots"][key], snapshot)
                 self.assertEqual(remaining["commits"], {})
                 self.assertNotEqual(self.git("rev-parse", "HEAD").stdout, head)
+
+    def repair(self, session):
+        return self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            session,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
 
     def load_native(self):
         script = self.bundle / "bin/obsidian-mcp-native"
@@ -2369,6 +2387,103 @@ class NativeCaptureTest(NativeCaptureFixture):
             module.retained_locator(home, session, envelope)
         self.assertEqual(str(raised.exception), "RETENTION_ARCHIVE_INVALID")
         self.assertTrue(locator.exists())
+
+    def test_status_flags_only_an_existing_unparseable_state(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        unknown = self.session_key("never-started")
+        for operation in ("profile-status", "status"):
+            result = self.cli(operation, "--home", str(self.home), "--session", unknown)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("state_invalid", json.loads(result.stdout))
+
+        self.state_paths()[0].write_bytes(b"not json")
+        flagged = self.cli(
+            "profile-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+        self.assertEqual(flagged.returncode, 0, flagged.stderr)
+        self.assertTrue(json.loads(flagged.stdout)["state_invalid"])
+
+    def test_project_drain_status_fails_closed_on_a_corrupt_state(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.state_paths()[0].write_bytes(b"not json")
+
+        result = self.cli(
+            "drain-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("STATE_INVALID", result.stderr)
+
+    def test_repair_state_flag_is_rejected_outside_takeover(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+
+        result = self.cli(
+            "status",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ARGUMENTS_INVALID", result.stderr)
+
+    def test_status_reports_an_unreadable_state_by_its_own_code(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.state_paths()[0].chmod(0o644)
+
+        result = self.cli(
+            "profile-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PRIVATE_FILE_INVALID", result.stderr)
+        self.assertNotIn("repair-state", result.stdout)
+
+    def test_repair_state_refuses_a_session_that_never_started(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        state = json.loads(self.state_paths()[0].read_text())
+        skipped = self.cli(
+            "skip",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+            "--turn",
+            state["turn"],
+            "--reason",
+            "no_meaningful_work",
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        unknown = self.session_key("never-started")
+        status = self.cli("status", "--home", str(self.home), "--session", unknown)
+        self.assertEqual(status.returncode, 0, status.stderr)
+
+        # The status call and the first refusal both leave a lock file behind;
+        # neither may make the never-started session repairable.
+        for _ in range(2):
+            refused = self.repair(unknown)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
+        self.assertFalse((self.home / "capture-state" / (unknown + ".json")).exists())
 
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
@@ -7075,6 +7190,242 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(drained["workspace_count"], 2)
         self.assertEqual(drained["session_count"], 2)
         self.assertEqual(json.loads(ownership_path.read_text()), ownership)
+
+    def corrupt_file(self, path, body=b"not json"):
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.write_bytes(body)
+        path.chmod(0o600)
+        return path
+
+    def test_state_invalid_outage_commit_recovers_through_repair_state(self):
+        """A commit made while the state file is unparseable survives the
+        supported repair path: the outage window is recorded as an explicit
+        not_captured resolution with the observed HEAD, the state is valid
+        again, and the HEAD reflog watch resumes from the fresh baseline.
+        """
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+        base_head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.corrupt_file(path, b"not json")
+
+        # Drain must name the at-risk window instead of raising.
+        at_risk = self.drain()
+        self.assertEqual(at_risk["status"], "incomplete")
+        self.assertFalse(at_risk["quiescent"])
+        self.assertTrue(at_risk["drain_at_risk"])
+        self.assertEqual(at_risk["reason"], "STATE_INVALID_AT_RISK")
+        self.assertEqual(
+            at_risk["at_risk"][0]["session"], self.session_key("session-1")
+        )
+
+        # A commit lands during the outage; the state file stays corrupt.
+        (self.project / "outage.txt").write_text("outage\n")
+        self.git("add", "outage.txt")
+        self.git("commit", "--allow-empty", "-m", "outage")
+        outage_head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(outage_head, base_head)
+
+        # The supported repair path rebuilds a minimal valid state and names
+        # the outage window as not_captured with the observed HEAD.
+        repaired = self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        outcome = json.loads(repaired.stdout)
+        self.assertEqual(outcome["status"], "repaired")
+        self.assertEqual(outcome["session"], self.session_key("session-1"))
+        self.assertEqual(outcome["observed_head"], outage_head)
+        self.assertFalse(outcome["head_unavailable"])
+        self.assertFalse(outcome["watch_unavailable"])
+        quarantined = Path(outcome["quarantine"])
+        self.assertEqual(quarantined.read_bytes(), b"not json")
+        self.assertTrue(path.exists())
+
+        state = json.loads(
+            next(
+                (self.home / "workspaces").glob(
+                    "*/capture-state/" + self.session_key("session-1") + ".json"
+                )
+            ).read_text()
+        )
+        self.assertEqual(state["schemaVersion"], 1)
+        self.assertEqual(state["session"], self.session_key("session-1"))
+        self.assertEqual(state["disposition"], "pending")
+        resolutions = state["snapshot_resolutions"]
+        self.assertEqual(len(resolutions), 1)
+        self.assertEqual(resolutions[0]["status"], "not_captured")
+        self.assertEqual(resolutions[0]["observed_head"], outage_head)
+        self.assertEqual(
+            resolutions[0]["verification"], "command-stopped-and-history-inspected"
+        )
+        self.assertEqual(
+            state["git_watch"]["head"], self.git("rev-parse", "HEAD").stdout.strip()
+        )
+        # The outage resolution is not drain evidence: only the repaired
+        # session's pending turn remains, and the at-risk window is gone.
+        after = self.drain()
+        self.assertEqual(after["status"], "inspected")
+        self.assertFalse(after["quiescent"])
+        self.assertNotIn("drain_at_risk", after)
+        self.assertNotIn(
+            "uncaptured_snapshot_evidence",
+            [reason for session in after["sessions"] for reason in session.get("unresolved", [])],
+        )
+
+        # A later commit is captured by the resumed watch.
+        (self.project / "after.txt").write_text("after\n")
+        self.git("add", "after.txt")
+        self.git("commit", "--allow-empty", "-m", "after")
+        self.hook("UserPromptSubmit", session_id="session-1", prompt="after outage")
+        captured = json.loads(
+            next(
+                (self.home / "workspaces").glob(
+                    "*/capture-state/" + self.session_key("session-1") + ".json"
+                )
+            ).read_text()
+        )
+        self.assertIn(
+            self.git("rev-parse", "HEAD").stdout.strip(),
+            [pending["event"].get("commit") for pending in captured["commits"].values()],
+        )
+
+    def test_repair_state_refuses_a_valid_state(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+        before = path.read_bytes()
+
+        refused = self.repair(self.session_key("session-1"))
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(path.with_name(path.name + ".invalid").exists())
+
+    def test_repaired_state_still_gates_on_a_later_unresolved_recovery(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        session = self.session_key("session-1")
+        path = next(
+            (self.home / "workspaces").glob("*/capture-state/" + session + ".json")
+        )
+        self.corrupt_file(path, b"not json")
+        repaired = self.repair(session)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        state = json.loads(path.read_text())
+        state["session_recovery"] = True
+        path.write_text(json.dumps(state))
+
+        output = self.hook("UserPromptSubmit", session_id="session-1", prompt="next")
+
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        self.assertTrue(json.loads(path.read_text())["session_recovery"])
+
+    def test_reconcile_enrollment_only_skips_a_corrupt_state(self):
+        self.configure()
+        self.terminal_session()
+        session = self.session_key("session-1")
+        binding = self.home / "bindings" / (session + ".json")
+        record = json.loads(binding.read_text())
+        binding.write_text(json.dumps(dict(record, enrolled=False)))
+        native = self.load_native()
+        _, profile = native.load_profile(self.home)
+
+        def conflict(*args, **kwargs):
+            raise native.NativeError("PUBLICATION_CONFLICT")
+
+        native.validate_initial_state = conflict
+        with self.assertRaisesRegex(native.NativeError, "PUBLICATION_CONFLICT"):
+            native.reconcile_enrollment(self.home, profile)
+
+        def corrupt(*args, **kwargs):
+            raise native.NativeError("STATE_INVALID")
+
+        native.validate_initial_state = corrupt
+        native.reconcile_enrollment(self.home, profile)
+        self.assertFalse(json.loads(binding.read_text())["enrolled"])
+
+    def test_outage_resolution_alone_does_not_refuse_a_workspace_transition(self):
+        native = self.load_native()
+        outage = dict(status="not_captured", reason="state_invalid", observed_head=None)
+        other = dict(status="not_captured", reason="snapshot_lost")
+
+        self.assertIsNone(
+            native.carried_evidence_refusal(
+                dict(snapshots={}, commits={}, snapshot_resolutions=[outage]), ()
+            )
+        )
+        self.assertIsNotNone(
+            native.carried_evidence_refusal(
+                dict(snapshots={}, commits={}, snapshot_resolutions=[outage, other]),
+                (),
+            )
+        )
+
+    def test_missing_enrolled_state_reports_stable_code(self):
+        self.configure()
+        self.terminal_session()
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+        path.unlink()
+
+        # Hooks report the stable code instead of FileNotFoundError or USER_CAPTURE_UNAVAILABLE.
+        denied = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "git status"})
+        self.assertIn("ENROLLED_STATE_MISSING", json.dumps(denied))
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
+
+        # Drain status reports the stable error code and fails closed.
+        drain = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(drain.returncode, 64)
+        self.assertIn("ENROLLED_STATE_MISSING", drain.stderr)
+
+    def test_profile_status_and_status_surface_state_invalid(self):
+        self.configure()
+        self.terminal_session()
+        session_key = self.session_key("session-1")
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + session_key + ".json"
+            )
+        )
+        self.corrupt_file(path, b"not json")
+
+        # status surfaces state_invalid and the supported repair command
+        st = self.cli("status", "--home", str(self.home), "--session", session_key)
+        self.assertEqual(st.returncode, 0, st.stderr)
+        st_data = json.loads(st.stdout)
+        self.assertTrue(st_data.get("state_invalid"))
+        self.assertEqual(st_data.get("state_invalid_repair"), REPAIR_STATE_HINT)
+
+        # profile-status surfaces state_invalid
+        prof = self.cli("profile-status", "--home", str(self.home))
+        self.assertEqual(prof.returncode, 0, prof.stderr)
+        prof_data = json.loads(prof.stdout)
+        self.assertTrue(prof_data.get("state_invalid"))
+        self.assertEqual(prof_data.get("state_invalid_repair"), REPAIR_STATE_HINT)
+        self.assertIn(session_key, prof_data.get("at_risk", []))
 
 
 class CommitRoutesTest(NativeCaptureFixture):
