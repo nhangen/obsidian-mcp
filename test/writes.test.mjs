@@ -968,6 +968,7 @@ test("find_notes ignores hidden and build directories and non-markdown entries (
   });
 
   await writeFile(join(vaultPath, "Inbox", "Legitimate.md"), "unique_search_token in legitimate note\n", "utf8");
+  await writeFile(join(vaultPath, "Inbox", ".note.md"), "unique_search_token in dot note\n", "utf8");
 
   await mkdir(join(vaultPath, "node_modules", "pkg"), { recursive: true });
   await writeFile(join(vaultPath, "node_modules", "pkg", "README.md"), "unique_search_token in dependency\n", "utf8");
@@ -997,7 +998,7 @@ test("find_notes ignores hidden and build directories and non-markdown entries (
   }, 2);
   assert.equal(result.result.isError, false);
   const paths = result.result.structuredContent.matches.map((m) => m.path);
-  assert.deepEqual(paths, ["Inbox/Legitimate.md"]);
+  assert.deepEqual(paths.sort(), ["Inbox/.note.md", "Inbox/Legitimate.md"]);
 });
 
 test("find_notes reports SCAN_LIMIT when vault markdown size exceeds maxScanBytes (#59)", async (t) => {

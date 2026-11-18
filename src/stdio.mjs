@@ -201,10 +201,9 @@ async function collectMarkdownFiles(root, current = root, files = [], signal, st
   const directories = [];
   for (const entry of entries) {
     throwIfAborted(signal);
-    if (entry.name.startsWith(".")) continue;
     const path = join(current, entry.name);
     if (entry.isDirectory()) {
-      if (ignoredDirectoryNames.has(entry.name.toLowerCase())) continue;
+      if (entry.name.startsWith(".") || ignoredDirectoryNames.has(entry.name.toLowerCase())) continue;
       state.entries += 1;
       if (state.entries > maxScanEntries) throw codedError("SCAN_LIMIT", "vault scan exceeded entry limit");
       directories.push(path);
