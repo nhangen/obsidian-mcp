@@ -1001,6 +1001,39 @@ test("find_notes ignores hidden and build directories and non-markdown entries (
   assert.deepEqual(paths.sort(), ["Inbox/.note.md", "Inbox/Legitimate.md"]);
 });
 
+test("find_notes scans notes successfully when non-markdown asset count exceeds maxScanEntries (#59)", async (t) => {
+  const { root, vaultPath, configPath } = await createFixtureVault();
+  const server = startStdioServer(configPath);
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await once(server.child, "close").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await writeFile(join(vaultPath, "Inbox", "Note.md"), "budget_search_token in note\n", "utf8");
+
+  await mkdir(join(vaultPath, "Assets"), { recursive: true });
+  const assetWrites = [];
+  for (let i = 0; i < 10005; i++) {
+    assetWrites.push(writeFile(join(vaultPath, "Assets", `asset_${i}.png`), ""));
+  }
+  await Promise.all(assetWrites);
+
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const result = await server.request({
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "obsidian_find_notes", arguments: { query: "budget_search_token" } },
+  }, 2);
+  assert.equal(result.result.isError, false);
+  const paths = result.result.structuredContent.matches.map((m) => m.path);
+  assert.deepEqual(paths, ["Inbox/Note.md"]);
+});
+
 test("find_notes reports SCAN_LIMIT when vault markdown size exceeds maxScanBytes (#59)", async (t) => {
   const { root, vaultPath, configPath } = await createFixtureVault();
   const server = startStdioServer(configPath);
