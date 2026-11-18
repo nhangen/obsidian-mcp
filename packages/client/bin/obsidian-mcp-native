@@ -4486,32 +4486,34 @@ def repair_state(home, profile, args):
                     raise NativeError("REPAIR_STATE_NOT_INVALID")
                 if quarantined.exists() or quarantined.is_symlink():
                     raise NativeError("REPAIR_QUARANTINE_TAKEN")
-        observed_head = (
-            git(
-                Path(profile["project"]),
-                "rev-parse",
-                "--verify",
-                "HEAD",
-                allow_failure=True,
-            ).strip()
-            or None
-        )
-        state = initial_session_state(
-            profile, session, digest(b"repair-state-outage")
-        )
-        state["snapshot_resolutions"] = [
-            dict(
-                owner=session,
-                observed_head=observed_head,
-                status="not_captured",
-                reason="state_invalid",
+            observed_head = (
+                git(
+                    Path(profile["project"]),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                    allow_failure=True,
+                ).strip()
+                or None
             )
-        ]
-        try:
-            state["git_watch"] = git_position(Path(profile["project"]))
-        except WATCH_ERRORS:
-            pass
-        atomic_write(state_path, encode(state))
+            state = initial_session_state(
+                profile, session, digest(b"repair-state-outage")
+            )
+            state["snapshot_resolutions"] = [
+                dict(
+                    owner=session,
+                    observed_head=observed_head,
+                    status="not_captured",
+                    reason="state_invalid",
+                    verification=args.verification,
+                )
+            ]
+            watch_unavailable = False
+            try:
+                state["git_watch"] = git_position(Path(profile["project"]))
+            except WATCH_ERRORS:
+                watch_unavailable = True
+            atomic_write(state_path, encode(state))
         if owner is not None:
             release_gate(gate)
         return dict(
@@ -4520,6 +4522,7 @@ def repair_state(home, profile, args):
             quarantine=str(quarantined),
             observed_head=observed_head,
             head_unavailable=observed_head is None,
+            watch_unavailable=watch_unavailable,
         )
 
 

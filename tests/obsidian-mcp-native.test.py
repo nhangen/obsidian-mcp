@@ -7170,6 +7170,7 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(outcome["session"], self.session_key("session-1"))
         self.assertEqual(outcome["observed_head"], outage_head)
         self.assertFalse(outcome["head_unavailable"])
+        self.assertFalse(outcome["watch_unavailable"])
         quarantined = Path(outcome["quarantine"])
         self.assertEqual(quarantined.read_bytes(), b"not json")
         self.assertTrue(path.exists())
@@ -7188,6 +7189,12 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(len(resolutions), 1)
         self.assertEqual(resolutions[0]["status"], "not_captured")
         self.assertEqual(resolutions[0]["observed_head"], outage_head)
+        self.assertEqual(
+            resolutions[0]["verification"], "command-stopped-and-history-inspected"
+        )
+        self.assertEqual(
+            state["git_watch"]["head"], self.git("rev-parse", "HEAD").stdout.strip()
+        )
         # The outage commit is not captured retroactively; the watch resumes
         # from the fresh baseline and only later movement is captured.
         self.assertNotIn(
