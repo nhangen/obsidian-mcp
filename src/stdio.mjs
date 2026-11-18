@@ -53,6 +53,16 @@ const maxRepositoryPathCharacters = 4096;
 const maxScanEntries = 10_000;
 const maxScanBytes = 64 * 1024 * 1024;
 const searchConcurrency = 16;
+const ignoredDirectoryNames = new Set([
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  "vendor",
+  "__pycache__",
+  ".venv",
+  "venv",
+]);
 
 // Subprocess caps per call type, in milliseconds. A keeper save writes the note
 // and then reconciles the folder INDEX, so it gets the most room. Over HTTP,
@@ -191,13 +201,15 @@ async function collectMarkdownFiles(root, current = root, files = [], signal, st
   const directories = [];
   for (const entry of entries) {
     throwIfAborted(signal);
-    if (entry.name === ".obsidian") continue;
     const path = join(current, entry.name);
-    state.entries += 1;
-    if (state.entries > maxScanEntries) throw codedError("SCAN_LIMIT", "vault scan exceeded entry limit");
     if (entry.isDirectory()) {
+      if (entry.name.startsWith(".") || ignoredDirectoryNames.has(entry.name.toLowerCase())) continue;
+      state.entries += 1;
+      if (state.entries > maxScanEntries) throw codedError("SCAN_LIMIT", "vault scan exceeded entry limit");
       directories.push(path);
     } else if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
+      state.entries += 1;
+      if (state.entries > maxScanEntries) throw codedError("SCAN_LIMIT", "vault scan exceeded entry limit");
       let details;
       try {
         details = await lstat(path);

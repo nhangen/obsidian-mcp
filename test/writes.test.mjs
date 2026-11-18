@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readdir, readFile, rm, symlink, writeFile, mkdir } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm, symlink, writeFile, mkdir, open } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -956,6 +956,112 @@ test("find_notes matches every term of a multi-word query, not the whole phrase 
   const matches = ranked.result.structuredContent.matches;
   assert.deepEqual(matches.map((match) => match.path), ["Projects/Strong.md", "Projects/Weak.md"]);
   assert.equal(matches[1].preview, "beta first line");
+});
+
+test("find_notes ignores hidden and build directories and non-markdown entries (#59)", async (t) => {
+  const { root, vaultPath, configPath } = await createFixtureVault();
+  const server = startStdioServer(configPath);
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await once(server.child, "close").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await writeFile(join(vaultPath, "Inbox", "Legitimate.md"), "unique_search_token in legitimate note\n", "utf8");
+  await writeFile(join(vaultPath, "Inbox", ".note.md"), "unique_search_token in dot note\n", "utf8");
+
+  await mkdir(join(vaultPath, "node_modules", "pkg"), { recursive: true });
+  await writeFile(join(vaultPath, "node_modules", "pkg", "README.md"), "unique_search_token in dependency\n", "utf8");
+
+  await mkdir(join(vaultPath, "target", "debug"), { recursive: true });
+  await writeFile(join(vaultPath, "target", "debug", "build.md"), "unique_search_token in build output\n", "utf8");
+
+  await mkdir(join(vaultPath, ".git", "hooks"), { recursive: true });
+  await writeFile(join(vaultPath, ".git", "hooks", "hook.md"), "unique_search_token in vcs\n", "utf8");
+
+  await mkdir(join(vaultPath, ".trash"), { recursive: true });
+  await writeFile(join(vaultPath, ".trash", "Deleted.md"), "unique_search_token in trash\n", "utf8");
+
+  await mkdir(join(vaultPath, "Assets"), { recursive: true });
+  await writeFile(join(vaultPath, "Assets", "image.png"), "not a markdown file", "utf8");
+  await writeFile(join(vaultPath, "Assets", "data.json"), "{}", "utf8");
+
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const result = await server.request({
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "obsidian_find_notes", arguments: { query: "unique_search_token" } },
+  }, 2);
+  assert.equal(result.result.isError, false);
+  const paths = result.result.structuredContent.matches.map((m) => m.path);
+  assert.deepEqual(paths.sort(), ["Inbox/.note.md", "Inbox/Legitimate.md"]);
+});
+
+test("find_notes scans notes successfully when non-markdown asset count exceeds maxScanEntries (#59)", async (t) => {
+  const { root, vaultPath, configPath } = await createFixtureVault();
+  const server = startStdioServer(configPath);
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await once(server.child, "close").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await writeFile(join(vaultPath, "Inbox", "Note.md"), "budget_search_token in note\n", "utf8");
+
+  await mkdir(join(vaultPath, "Assets"), { recursive: true });
+  const assetWrites = [];
+  for (let i = 0; i < 10005; i++) {
+    assetWrites.push(writeFile(join(vaultPath, "Assets", `asset_${i}.png`), ""));
+  }
+  await Promise.all(assetWrites);
+
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const result = await server.request({
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "obsidian_find_notes", arguments: { query: "budget_search_token" } },
+  }, 2);
+  assert.equal(result.result.isError, false);
+  const paths = result.result.structuredContent.matches.map((m) => m.path);
+  assert.deepEqual(paths, ["Inbox/Note.md"]);
+});
+
+test("find_notes reports SCAN_LIMIT when vault markdown size exceeds maxScanBytes (#59)", async (t) => {
+  const { root, vaultPath, configPath } = await createFixtureVault();
+  const server = startStdioServer(configPath);
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await once(server.child, "close").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const hugeNote = join(vaultPath, "Projects", "Huge.md");
+  const handle = await open(hugeNote, "w");
+  await handle.truncate(65 * 1024 * 1024);
+  await handle.close();
+
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const result = await server.request({
+    jsonrpc: "2.0", id: 2, method: "tools/call",
+    params: { name: "obsidian_find_notes", arguments: { query: "anything" } },
+  }, 2);
+  assert.equal(result.result.isError, true);
+  const payload = JSON.parse(result.result.content[0].text);
+  assert.equal(payload.code, "SCAN_LIMIT");
+  assert.match(payload.detail, /vault scan limit exceeded/);
 });
 
 test("stdio writes fail with a structured configuration error when daily_path is missing or invalid", async (t) => {
