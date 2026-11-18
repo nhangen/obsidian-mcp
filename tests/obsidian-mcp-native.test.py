@@ -3948,7 +3948,7 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
                 self.assertEqual(specific["permissionDecision"], "deny")
                 self.assertIn("CONFIG_INVALID", specific["permissionDecisionReason"])
 
-    def test_hook_lock_wait_override_bounds_duration(self):
+    def test_hook_lock_wait_override_shortens_state_lock_wait(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
         (lock,) = (
