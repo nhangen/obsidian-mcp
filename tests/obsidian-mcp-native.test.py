@@ -6843,7 +6843,15 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
             finally:
                 target.write_bytes(original)
             guidance = self.assert_bash_advisory(denied)
-            self.assertIn(code, guidance, repr(target))
+            self.assertEqual(
+                guidance,
+                "Obsidian capture advisory: "
+                + code
+                + "; pending state retained, no new capture.\n"
+                "The original command may proceed unchanged. "
+                "Capture remains unresolved; retained evidence is not a successful capture.",
+                repr(target),
+            )
             self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
         archive = self.home / "archive"
         archive.mkdir(mode=0o700)
@@ -6858,7 +6866,13 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
             tool_input={"command": command},
         )
         guidance = self.assert_bash_advisory(denied)
-        self.assertIn("RETENTION_INDEX_INVALID", guidance)
+        self.assertEqual(
+            guidance,
+            "Obsidian capture advisory: "
+            "RETENTION_INDEX_INVALID; pending state retained, no new capture.\n"
+            "The original command may proceed unchanged. "
+            "Capture remains unresolved; retained evidence is not a successful capture.",
+        )
         self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
         shutil.rmtree(archive)
         self.assertEqual(

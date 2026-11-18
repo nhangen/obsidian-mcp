@@ -3584,10 +3584,13 @@ def hook(home, profile, event):
         and name == "PreToolUse"
         and specific.get("permissionDecision") == "deny"
     ):
+        reason = specific.get("permissionDecisionReason", "Capture unavailable")
+        prefix = "Obsidian capture advisory: "
+        if not reason.startswith(prefix):
+            reason = prefix + reason
         return context(
             name,
-            "Obsidian capture advisory: "
-            + specific.get("permissionDecisionReason", "Capture unavailable")
+            reason
             + "\nThe original command may proceed unchanged. Capture remains unresolved; retained evidence is not a successful capture.",
         )
     return result
