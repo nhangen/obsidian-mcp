@@ -8386,6 +8386,13 @@ class CaptureShellParserTest(NativeCaptureFixture):
             tool_input={"command": "git commit -m {a,b}"},
         )
         guidance = self.assert_bash_advisory(denied)
+        self.assertTrue(
+            guidance.startswith(
+                "Obsidian capture advisory: Obsidian capture could not analyze"
+            ),
+            guidance,
+        )
+        self.assertEqual(guidance.count("Obsidian capture advisory: "), 1)
         self.assertIn("BRACE_EXPANSION_UNSUPPORTED", guidance)
         self.assertIn("plain git commit", guidance)
 
