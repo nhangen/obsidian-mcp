@@ -8079,6 +8079,10 @@ class CaptureShellParserTest(NativeCaptureFixture):
             "git commit -m msg <<'EOF'\nx\nEOF\n",
             "cat <<EOF\n$(git commit -m x)\nEOF\n",
             "echo \"$(git commit -m x)\"",
+            "git commit -m \"foo\x00bar\"",
+            "git commit -m \"foo\x01bar\"",
+            "git commit -m \"foo\x1fbar\"",
+            "git commit -m \"foo\x7fbar\"",
         ):
             with self.assertRaises(module.NativeError) as raised:
                 module.shell_commit(command, self.project, self.project)
@@ -8978,6 +8982,84 @@ class CaptureShellParserTest(NativeCaptureFixture):
         )
         self.assertTrue(
             all(p["status"] == "pending" for p in state["commits"].values())
+        )
+
+    def test_pretool_command_with_nul_is_not_wrapped(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        cmd = "git commit -m 'hello\x00world'"
+        result = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="nul-call",
+            tool_input={"command": cmd},
+        )
+        guidance = self.assert_bash_advisory(result)
+        self.assertIn("unsupported commit command", guidance)
+        self.assertIn("HEAD reflog", guidance)
+
+    def test_helper_parse_environment_is_minimal(self):
+        module = self.native()
+        self.assertEqual(
+            module.HELPER_ENVIRONMENT,
+            {"LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        )
+        self.assertNotIn("GOTRACEBACK", module.HELPER_ENVIRONMENT)
+
+    def test_stale_stop_watched_cleared_when_snapshots_remain(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+
+        # First Stop: no snapshots, turn is clean -> sets stop_watched = True
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.assertTrue(self.watched_state().get("stop_watched"))
+
+        # Continuation prompt: state must remain frozen
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assertTrue(self.watched_state().get("stop_watched"))
+
+        # Two commits made with NO Bash
+        self.empty_commit("one")
+        self.empty_commit("two")
+
+        # Second Stop: watch_git_history retains a snapshot for multiple commits.
+        # stop_watched MUST be popped!
+        self.hook("Stop", stop_hook_active=False)
+        state_after_stop = self.watched_state()
+        self.assertTrue(bool(state_after_stop["snapshots"]))
+        self.assertNotIn("stop_watched", state_after_stop)
+
+        # Hidden commit made outside
+        self.empty_commit("hidden")
+
+        # Snapshot resolved outside Bash
+        snapshot = next(iter(state_after_stop["snapshots"]))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+
+        # Next prompt: reconciles reflog and captures the hidden commit
+        self.next_turn()
+        state_next = self.watched_state()
+        self.assertEqual(state_next["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state_next["commits"].values()],
+            [self.head()],
         )
 
 

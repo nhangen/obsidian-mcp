@@ -714,15 +714,16 @@ Stop:
   because `skip_if_hash` keeps the first.
 - Reflog entries with a known non-commit reason need nothing: `am`, `bisect`,
   `branch`, `checkout`, `cherry-pick`, `clone`, `initial`, `merge`, `pull`,
-  `rebase`, `reset`, and `revert`. Those operations can create commits, but they aren't
-  `git commit` events. A `git commit` that concludes a merge or cherry-pick is
-  captured.
+  `rebase`, `reset`, and `revert`. Those operations can create commits, but
+  they aren't `git commit` events. A `git commit` that concludes a merge or
+  cherry-pick is captured.
 - Anything it can't prove keeps an unresolved snapshot: two commits in one
   window, a commit HEAD has already left, a rewritten reflog, plumbing, or a
-  reflog reason outside that list. Further commits run unchanged with an advisory
-  while the snapshot is retained. Inspect history and run `resolve-snapshot`, which appends
-  the record to `watch-resolutions.jsonl` in the capture home. A commit hidden
-  from the parser during that time is captured after you resolve it.
+  reflog reason outside that list. Further commits run unchanged with an
+  advisory while the snapshot is retained. Inspect history and run
+  `resolve-snapshot`, which appends the record to `watch-resolutions.jsonl` in
+  the capture home. A commit hidden from the parser during that time is
+  captured after you resolve it.
 
 The watch has these limits:
 

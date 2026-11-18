@@ -17,6 +17,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT = ROOT / "packages/client"
@@ -129,6 +130,34 @@ class HelperBuildDeterminismTest(unittest.TestCase):
             for license_name in ("LICENSE-mvdan-sh.txt", "LICENSE-go-runtime.txt"):
                 contents = (directory / "out" / license_name).read_bytes()
                 self.assertGreater(len(contents), 0, license_name)
+
+    def test_builder_toolchain_license_url_formatting(self):
+        builder = load_module(BUILDER, "builder_under_test")
+        with mock.patch.object(builder, "go_setting", return_value="/nonexistent"):
+            with self.assertRaises(ValueError) as ctx:
+                builder.toolchain_license_bytes("go1.27.3")
+            self.assertIn(
+                "https://raw.githubusercontent.com/golang/go/go1.27.3/LICENSE",
+                str(ctx.exception),
+            )
+            self.assertNotIn("gogo1.27.3", str(ctx.exception))
+
+    def test_builder_does_not_create_output_dir_on_version_mismatch(self):
+        builder = load_module(BUILDER, "builder_under_test")
+        with tempfile.TemporaryDirectory(prefix="builder-test-") as temp_dir:
+            out_dir = Path(temp_dir) / "staging"
+            with mock.patch.object(builder, "go_setting", return_value="go9.99.9"):
+                with mock.patch(
+                    "sys.argv",
+                    ["build-shell-capture-parser.py", "--output", str(out_dir)],
+                ):
+                    with self.assertRaises(ValueError) as ctx:
+                        builder.main()
+                    self.assertIn("unexpected Go toolchain version", str(ctx.exception))
+                    self.assertFalse(
+                        out_dir.exists(),
+                        "output directory should not be created if version check fails",
+                    )
 
 
 class PackerHelperValidationTest(unittest.TestCase):
