@@ -2226,7 +2226,10 @@ def inspect_provisioning(home, profile):
                 continue
             if entry.name != "capture-profile.json":
                 raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
-            descriptor = json.loads(private_read(entry))
+            try:
+                descriptor = json.loads(private_read(entry))
+            except ValueError:
+                raise NativeError("CHILD_PROFILE_INVALID") from None
             mode = project_mode(descriptor)
             project = descriptor.get("project")
             if stage.name != workspace_key(
@@ -2327,11 +2330,11 @@ def user_drain_status(home, profile):
                         continue
                     if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
                         raise NativeError("RETENTION_ARCHIVE_INVALID")
-                    validate_archive(
-                        json.loads(private_read(entry, limit=RETENTION_LIMIT)),
-                        session,
-                        entry.stem,
-                    )
+                    try:
+                        archived = json.loads(private_read(entry, limit=RETENTION_LIMIT))
+                    except ValueError:
+                        raise NativeError("RETENTION_ARCHIVE_INVALID") from None
+                    validate_archive(archived, session, entry.stem)
                 if index["location"] == "archive":
                     archive_count += 1
         locators = home / "retained-bindings"

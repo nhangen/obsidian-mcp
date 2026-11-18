@@ -2329,6 +2329,18 @@ class NativeCaptureTest(NativeCaptureFixture):
                 self.assertEqual(result.returncode, 64)
                 self.assertIn("PROFILE_DRIFT", result.stderr)
 
+    def test_unparseable_staged_child_profile_fails_inspection_with_stable_code(self):
+        module = self.load_native()
+        home = self.home
+        home.mkdir(mode=0o700)
+        stage = self.corrupt_file(
+            home / "provisioning" / ("b" * 64) / "capture-profile.json"
+        )
+        (stage.parent / "capture-state").mkdir(mode=0o700)
+        with self.assertRaises(module.NativeError) as raised:
+            module.inspect_provisioning(home, dict(host="codex"))
+        self.assertEqual(str(raised.exception), "CHILD_PROFILE_INVALID")
+
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
@@ -5853,6 +5865,17 @@ module.hook(home, descriptor, json.loads(event))
                     if p.name != "index.json"
                 ]
                 self.assertIn(original, snapshots)
+
+    def test_unparseable_archive_generation_fails_drain_status_with_stable_code(self):
+        self.configure()
+        path = self.terminal_session()
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other work")
+        stray = self.home / "archive" / path.stem / ("f" * 64 + ".json")
+        stray.write_text("{")
+        stray.chmod(0o600)
+        result = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("RETENTION_ARCHIVE_INVALID", result.stderr)
 
     def test_archived_missing_evidence_and_conflicting_hot_copy_never_fall_back(self):
         for failure in ("missing-generation", "missing-directory", "conflicting-hot"):
