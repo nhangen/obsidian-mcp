@@ -2700,7 +2700,16 @@ def drain_status(home):
         sessions = []
         present = set()
         for key in sorted(keys):
-            state, _path = locks.enter_context(state_lock(home, key))
+            try:
+                state, _path = locks.enter_context(state_lock(home, key))
+            except NativeError as error:
+                if str(error) != "STATE_INVALID":
+                    raise
+                present.add(key)
+                sessions.append(
+                    dict(session=key, unresolved=["state_invalid"], repair=REPAIR_STATE_HINT)
+                )
+                continue
             if state is None:
                 continue
             present.add(key)
