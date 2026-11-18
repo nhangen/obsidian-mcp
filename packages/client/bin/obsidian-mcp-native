@@ -2271,6 +2271,8 @@ def user_hook(home, profile, event):
 
 
 def inspect_child_records(home, child):
+    # State locks before the gate, the order claim_gate uses; holding the gate
+    # across these state locks would invert it against a committing session.
     for entry in streamed_entries(checked_state_directory(child)):
         if (
             entry.name in (ACTIVE, "active.lock")
