@@ -324,6 +324,11 @@ moves the unparseable file aside (`.json.invalid`), rebuilds a minimal valid sta
 and records a `snapshot_resolutions` entry with `status="not_captured"` and the
 current HEAD as `observed_head`. The outage commit is not captured retroactively;
 the loss is named explicitly, and the reflog watch resumes from the fresh baseline.
+That record is short-lived and partial: `observed_head` names only the HEAD at
+repair time, not each commit made during the outage, and the next
+`UserPromptSubmit` replaces the state that holds it. The command's JSON output and
+the `.json.invalid` file are what remain, so keep the output if the outage
+matters (#49).
 A missing state file under an enrolled binding reports `ENROLLED_STATE_MISSING`
 instead of a leaked filesystem error. User-scope `drain-status` and
 `profile-status` surface at-risk sessions with the repair command; project-scope
