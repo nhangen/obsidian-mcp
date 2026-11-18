@@ -2029,9 +2029,11 @@ def reconcile_enrollment(home, profile):
                 if state is not None:
                     validate_initial_state(descriptor, path.stem, state)
                     atomic_write(path, encode(dict(record, enrolled=True)))
-        except NativeError:
-            # STATE_INVALID (corrupt state) leaves the binding unenrolled and
-            # non-paused; the supported repair is takeover --repair-state.
+        except NativeError as error:
+            # A corrupt state leaves the binding unenrolled and non-paused so
+            # takeover --repair-state can still reach it.
+            if str(error) != "STATE_INVALID":
+                raise
             continue
 
 

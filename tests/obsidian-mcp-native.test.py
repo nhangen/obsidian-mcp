@@ -7268,6 +7268,30 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
         self.assertTrue(json.loads(path.read_text())["session_recovery"])
 
+    def test_reconcile_enrollment_only_skips_a_corrupt_state(self):
+        self.configure()
+        self.terminal_session()
+        session = self.session_key("session-1")
+        binding = self.home / "bindings" / (session + ".json")
+        record = json.loads(binding.read_text())
+        binding.write_text(json.dumps(dict(record, enrolled=False)))
+        native = self.load_native()
+        _, profile = native.load_profile(self.home)
+
+        def conflict(*args, **kwargs):
+            raise native.NativeError("PUBLICATION_CONFLICT")
+
+        native.validate_initial_state = conflict
+        with self.assertRaisesRegex(native.NativeError, "PUBLICATION_CONFLICT"):
+            native.reconcile_enrollment(self.home, profile)
+
+        def corrupt(*args, **kwargs):
+            raise native.NativeError("STATE_INVALID")
+
+        native.validate_initial_state = corrupt
+        native.reconcile_enrollment(self.home, profile)
+        self.assertFalse(json.loads(binding.read_text())["enrolled"])
+
     def test_outage_resolution_alone_does_not_refuse_a_workspace_transition(self):
         native = self.load_native()
         outage = dict(status="not_captured", reason="state_invalid", observed_head=None)
