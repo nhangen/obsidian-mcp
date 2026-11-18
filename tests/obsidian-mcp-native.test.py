@@ -2445,6 +2445,23 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ARGUMENTS_INVALID", result.stderr)
 
+    def test_status_reports_an_unreadable_state_by_its_own_code(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.state_paths()[0].chmod(0o644)
+
+        result = self.cli(
+            "profile-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PRIVATE_FILE_INVALID", result.stderr)
+        self.assertNotIn("repair-state", result.stdout)
+
     def test_repair_state_refuses_a_session_that_never_started(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
