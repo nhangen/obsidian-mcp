@@ -159,6 +159,33 @@ class HelperBuildDeterminismTest(unittest.TestCase):
                         "output directory should not be created if version check fails",
                     )
 
+    def test_builder_does_not_create_output_dir_on_dependency_failure(self):
+        builder = load_module(BUILDER, "builder_under_test")
+        with tempfile.TemporaryDirectory(prefix="builder-test-") as temp_dir:
+            out_dir = Path(temp_dir) / "staging"
+            module_cache = Path(temp_dir).resolve() / "modcache"
+            (module_cache / f"{builder.MODULE}@{builder.MODULE_VERSION}").parent.mkdir(
+                parents=True
+            )
+            settings = {
+                "GOVERSION": builder.EXPECTED_GOVERSION,
+                "GOMODCACHE": str(module_cache),
+            }
+            with mock.patch.object(
+                builder, "go_setting", side_effect=settings.__getitem__
+            ), mock.patch.object(
+                builder,
+                "verify_dependency_checksums",
+                side_effect=ValueError("fixture dependency failure"),
+            ), mock.patch(
+                "sys.argv",
+                ["build-shell-capture-parser.py", "--output", str(out_dir)],
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    builder.main()
+            self.assertIn("fixture dependency failure", str(ctx.exception))
+            self.assertFalse(out_dir.exists())
+
 
 class PackerHelperValidationTest(unittest.TestCase):
     def load_packer(self):
