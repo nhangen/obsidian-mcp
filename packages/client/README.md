@@ -313,7 +313,8 @@ locator (`RETENTION_JOURNAL_INVALID`, `RETENTION_ARCHIVE_INVALID`,
 (`PUBLICATION_AMBIGUOUS`), a staged child profile (`CHILD_PROFILE_INVALID`), an
 enrollment date (`ENROLLMENT_PUBLICATION_INVALID`,
 `CONTINUATION_PUBLICATION_INVALID`), the capture profile
-(`PROFILE_INACTIVE_OR_INVALID`), and undecodable Git output (`GIT_FAILED`).
+(`PROFILE_INACTIVE_OR_INVALID`), an isolated profile's `config.toml`
+(`PROFILE_DRIFT`), and undecodable Git output (`GIT_FAILED`).
 A commit-shaped tool call during such a failure runs unchanged with the code in
 its advisory, and the HEAD reflog watch records the commit once the damaged file
 is repaired, so degraded capture is named, not silent.

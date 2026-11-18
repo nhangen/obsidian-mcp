@@ -2319,6 +2319,16 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertTrue(module.claim_commit(self.home, "a" * 64, commit))
         self.assertEqual((claims / commit).read_text(), "a" * 64)
 
+    def test_unparseable_config_toml_reports_profile_drift(self):
+        self.configure()
+        config = self.home / "config.toml"
+        for body in (b"[[[ not toml", b"\xff"):
+            with self.subTest(body=body):
+                config.write_bytes(body)
+                result = self.cli("status", "--home", str(self.home))
+                self.assertEqual(result.returncode, 64)
+                self.assertIn("PROFILE_DRIFT", result.stderr)
+
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None

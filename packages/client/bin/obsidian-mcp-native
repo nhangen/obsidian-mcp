@@ -592,7 +592,10 @@ def load_profile(home, *, parent_only=False, inspect=False):
     for name in OWNED:
         body = private_read(home / name)
         if name == "config.toml":
-            config = tomllib.loads(body.decode())
+            try:
+                config = tomllib.loads(body.decode())
+            except ValueError:
+                raise NativeError("PROFILE_DRIFT") from None
             for host_key in ("tui", "projects"):
                 config.pop(host_key, None)
             host_hooks = config.pop("hooks", {})
