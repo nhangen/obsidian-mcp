@@ -2361,7 +2361,6 @@ def user_drain_status(home, profile):
         sessions = []
         workspaces = []
         at_risk = []
-        at_risk_keys = set()
         quiescent = True
 
         def note_at_risk(session, workspace, reason):
@@ -2374,7 +2373,6 @@ def user_drain_status(home, profile):
                     status="not_captured",
                 )
             )
-            at_risk_keys.add(session)
             quiescent = False
 
         inspect_provisioning(home, profile)
@@ -2384,10 +2382,6 @@ def user_drain_status(home, profile):
             record, _ = read_binding(home, entry.stem, restore=False)
             if record is None:
                 raise NativeError("SESSION_BINDING_INVALID")
-            if str(entry.stem) in at_risk_keys:
-                hot_count += 1
-                quiescent = False
-                continue
             try:
                 child, _ = bound_child(home, profile, record, inspect=True)
                 with state_lock(child, entry.stem) as (state, _):
