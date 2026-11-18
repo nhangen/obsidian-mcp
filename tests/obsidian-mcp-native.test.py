@@ -157,34 +157,67 @@ class NativeCaptureFixture(unittest.TestCase):
 
     def assert_busy_commit_guard(self, path, lockers):
         before = path.read_bytes()
-        for label, acquire in lockers:
-            with acquire():
-                for command in (
-                    "git commit -m second",
-                    "/usr/bin/git -C . commit -m second",
-                    "rtk git commit -m second",
-                    "rtk proxy git commit -m second",
-                ):
-                    with self.subTest(lock=label, command=command):
-                        denied = self.hook(
+        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
+        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
+        try:
+            for label, acquire in lockers:
+                with acquire():
+                    for command in (
+                        "git commit -m second",
+                        "/usr/bin/git -C . commit -m second",
+                        "rtk git commit -m second",
+                        "rtk proxy git commit -m second",
+                    ):
+                        with self.subTest(lock=label, command=command):
+                            denied = self.hook(
+                                "PreToolUse",
+                                tool_name="Bash",
+                                tool_use_id="second-commit",
+                                tool_input={"command": command},
+                            )
+                            self.assert_bash_advisory(denied)
+                            self.assertIn("BlockingIOError", json.dumps(denied))
+                    for command in ("pwd", "git status"):
+                        advisory = self.hook(
                             "PreToolUse",
                             tool_name="Bash",
-                            tool_use_id="second-commit",
+                            tool_use_id="ordinary",
                             tool_input={"command": command},
                         )
-                        self.assert_bash_advisory(denied)
-                        self.assertIn("BlockingIOError", json.dumps(denied))
-                for command in ("pwd", "git status"):
-                    advisory = self.hook(
-                        "PreToolUse",
-                        tool_name="Bash",
-                        tool_use_id="ordinary",
-                        tool_input={"command": command},
-                    )
-                    self.assertNotIn(
-                        "permissionDecision", advisory.get("hookSpecificOutput", {})
-                    )
+                        self.assertNotIn(
+                            "permissionDecision", advisory.get("hookSpecificOutput", {})
+                        )
             self.assertEqual(path.read_bytes(), before)
+        finally:
+            if old_wait is None:
+                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
+            else:
+                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+
+    @contextmanager
+    def briefly_held(self, lock, seconds=0.4):
+        holder = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                "import fcntl,os,sys,time\n"
+                "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR)\n"
+                "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                "print('HELD',flush=True)\n"
+                "time.sleep(float(sys.argv[2]))\n"
+                "fcntl.flock(fd,fcntl.LOCK_UN)\n",
+                str(lock),
+                str(seconds),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            yield
+        finally:
+            holder.wait(timeout=10)
+            holder.stdout.close()
 
     def execute_rewritten(self, rewritten):
         self.assertEqual(
@@ -3813,6 +3846,100 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
         self.assertEqual(invalid.returncode, 64)
         self.assertNotIn("Traceback", invalid.stderr)
 
+    def test_briefly_held_session_lock_waits_instead_of_denying_capture_tool(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (lock,) = (
+            path
+            for path in (self.home / "capture-state").glob("*.lock")
+            if path.name != "active.lock"
+        )
+        with self.briefly_held(lock):
+            result = self.hook(
+                "PreToolUse",
+                tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                tool_use_id="contended-save",
+                tool_input={},
+            )
+        self.assertNotIn("HOOK_STATE_OR_EVENT_INVALID", json.dumps(result))
+        self.assertNotIn("permissionDecision", result.get("hookSpecificOutput", {}))
+
+    def test_briefly_held_session_lock_waits_on_post_tool_use_and_stop(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (lock,) = (
+            path
+            for path in (self.home / "capture-state").glob("*.lock")
+            if path.name != "active.lock"
+        )
+        for name, extra in (
+            (
+                "PostToolUse",
+                dict(
+                    tool_name="Bash",
+                    tool_use_id="contended-post",
+                    tool_input={"command": "pwd"},
+                    tool_response="",
+                ),
+            ),
+            ("Stop", {}),
+        ):
+            with self.subTest(event=name), self.briefly_held(lock):
+                result = self.hook(name, **extra)
+                self.assertNotIn("HOOK_STATE_OR_EVENT_INVALID", json.dumps(result))
+
+    def test_held_gate_lock_times_out_with_budget_on_commit(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (self.project / "file.txt").write_text("content\n")
+        self.git("add", "file.txt")
+        native = self.load_native()
+        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
+        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
+        try:
+            with native.gate_lock(self.home):
+                denied = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="commit-call",
+                    tool_input={"command": "git commit -m test"},
+                )
+                self.assertIn("BlockingIOError", json.dumps(denied))
+        finally:
+            if old_wait is None:
+                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
+            else:
+                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+
+    def test_hook_lock_wait_override_bounds_duration(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        (lock,) = (
+            path
+            for path in (self.home / "capture-state").glob("*.lock")
+            if path.name != "active.lock"
+        )
+        native = self.load_native()
+        old_wait = self.environment.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
+        self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = "0.05"
+        start = time.monotonic()
+        try:
+            with native.state_lock(self.home, lock.stem):
+                result = self.hook(
+                    "PreToolUse",
+                    tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                    tool_use_id="busy-save",
+                    tool_input={},
+                )
+                self.assertIn("BlockingIOError", json.dumps(result))
+        finally:
+            if old_wait is None:
+                self.environment.pop("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT", None)
+            else:
+                self.environment["OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT"] = old_wait
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.0)
+
 
 class DirectoryCaptureTest(NativeCaptureFixture):
     initialize_git = False
@@ -5363,31 +5490,6 @@ module.hook(profile_home, descriptor, json.loads(event))
             self.assertEqual(
                 json.loads(path.read_bytes())["session_request"], arguments
             )
-
-    @contextmanager
-    def briefly_held(self, lock, seconds=0.4):
-        holder = subprocess.Popen(
-            [
-                "python3",
-                "-c",
-                "import fcntl,os,sys,time\n"
-                "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR)\n"
-                "fcntl.flock(fd,fcntl.LOCK_EX)\n"
-                "print('HELD',flush=True)\n"
-                "time.sleep(float(sys.argv[2]))\n"
-                "fcntl.flock(fd,fcntl.LOCK_UN)\n",
-                str(lock),
-                str(seconds),
-            ],
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            self.assertEqual(holder.stdout.readline().strip(), "HELD")
-            yield
-        finally:
-            holder.wait(timeout=10)
-            holder.stdout.close()
 
     def test_briefly_held_gate_lock_waits_instead_of_denying_capture_tool(self):
         self.configure()
