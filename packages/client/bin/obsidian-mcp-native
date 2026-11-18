@@ -2694,16 +2694,7 @@ def drain_status(home):
         sessions = []
         present = set()
         for key in sorted(keys):
-            try:
-                state, _path = locks.enter_context(state_lock(home, key))
-            except NativeError as error:
-                if str(error) != "STATE_INVALID":
-                    raise
-                present.add(key)
-                sessions.append(
-                    dict(session=key, unresolved=["state_invalid"], repair=REPAIR_STATE_HINT)
-                )
-                continue
+            state, _path = locks.enter_context(state_lock(home, key))
             if state is None:
                 continue
             present.add(key)
@@ -4837,13 +4828,6 @@ def dispatch_command(args, extra, locks):
                 if scope == "user"
                 else drain_status(home)
             )
-            if (
-                scope == "project"
-                and args.session
-                and state_unavailable(home, args.session)
-            ):
-                result["state_invalid"] = True
-                result["state_invalid_repair"] = REPAIR_STATE_HINT
         elif args.operation == "execute-commit":
             return execute_commit(home, profile, args, locks)
         elif args.operation == "hook":

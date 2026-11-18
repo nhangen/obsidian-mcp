@@ -325,8 +325,10 @@ and records a `snapshot_resolutions` entry with `status="not_captured"` and the
 current HEAD as `observed_head`. The outage commit is not captured retroactively;
 the loss is named explicitly, and the reflog watch resumes from the fresh baseline.
 A missing state file under an enrolled binding reports `ENROLLED_STATE_MISSING`
-instead of a leaked filesystem error, and at-risk sessions are surfaced in
-`drain-status` and `profile-status`.
+instead of a leaked filesystem error. User-scope `drain-status` and
+`profile-status` surface at-risk sessions with the repair command; project-scope
+`drain-status` fails closed with `STATE_INVALID`, and project-scope `status` and
+`profile-status --session` name the repair.
 If `daily-append` or `resolve-snapshot` finish their local write and then find
 the gate corrupt or owned by another session, they report it (`note` in the
 result, one context line in the hook) without raising, so a completed capture

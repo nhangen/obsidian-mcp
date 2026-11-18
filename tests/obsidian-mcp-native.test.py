@@ -2408,26 +2408,21 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(flagged.returncode, 0, flagged.stderr)
         self.assertTrue(json.loads(flagged.stdout)["state_invalid"])
 
-    def test_project_drain_status_names_a_corrupt_state(self):
+    def test_project_drain_status_fails_closed_on_a_corrupt_state(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
         self.state_paths()[0].write_bytes(b"not json")
 
-        result = self.cli("drain-status", "--home", str(self.home))
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        drained = json.loads(result.stdout)
-        self.assertFalse(drained["quiescent"])
-        self.assertEqual(
-            drained["sessions"],
-            [
-                dict(
-                    session=self.session_key("session-1"),
-                    unresolved=["state_invalid"],
-                    repair=REPAIR_STATE_HINT,
-                )
-            ],
+        result = self.cli(
+            "drain-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
         )
+
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("STATE_INVALID", result.stderr)
 
     def test_repair_state_flag_is_rejected_outside_takeover(self):
         self.configure()
