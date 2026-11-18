@@ -32,7 +32,23 @@ HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
 HOOK_LOCK_WAIT = 2.0
+HOOK_LOCK_WAIT_MAX = 60.0
 LOCK_DEADLINE = None
+
+
+def hook_lock_wait():
+    override = os.environ.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
+    if override is None:
+        return HOOK_LOCK_WAIT
+    try:
+        seconds = float(override)
+    except ValueError:
+        raise NativeError("CONFIG_INVALID") from None
+    if not 0 <= seconds <= HOOK_LOCK_WAIT_MAX:
+        raise NativeError("CONFIG_INVALID")
+    return seconds
+
+
 # Two accepted JSON components may expand when Unicode is canonicalized.
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
@@ -2103,7 +2119,7 @@ def retained_capture_event(home, profile, event):
 
 def user_hook(home, profile, event):
     try:
-        with lock_budget(HOOK_LOCK_WAIT), gate_lock(home, nonblocking=True):
+        with lock_budget(hook_lock_wait()), gate_lock(home, nonblocking=True):
             check_user_state(home)
             reconcile_retention(home)
             reconcile_rebinds(home)
@@ -2257,30 +2273,31 @@ def user_hook(home, profile, event):
 
 
 def inspect_child_records(home, child):
+    # State locks before the gate, the order claim_gate uses; holding the gate
+    # across these state locks would invert it against a committing session.
+    for entry in streamed_entries(checked_state_directory(child)):
+        if (
+            entry.name in (ACTIVE, "active.lock")
+            or entry.name.endswith(".invalid")
+        ):
+            continue
+        if (
+            entry.suffix not in (".json", ".lock")
+            or HEX.fullmatch(entry.stem) is None
+        ):
+            raise NativeError("DRAIN_STATE_INVALID")
+        with state_lock(child, entry.stem) as (state, _):
+            if state is not None:
+                record, _ = read_hot_binding(home, entry.stem)
+                if (
+                    record is None
+                    or record["workspace"] != child.name
+                    or not record["enrolled"]
+                ):
+                    raise NativeError("SESSION_BINDING_INVALID")
+                drain_reasons(state)
     with gate_lock(child, nonblocking=True):
-        owner = active_request(child)
-        for entry in streamed_entries(checked_state_directory(child)):
-            if (
-                entry.name in (ACTIVE, "active.lock")
-                or entry.name.endswith(".invalid")
-            ):
-                continue
-            if (
-                entry.suffix not in (".json", ".lock")
-                or HEX.fullmatch(entry.stem) is None
-            ):
-                raise NativeError("DRAIN_STATE_INVALID")
-            with state_lock(child, entry.stem) as (state, _):
-                if state is not None:
-                    record, _ = read_hot_binding(home, entry.stem)
-                    if (
-                        record is None
-                        or record["workspace"] != child.name
-                        or not record["enrolled"]
-                    ):
-                        raise NativeError("SESSION_BINDING_INVALID")
-                    drain_reasons(state)
-        return owner
+        return active_request(child)
 
 
 def inspect_provisioning(home, profile):
@@ -2510,6 +2527,14 @@ def checked_state_directory(home):
 
 @contextmanager
 def lock_budget(seconds):
+    """Share one lock wait budget across all locks taken within this context.
+
+    The budget sets an absolute deadline from the moment the context is entered.
+    In long CLI commands (such as execute-commit where Git execution may take
+    several seconds), locks attempted after the budget has elapsed receive a
+    single nonblocking attempt. This matches pre-#37 behavior while ensuring
+    process wait times remain strictly bounded.
+    """
     global LOCK_DEADLINE
     previous = LOCK_DEADLINE
     LOCK_DEADLINE = time.monotonic() + seconds
@@ -2520,6 +2545,13 @@ def lock_budget(seconds):
 
 
 def exclusive_flock(fd, wait=None):
+    """Acquire an exclusive advisory flock, bounded by an active budget or explicit wait.
+
+    When an explicit wait is supplied, deadline is calculated from current time.
+    When a lock_budget is active, deadline is the absolute budget deadline.
+    If the deadline has already passed or no budget is active, a single
+    nonblocking attempt is made (matching pre-#37 single-try behavior).
+    """
     if wait is not None:
         deadline = time.monotonic() + wait
     elif LOCK_DEADLINE is not None:
@@ -2573,14 +2605,14 @@ def state_lock(home, key, *, create=True, wait=None, allow_invalid=False):
 
 
 @contextmanager
-def gate_lock(home, *, nonblocking=False):
+def gate_lock(home, *, nonblocking=False, wait=None):
     directory = checked_state_directory(home)
     fd = os.open(
         directory / "active.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
     )
     try:
-        if nonblocking:
-            exclusive_flock(fd)
+        if nonblocking or LOCK_DEADLINE is not None or wait is not None:
+            exclusive_flock(fd, wait)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield directory
@@ -2757,6 +2789,11 @@ def claim_gate(home, session, state):
 def settle_gate(home, session, state):
     try:
         owner = claim_gate(home, session, state)
+    except BlockingIOError:
+        return (
+            "\nThe capture gate is busy (CAPTURE_GATE_BUSY), so it was not updated for"
+            " this session; the session state was still saved and the next event retries."
+        )
     except NativeError as error:
         if str(error) != "ACTIVE_STATE_INVALID":
             raise
@@ -3728,10 +3765,12 @@ def capture_hook(home, profile, event):
     if capture_scope(profile) == "user":
         return user_hook(home, profile, event)
     if profile["host"] != "claude-plugin":
-        return engine_hook(home, profile, event)
+        with lock_budget(hook_lock_wait()):
+            return engine_hook(home, profile, event)
     name = event.get("hook_event_name")
     try:
-        return claude_output(engine_hook(home, profile, event), name)
+        with lock_budget(hook_lock_wait()):
+            return claude_output(engine_hook(home, profile, event), name)
     except Exception as error:
         code = (
             str(error)
@@ -4748,7 +4787,7 @@ def dispatch_command(args, extra, locks):
             "drain-status",
             "hook",
         ):
-            locks.enter_context(lock_budget(HOOK_LOCK_WAIT))
+            locks.enter_context(lock_budget(hook_lock_wait()))
             locks.enter_context(gate_lock(home, nonblocking=True))
             if inspection and unpublished_user_state(home):
                 raise NativeError("PUBLICATION_PENDING")
