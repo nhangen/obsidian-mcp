@@ -3955,6 +3955,18 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
                 self.assertEqual(specific["permissionDecision"], "deny")
                 self.assertIn("CONFIG_INVALID", specific["permissionDecisionReason"])
 
+    def test_lock_after_expired_budget_gets_one_nonblocking_try(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        native = self.load_native()
+        with native.gate_lock(self.home), native.lock_budget(0.05):
+            time.sleep(0.1)
+            start = time.monotonic()
+            with self.assertRaises(BlockingIOError):
+                with native.gate_lock(self.home):
+                    pass
+            self.assertLess(time.monotonic() - start, 0.05)
+
     def test_hook_lock_wait_override_shortens_state_lock_wait(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
