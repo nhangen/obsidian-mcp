@@ -7248,6 +7248,26 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse(path.with_name(path.name + ".invalid").exists())
 
+    def test_repaired_state_still_gates_on_a_later_unresolved_recovery(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        session = self.session_key("session-1")
+        path = next(
+            (self.home / "workspaces").glob("*/capture-state/" + session + ".json")
+        )
+        self.corrupt_file(path, b"not json")
+        repaired = self.repair(session)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        state = json.loads(path.read_text())
+        state["session_recovery"] = True
+        path.write_text(json.dumps(state))
+
+        output = self.hook("UserPromptSubmit", session_id="session-1", prompt="next")
+
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        self.assertTrue(json.loads(path.read_text())["session_recovery"])
+
     def test_outage_resolution_alone_does_not_refuse_a_workspace_transition(self):
         native = self.load_native()
         outage = dict(status="not_captured", reason="state_invalid", observed_head=None)

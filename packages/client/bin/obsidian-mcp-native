@@ -3798,9 +3798,11 @@ def engine_hook(home, profile, event):
             )
             reconcile_note = ""
             if not continuation and (state is None or state["turn"] != turn):
+                # A repaired state carries only a synthetic pending disposition;
+                # every other unresolved condition still holds the gate.
                 outage_repair = bool(state and has_outage_resolution(state))
-                if state and not outage_repair and (
-                    state["disposition"] == "pending"
+                if state and (
+                    (state["disposition"] == "pending" and not outage_repair)
                     or state.get("session_recovery")
                     or state.get("snapshots")
                     or any(
@@ -3812,9 +3814,12 @@ def engine_hook(home, profile, event):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if (
                     state
-                    and not outage_repair
                     and attached_profile(profile)
-                    and drain_reasons(state)
+                    and [
+                        reason
+                        for reason in drain_reasons(state)
+                        if not (outage_repair and reason == "session_pending")
+                    ]
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if state and mode == "git" and not state.get("stop_watched"):
