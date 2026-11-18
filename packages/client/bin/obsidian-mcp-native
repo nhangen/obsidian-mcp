@@ -60,6 +60,7 @@ COMMIT_CONTEXT_TEMPLATE = (
     "<replace with investigation findings and decisions>",
     "<replace with verification and remaining work>",
 )
+ADVISORY_PREFIX = "Obsidian capture advisory: "
 ACTIVE = "active.json"
 OWNED = ("config.toml", "hooks.json", "AGENTS.md")
 CLAUDE_TOOLS = {
@@ -1697,7 +1698,7 @@ def capture_pretool_needs_validation(event):
 def user_hook_failure(event, code):
     name = event.get("hook_event_name")
     message = (
-        "Obsidian capture advisory: "
+        ADVISORY_PREFIX
         + code
         + "; pending state retained, no new capture."
     )
@@ -3584,10 +3585,12 @@ def hook(home, profile, event):
         and name == "PreToolUse"
         and specific.get("permissionDecision") == "deny"
     ):
+        reason = specific.get("permissionDecisionReason", "Capture unavailable")
+        if not reason.startswith(ADVISORY_PREFIX):
+            reason = ADVISORY_PREFIX + reason
         return context(
             name,
-            "Obsidian capture advisory: "
-            + specific.get("permissionDecisionReason", "Capture unavailable")
+            reason
             + "\nThe original command may proceed unchanged. Capture remains unresolved; retained evidence is not a successful capture.",
         )
     return result
