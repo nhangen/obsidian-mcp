@@ -316,8 +316,11 @@ enrollment date (`ENROLLMENT_PUBLICATION_INVALID`,
 (`PROFILE_INACTIVE_OR_INVALID`), an isolated profile's `config.toml`
 (`PROFILE_DRIFT`), and undecodable Git output (`GIT_FAILED`).
 A commit-shaped tool call during such a failure runs unchanged with the code in
-its advisory, and the HEAD reflog watch records the commit once the damaged file
-is repaired, so degraded capture is named, not silent.
+its advisory, but the HEAD reflog watch does not run while the file stays
+damaged. Restoring the original file lets the next hook event record the commit.
+Deleting or rebuilding session state takes a fresh reflog baseline, so a commit
+made during the failure is not captured; there is no supported repair for
+`STATE_INVALID` yet (#44).
 If `daily-append` or `resolve-snapshot` finish their local write and then find
 the gate corrupt or owned by another session, they report it (`note` in the
 result, one context line in the hook) without raising, so a completed capture
