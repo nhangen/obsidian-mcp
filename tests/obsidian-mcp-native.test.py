@@ -3933,6 +3933,21 @@ print(json.dumps([module.hook(home, descriptor, e) for e in json.loads(events)])
         )
         self.assertEqual(state["snapshots"], {})
 
+    def test_invalid_hook_lock_wait_override_is_reported_not_crashed(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        for value in ("abc", "nan", "inf", "-1"):
+            with self.subTest(value=value), self.lock_wait_override(value):
+                result = self.hook(
+                    "PreToolUse",
+                    tool_name="mcp__obsidian-write__obsidian_keeper_save",
+                    tool_use_id="invalid-wait",
+                    tool_input={},
+                )
+                specific = result["hookSpecificOutput"]
+                self.assertEqual(specific["permissionDecision"], "deny")
+                self.assertIn("CONFIG_INVALID", specific["permissionDecisionReason"])
+
     def test_hook_lock_wait_override_bounds_duration(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")

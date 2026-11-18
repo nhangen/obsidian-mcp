@@ -31,23 +31,24 @@ BUNDLE = Path(__file__).resolve().parent.parent
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LIMIT = 262144
-HOOK_LOCK_WAIT = float(
-    os.environ.get(
-        "OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT",
-        os.environ.get("OBSIDIAN_MCP_HOOK_LOCK_WAIT", "2.0"),
-    )
-)
+HOOK_LOCK_WAIT = 2.0
+HOOK_LOCK_WAIT_MAX = 60.0
 LOCK_DEADLINE = None
 
 
 def hook_lock_wait():
     override = os.environ.get("OBSIDIAN_MCP_TEST_HOOK_LOCK_WAIT")
-    if override is not None:
-        try:
-            return float(override)
-        except ValueError:
-            pass
-    return HOOK_LOCK_WAIT
+    if override is None:
+        return HOOK_LOCK_WAIT
+    try:
+        seconds = float(override)
+    except ValueError:
+        raise NativeError("CONFIG_INVALID") from None
+    if not 0 <= seconds <= HOOK_LOCK_WAIT_MAX:
+        raise NativeError("CONFIG_INVALID")
+    return seconds
+
+
 # Two accepted JSON components may expand when Unicode is canonicalized.
 RETENTION_LIMIT = 12 * LIMIT + 16384
 MAX_PENDING = 16
@@ -3755,33 +3756,34 @@ def hook(home, profile, event):
 def capture_hook(home, profile, event):
     if capture_scope(profile) == "user":
         return user_hook(home, profile, event)
-    with lock_budget(hook_lock_wait()):
-        if profile["host"] != "claude-plugin":
+    if profile["host"] != "claude-plugin":
+        with lock_budget(hook_lock_wait()):
             return engine_hook(home, profile, event)
-        name = event.get("hook_event_name")
-        try:
+    name = event.get("hook_event_name")
+    try:
+        with lock_budget(hook_lock_wait()):
             return claude_output(engine_hook(home, profile, event), name)
-        except Exception as error:
-            code = (
-                str(error)
-                if isinstance(error, NativeError)
-                else "HOOK_STATE_OR_EVENT_INVALID (" + type(error).__name__ + ")"
-            )
-            message = "Obsidian capture unresolved: " + code
-            if capture_pretool_needs_validation(event):
-                return {
-                    "hookSpecificOutput": dict(
-                        hookEventName=name,
-                        permissionDecision="deny",
-                        permissionDecisionReason=message,
-                    )
-                }
-            if name == "Stop":
-                return dict(systemMessage=message)
-            if name == "StopFailure":
-                print(message, file=sys.stderr)
-                return {}
-            return context(name, message)
+    except Exception as error:
+        code = (
+            str(error)
+            if isinstance(error, NativeError)
+            else "HOOK_STATE_OR_EVENT_INVALID (" + type(error).__name__ + ")"
+        )
+        message = "Obsidian capture unresolved: " + code
+        if capture_pretool_needs_validation(event):
+            return {
+                "hookSpecificOutput": dict(
+                    hookEventName=name,
+                    permissionDecision="deny",
+                    permissionDecisionReason=message,
+                )
+            }
+        if name == "Stop":
+            return dict(systemMessage=message)
+        if name == "StopFailure":
+            print(message, file=sys.stderr)
+            return {}
+        return context(name, message)
 
 
 def engine_hook(home, profile, event):
