@@ -2462,11 +2462,15 @@ class NativeCaptureTest(NativeCaptureFixture):
         )
         self.assertEqual(skipped.returncode, 0, skipped.stderr)
         unknown = self.session_key("never-started")
+        status = self.cli("status", "--home", str(self.home), "--session", unknown)
+        self.assertEqual(status.returncode, 0, status.stderr)
 
-        refused = self.repair(unknown)
-
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
+        # The status call and the first refusal both leave a lock file behind;
+        # neither may make the never-started session repairable.
+        for _ in range(2):
+            refused = self.repair(unknown)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
         self.assertFalse((self.home / "capture-state" / (unknown + ".json")).exists())
 
 
