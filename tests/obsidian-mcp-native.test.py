@@ -2382,6 +2382,26 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(str(raised.exception), "RETENTION_ARCHIVE_INVALID")
         self.assertTrue(locator.exists())
 
+    def test_status_flags_only_an_existing_unparseable_state(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        unknown = self.session_key("never-started")
+        for operation in ("profile-status", "status"):
+            result = self.cli(operation, "--home", str(self.home), "--session", unknown)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("state_invalid", json.loads(result.stdout))
+
+        self.state_paths()[0].write_bytes(b"not json")
+        flagged = self.cli(
+            "profile-status",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+        self.assertEqual(flagged.returncode, 0, flagged.stderr)
+        self.assertTrue(json.loads(flagged.stdout)["state_invalid"])
+
     def test_repair_state_refuses_a_session_that_never_started(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")

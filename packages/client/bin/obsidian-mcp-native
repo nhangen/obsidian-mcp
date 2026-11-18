@@ -1200,13 +1200,18 @@ def session_state_path(home, session):
 def read_state_lenient(home, key):
     """Parse a session state file without raising STATE_INVALID.
 
-    Returns (state, valid) where valid is False when the file is missing,
-    unparseable, or fails schema/session checks (state is then None).
+    Returns (state, valid). A missing file is (None, True): there is nothing
+    to repair. A file that exists but cannot be read, parsed, or fails the
+    schema/session checks is (None, False).
     """
+    if not isinstance(key, str) or HEX.fullmatch(key) is None:
+        raise NativeError("SESSION_KEY_INVALID")
     path = session_state_path(home, key)
     try:
         text = private_read(path)
     except FileNotFoundError:
+        return None, True
+    except (OSError, NativeError):
         return None, False
     try:
         state = json.loads(text)
