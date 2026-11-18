@@ -240,7 +240,10 @@ def git(root, *args, allow_failure=False):
         if allow_failure:
             return ""
         raise NativeError("GIT_FAILED")
-    return result.stdout.decode("utf-8")
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise NativeError("GIT_FAILED") from None
 
 
 def trusted_bundle(expected):
@@ -494,7 +497,10 @@ def load_profile(home, *, parent_only=False, inspect=False):
         or home.resolve() != home
     ):
         raise NativeError("PROFILE_INVALID")
-    profile = json.loads(private_read(home / "capture-profile.json"))
+    try:
+        profile = json.loads(private_read(home / "capture-profile.json"))
+    except ValueError:
+        raise NativeError("PROFILE_INACTIVE_OR_INVALID") from None
     if (
         not isinstance(profile, dict)
         or profile.get("schemaVersion") != 1
@@ -572,6 +578,8 @@ def load_profile(home, *, parent_only=False, inspect=False):
                 )
             except FileNotFoundError:
                 hint = {}
+            except ValueError:
+                raise NativeError("PROFILE_INACTIVE_OR_INVALID") from None
             if isinstance(hint, dict) and hint.get("scope") == "user":
                 parent_home = str(home.parent.parent)
         if parent_home is not None:
@@ -584,7 +592,10 @@ def load_profile(home, *, parent_only=False, inspect=False):
     for name in OWNED:
         body = private_read(home / name)
         if name == "config.toml":
-            config = tomllib.loads(body.decode())
+            try:
+                config = tomllib.loads(body.decode())
+            except ValueError:
+                raise NativeError("PROFILE_DRIFT") from None
             for host_key in ("tui", "projects"):
                 config.pop(host_key, None)
             host_hooks = config.pop("hooks", {})
@@ -645,6 +656,8 @@ def read_hot_binding(home, session):
         if path.is_symlink():
             raise NativeError("SESSION_BINDING_INVALID") from None
         return None, path
+    except ValueError:
+        raise NativeError("SESSION_BINDING_INVALID") from None
     validate_binding(record, session)
     return record, path
 
@@ -714,7 +727,10 @@ def archive_index(home, session):
         return None
     private_directory(home / "archive")
     private_directory(directory)
-    index = json.loads(private_read(directory / "index.json", limit=RETENTION_LIMIT))
+    try:
+        index = json.loads(private_read(directory / "index.json", limit=RETENTION_LIMIT))
+    except ValueError:
+        raise NativeError("RETENTION_INDEX_INVALID") from None
     if (
         not isinstance(index, dict)
         or set(index) != {"generation", "location"}
@@ -762,13 +778,13 @@ def archived_record(home, session, index):
     directory = home / "archive" / session
 
     def read_generation(key):
-        value = validate_archive(
-            json.loads(
+        try:
+            value = json.loads(
                 private_read(directory / (key + ".json"), limit=RETENTION_LIMIT)
-            ),
-            session,
-            key,
-        )
+            )
+        except ValueError:
+            raise NativeError("RETENTION_ARCHIVE_INVALID") from None
+        value = validate_archive(value, session, key)
         return value
 
     current = value = read_generation(generation)
@@ -806,6 +822,8 @@ def retained_locator(home, session, envelope, *, create=False, first_generation=
             firstGeneration=envelope["generation"],
         )
         atomic_write(path, encode(value))
+    except ValueError:
+        raise NativeError("RETENTION_BINDING_INVALID") from None
     if (
         not isinstance(value, dict)
         or set(value) != {"session", "workspace", "firstGeneration"}
@@ -820,11 +838,14 @@ def retained_locator(home, session, envelope, *, create=False, first_generation=
     ):
         raise NativeError("RETENTION_BINDING_INVALID")
     first = home / "archive" / session / (value["firstGeneration"] + ".json")
-    first_record = validate_archive(
-        json.loads(private_read(first, limit=RETENTION_LIMIT)),
-        session,
-        value["firstGeneration"],
-    )
+    try:
+        first_record = validate_archive(
+            json.loads(private_read(first, limit=RETENTION_LIMIT)),
+            session,
+            value["firstGeneration"],
+        )
+    except ValueError:
+        raise NativeError("RETENTION_ARCHIVE_INVALID") from None
     if "archiveGeneration" in first_record["binding"]:
         raise NativeError("RETENTION_LINEAGE_INVALID")
 
@@ -972,7 +993,10 @@ def publication_candidates(directory, *, limit=LIMIT):
     for entry in streamed_entries(directory):
         if entry.name.startswith(".capture-"):
             body = private_read(entry, limit=limit)
-            value = json.loads(body)
+            try:
+                value = json.loads(body)
+            except ValueError:
+                raise NativeError("PUBLICATION_AMBIGUOUS") from None
             if not isinstance(value, dict) or encode(value) != body:
                 raise NativeError("PUBLICATION_AMBIGUOUS")
             yield entry, body, value
@@ -1018,6 +1042,8 @@ def reconcile_retention(home):
         validate_retention_journal(home, candidate[2], unpublished=True)
         publish_candidate(candidate, journal, limit=RETENTION_LIMIT)
         value = candidate[2]
+    except ValueError:
+        raise NativeError("RETENTION_JOURNAL_INVALID") from None
     envelope, before, child, directory, index, after = validate_retention_journal(
         home, value
     )
@@ -1736,7 +1762,11 @@ def provision_child(home, profile, project, mode):
         publish_candidate(candidate, descriptor)
         clean_retention_temporaries({stage: (encode(expected),)})
     if descriptor.exists() or descriptor.is_symlink():
-        if json.loads(private_read(descriptor)) != expected:
+        try:
+            published = json.loads(private_read(descriptor))
+        except ValueError:
+            raise NativeError("CHILD_PROFILE_INVALID") from None
+        if published != expected:
             raise NativeError("CHILD_PROFILE_INVALID")
     else:
         atomic_write(descriptor, encode(expected))
@@ -1786,10 +1816,14 @@ def validate_initial_state(profile, session, state):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
     turn, transcript = state.get("turn"), state.get("claude_transcript")
     date = state.get("session_save", {}).get("date")
+    try:
+        parsed = datetime.date.fromisoformat(date).isoformat() if date else None
+    except (TypeError, ValueError):
+        raise NativeError("ENROLLMENT_PUBLICATION_INVALID") from None
     if (
         not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
-        or datetime.date.fromisoformat(date).isoformat() != date
+        or parsed != date
         or {key: value for key, value in state.items() if key != "git_watch"}
         != initial_session_state(profile, session, turn, transcript, date=date)
     ):
@@ -1805,10 +1839,14 @@ def continuation_capture(profile, session, state):
         raise NativeError("CONTINUATION_PUBLICATION_INVALID")
     turn, transcript = state.get("turn"), state.get("claude_transcript")
     date = state["session_save"].get("date")
+    try:
+        parsed = datetime.date.fromisoformat(date).isoformat() if date else None
+    except (TypeError, ValueError):
+        raise NativeError("CONTINUATION_PUBLICATION_INVALID") from None
     if (
         not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
-        or datetime.date.fromisoformat(date).isoformat() != date
+        or parsed != date
     ):
         raise NativeError("CONTINUATION_PUBLICATION_INVALID")
     expected = initial_session_state(profile, session, turn, transcript, date=date)
@@ -2188,7 +2226,10 @@ def inspect_provisioning(home, profile):
                 continue
             if entry.name != "capture-profile.json":
                 raise NativeError("CHILD_PROVISIONING_AMBIGUOUS")
-            descriptor = json.loads(private_read(entry))
+            try:
+                descriptor = json.loads(private_read(entry))
+            except ValueError:
+                raise NativeError("CHILD_PROFILE_INVALID") from None
             mode = project_mode(descriptor)
             project = descriptor.get("project")
             if stage.name != workspace_key(
@@ -2289,11 +2330,11 @@ def user_drain_status(home, profile):
                         continue
                     if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
                         raise NativeError("RETENTION_ARCHIVE_INVALID")
-                    validate_archive(
-                        json.loads(private_read(entry, limit=RETENTION_LIMIT)),
-                        session,
-                        entry.stem,
-                    )
+                    try:
+                        archived = json.loads(private_read(entry, limit=RETENTION_LIMIT))
+                    except ValueError:
+                        raise NativeError("RETENTION_ARCHIVE_INVALID") from None
+                    validate_archive(archived, session, entry.stem)
                 if index["location"] == "archive":
                     archive_count += 1
         locators = home / "retained-bindings"
@@ -2392,11 +2433,14 @@ def state_lock(home, key, *, create=True, wait=None):
     try:
         exclusive_flock(fd, wait)
         path = directory / (key + ".json")
-        state = (
-            json.loads(private_read(path))
-            if path.exists() or path.is_symlink()
-            else None
-        )
+        try:
+            state = (
+                json.loads(private_read(path))
+                if path.exists() or path.is_symlink()
+                else None
+            )
+        except ValueError:
+            raise NativeError("STATE_INVALID") from None
         if state is not None and (
             not isinstance(state, dict)
             or state.get("schemaVersion") != 1
@@ -2837,7 +2881,11 @@ def claim_commit(home, session, commit):
             return True
         except FileExistsError:
             pass
-        owner = target.read_text()
+        try:
+            owner = target.read_text()
+        except (OSError, UnicodeDecodeError):
+            os.replace(temporary, target)
+            return True
         if owner == session:
             return True
         if session_records_commit(home, owner, commit):

@@ -2209,6 +2209,167 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertNotEqual(recovered.returncode, 0)
         self.assertIn("SESSION_KEY_INVALID", recovered.stderr)
 
+    def corrupt_file(self, path, body=b"not json"):
+        ancestors = [path]
+        while not ancestors[-1].parent.exists():
+            ancestors.append(ancestors[-1].parent)
+        for ancestor in reversed(ancestors[1:]):
+            ancestor.mkdir(mode=0o700)
+        path.write_bytes(body)
+        path.chmod(0o600)
+        return path
+
+    def test_unparseable_persisted_state_reports_stable_codes(self):
+        module = self.load_native()
+        session = self.session_key("session-1")
+        home = self.home
+        home.mkdir(mode=0o700)
+        self.corrupt_file(home / "bindings" / (session + ".json"))
+        self.corrupt_file(home / "archive" / session / "index.json")
+        self.corrupt_file(home / "archive" / session / (session + ".json"))
+        self.corrupt_file(home / "retained-bindings" / (session + ".json"))
+        self.corrupt_file(home / "retention-journal.json")
+        self.corrupt_file(home / "capture-state" / (session + ".json"))
+        self.corrupt_file(home / "capture-profile.json")
+        for call, code in (
+            (lambda: module.read_hot_binding(home, session), "SESSION_BINDING_INVALID"),
+            (lambda: module.archive_index(home, session), "RETENTION_INDEX_INVALID"),
+            (
+                lambda: module.archived_record(
+                    home, session, dict(generation=session, location="archive")
+                ),
+                "RETENTION_ARCHIVE_INVALID",
+            ),
+            (lambda: module.retained_locator(home, session, {}), "RETENTION_BINDING_INVALID"),
+            (lambda: module.reconcile_retention(home), "RETENTION_JOURNAL_INVALID"),
+            (lambda: module.load_profile(str(home)), "PROFILE_INACTIVE_OR_INVALID"),
+        ):
+            with self.subTest(code=code):
+                with self.assertRaises(module.NativeError) as raised:
+                    call()
+                self.assertEqual(str(raised.exception), code)
+        with self.assertRaises(module.NativeError) as raised:
+            with module.state_lock(home, session):
+                pass
+        self.assertEqual(str(raised.exception), "STATE_INVALID")
+
+    def test_unparseable_staged_publication_is_ambiguous(self):
+        module = self.load_native()
+        staged = self.corrupt_file(self.home / "staging" / ".capture-a")
+        with self.assertRaises(module.NativeError) as raised:
+            list(module.publication_candidates(staged.parent))
+        self.assertEqual(str(raised.exception), "PUBLICATION_AMBIGUOUS")
+
+    def test_unparseable_staged_child_profile_is_refused(self):
+        module = self.load_native()
+        home = self.home
+        home.mkdir(mode=0o700)
+        (home / "workspaces").mkdir(mode=0o700)
+        stage = self.corrupt_file(
+            home
+            / "provisioning"
+            / module.workspace_key(str(self.project), "git")
+            / "capture-profile.json"
+        )
+        (stage.parent / "capture-state").mkdir(mode=0o700)
+        with self.assertRaises(module.NativeError) as raised:
+            module.provision_child(home, dict(host="codex"), str(self.project), "git")
+        self.assertEqual(str(raised.exception), "CHILD_PROFILE_INVALID")
+
+    def test_unparseable_enrollment_dates_are_publication_errors(self):
+        self.configure()
+        module = self.load_native()
+        _, profile = module.load_profile(str(self.home))
+        session = self.session_key("session-1")
+        for date in ("not-a-date", "2026-13-45", 20261117):
+            for call, code in (
+                (
+                    lambda: module.validate_initial_state(
+                        profile,
+                        session,
+                        dict(turn="turn-1", session_save={"date": date}),
+                    ),
+                    "ENROLLMENT_PUBLICATION_INVALID",
+                ),
+                (
+                    lambda: module.continuation_capture(
+                        profile,
+                        session,
+                        dict(
+                            turn="turn-1",
+                            continuation_requested=True,
+                            session_save={"date": date},
+                        ),
+                    ),
+                    "CONTINUATION_PUBLICATION_INVALID",
+                ),
+            ):
+                with self.subTest(code=code, date=date):
+                    with self.assertRaises(module.NativeError) as raised:
+                        call()
+                    self.assertEqual(str(raised.exception), code)
+
+    def test_undecodable_git_output_reports_git_failed(self):
+        module = self.load_native()
+        completed = subprocess.CompletedProcess([], 0)
+        completed.stdout = b"\xff"
+        completed.stderr = b""
+        with mock.patch.object(module.subprocess, "run", return_value=completed):
+            with self.assertRaises(module.NativeError) as raised:
+                module.git(self.project, "rev-parse", "HEAD")
+        self.assertEqual(str(raised.exception), "GIT_FAILED")
+
+    def test_unreadable_commit_claim_transfers_to_the_calling_session(self):
+        module = self.load_native()
+        claims = self.home / "commit-claims"
+        claims.mkdir(parents=True, mode=0o700)
+        commit = "c" * 40
+        (claims / commit).write_bytes(b"\xff")
+        (claims / commit).chmod(0o600)
+        self.assertTrue(module.claim_commit(self.home, "a" * 64, commit))
+        self.assertEqual((claims / commit).read_text(), "a" * 64)
+
+    def test_unparseable_config_toml_reports_profile_drift(self):
+        self.configure()
+        config = self.home / "config.toml"
+        for body in (b"[[[ not toml", b"\xff"):
+            with self.subTest(body=body):
+                config.write_bytes(body)
+                result = self.cli("status", "--home", str(self.home))
+                self.assertEqual(result.returncode, 64)
+                self.assertIn("PROFILE_DRIFT", result.stderr)
+
+    def test_unparseable_staged_child_profile_fails_inspection_with_stable_code(self):
+        module = self.load_native()
+        home = self.home
+        home.mkdir(mode=0o700)
+        stage = self.corrupt_file(
+            home / "provisioning" / ("b" * 64) / "capture-profile.json"
+        )
+        (stage.parent / "capture-state").mkdir(mode=0o700)
+        with self.assertRaises(module.NativeError) as raised:
+            module.inspect_provisioning(home, dict(host="codex"))
+        self.assertEqual(str(raised.exception), "CHILD_PROFILE_INVALID")
+
+    def test_unparseable_retained_first_generation_reports_archive_invalid(self):
+        module = self.load_native()
+        home = self.home
+        home.mkdir(mode=0o700)
+        session = self.session_key("session-1")
+        first = "e" * 64
+        locator = self.corrupt_file(
+            home / "retained-bindings" / (session + ".json"),
+            json.dumps(
+                dict(session=session, workspace="w" * 64, firstGeneration=first)
+            ).encode(),
+        )
+        self.corrupt_file(home / "archive" / session / (first + ".json"), b"{")
+        envelope = dict(binding=dict(workspace="w" * 64), generation=first)
+        with self.assertRaises(module.NativeError) as raised:
+            module.retained_locator(home, session, envelope)
+        self.assertEqual(str(raised.exception), "RETENTION_ARCHIVE_INVALID")
+        self.assertTrue(locator.exists())
+
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
@@ -3961,6 +4122,15 @@ class UserCaptureTest(NativeCaptureFixture):
             + "\nContinue original capture",
         )
         return path, frozen, event
+
+    def test_unparseable_continuation_date_reports_stable_code_at_the_hook(self):
+        path, frozen, event = self.continuation_fixture()
+        state = json.loads(frozen)
+        state["session_save"]["date"] = "2026-13-45"
+        path.write_text(json.dumps(state))
+        output = self.hook("UserPromptSubmit", prompt=event["prompt"])
+        self.assertIn("CONTINUATION_PUBLICATION_INVALID", json.dumps(output))
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(output))
 
     def interrupted_continuation(self, event):
         program = """
@@ -5734,6 +5904,17 @@ module.hook(home, descriptor, json.loads(event))
                 ]
                 self.assertIn(original, snapshots)
 
+    def test_unparseable_archive_generation_fails_drain_status_with_stable_code(self):
+        self.configure()
+        path = self.terminal_session()
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other work")
+        stray = self.home / "archive" / path.stem / ("f" * 64 + ".json")
+        stray.write_text("{")
+        stray.chmod(0o600)
+        result = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("RETENTION_ARCHIVE_INVALID", result.stderr)
+
     def test_archived_missing_evidence_and_conflicting_hot_copy_never_fall_back(self):
         for failure in ("missing-generation", "missing-directory", "conflicting-hot"):
             with self.subTest(failure=failure):
@@ -6639,6 +6820,55 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.hook("UserPromptSubmit", prompt="work")
         self.assert_hook_exception_boundaries(
             "check_user_state", "USER_CAPTURE_UNAVAILABLE"
+        )
+
+    def test_corrupt_persisted_state_reports_stable_codes_not_value_error(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        session = self.session_key("session-1")
+        command = "git commit -m next"
+        for target, code in (
+            (self.state_paths()[0], "STATE_INVALID"),
+            (self.home / "bindings" / (session + ".json"), "SESSION_BINDING_INVALID"),
+        ):
+            original = target.read_bytes()
+            target.write_bytes(b"not json")
+            try:
+                denied = self.hook(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_use_id="corrupt-call",
+                    tool_input={"command": command},
+                )
+            finally:
+                target.write_bytes(original)
+            guidance = self.assert_bash_advisory(denied)
+            self.assertIn(code, guidance, repr(target))
+            self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
+        archive = self.home / "archive"
+        archive.mkdir(mode=0o700)
+        index = archive / session / "index.json"
+        index.parent.mkdir(mode=0o700)
+        index.write_text("not json")
+        index.chmod(0o600)
+        denied = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="corrupt-call",
+            tool_input={"command": command},
+        )
+        guidance = self.assert_bash_advisory(denied)
+        self.assertIn("RETENTION_INDEX_INVALID", guidance)
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
+        shutil.rmtree(archive)
+        self.assertEqual(
+            self.hook(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_use_id="recover-call",
+                tool_input={"command": command},
+            )["hookSpecificOutput"].get("permissionDecision", "allow"),
+            "allow",
         )
 
     def test_bound_and_unbound_busy_hooks_do_not_block_prompts_or_unrelated_bash(self):
@@ -8332,6 +8562,50 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.assertEqual(
             self.parse_shell_words("git commit -m fixture"),
             ["git", "commit", "-m", "fixture"],
+        )
+
+    def test_add_commit_chain_runs_and_is_captured_by_the_reflog_watch(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.hook("UserPromptSubmit", prompt="work")
+        command = "git add file.txt && git commit -m chained"
+        (self.project / "file.txt").write_text("chained\n")
+        before = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="chain-call",
+            tool_input={"command": command},
+        )
+        guidance = self.assert_bash_advisory(before)
+        self.assertIn("unsupported commit command", guidance)
+        self.assertIn("HEAD reflog", guidance)
+        executed = subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=self.project,
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        after = self.hook(
+            "PostToolUse",
+            tool_name="Bash",
+            tool_use_id="chain-call",
+            tool_input={"command": command},
+            tool_response=executed.stdout,
+        )
+        self.assertIn(
+            "Prepare the pending capture:",
+            after["hookSpecificOutput"]["additionalContext"],
+        )
+        state = json.loads(next(iter(self.state_paths())).read_text())
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()],
+            [self.git("rev-parse", "HEAD").stdout.strip()],
+        )
+        self.assertTrue(
+            all(p["status"] == "pending" for p in state["commits"].values())
         )
 
 

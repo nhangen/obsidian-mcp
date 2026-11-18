@@ -305,6 +305,22 @@ If `capture-state/active.json` is corrupt (`ACTIVE_STATE_INVALID`), the same `ta
 command deletes it and reports `cleared_invalid_gate`; the commit event is already
 recorded in the session state by then. `takeover` also aborts with
 `INTERRUPTED_OWNERSHIP_CHANGED` if the owner released the gate while it waited.
+Any other unparseable persisted capture file fails closed with its own stable
+code instead of an unspecific exception class: session state (`STATE_INVALID`),
+session binding (`SESSION_BINDING_INVALID`), retention journal, archive or
+locator (`RETENTION_JOURNAL_INVALID`, `RETENTION_ARCHIVE_INVALID`,
+`RETENTION_INDEX_INVALID`, `RETENTION_BINDING_INVALID`), a staged publication
+(`PUBLICATION_AMBIGUOUS`), a staged child profile (`CHILD_PROFILE_INVALID`), an
+enrollment date (`ENROLLMENT_PUBLICATION_INVALID`,
+`CONTINUATION_PUBLICATION_INVALID`), the capture profile
+(`PROFILE_INACTIVE_OR_INVALID`), an isolated profile's `config.toml`
+(`PROFILE_DRIFT`), and undecodable Git output (`GIT_FAILED`).
+A commit-shaped tool call during such a failure runs unchanged with the code in
+its advisory, but the HEAD reflog watch does not run while the file stays
+damaged. Restoring the original file lets the next hook event record the commit.
+Deleting or rebuilding session state takes a fresh reflog baseline, so a commit
+made during the failure is not captured; there is no supported repair for
+`STATE_INVALID` yet (#44).
 If `daily-append` or `resolve-snapshot` finish their local write and then find
 the gate corrupt or owned by another session, they report it (`note` in the
 result, one context line in the hook) without raising, so a completed capture
