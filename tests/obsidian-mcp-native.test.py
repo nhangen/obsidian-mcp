@@ -8998,13 +8998,16 @@ class CaptureShellParserTest(NativeCaptureFixture):
         self.assertIn("unsupported commit command", guidance)
         self.assertIn("HEAD reflog", guidance)
 
-    def test_helper_parse_environment_is_minimal(self):
-        module = self.native()
-        self.assertEqual(
-            module.HELPER_ENVIRONMENT,
-            {"LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+    def test_helper_parse_runs_helper_with_minimal_environment(self):
+        seen = Path(self.temp.name) / "helper-env"
+        self.stub_helper(
+            f'printf "%s|%s|%s" "${{GOTRACEBACK-unset}}" "$PATH" "$LC_ALL" > {seen}\n'
+            "exit 1"
         )
-        self.assertNotIn("GOTRACEBACK", module.HELPER_ENVIRONMENT)
+        with mock.patch.dict(os.environ, {"GOTRACEBACK": "crash"}):
+            with self.assertRaises(self.native().ShellParseError):
+                self.native().helper_parse("git status")
+        self.assertEqual(seen.read_text(), "unset|/usr/bin:/bin|C.UTF-8")
 
     def stop_watched_then_two_commits(self):
         self.configure()
