@@ -4705,6 +4705,8 @@ def dispatch_command(args, extra, locks):
         args.operation != "attach" or args.host != "claude-plugin"
     ):
         raise NativeError("COMMIT_ROUTES_HOST_UNSUPPORTED")
+    if args.repair_state and args.operation != "takeover":
+        raise NativeError("ARGUMENTS_INVALID")
     if extra and args.operation not in ("run", "capabilities", "attach", "create"):
         raise NativeError("ARGUMENTS_INVALID")
     if args.operation == "capabilities":

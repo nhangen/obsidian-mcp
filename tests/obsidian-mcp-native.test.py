@@ -2429,6 +2429,22 @@ class NativeCaptureTest(NativeCaptureFixture):
             ],
         )
 
+    def test_repair_state_flag_is_rejected_outside_takeover(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+
+        result = self.cli(
+            "status",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ARGUMENTS_INVALID", result.stderr)
+
     def test_repair_state_refuses_a_session_that_never_started(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
