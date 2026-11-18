@@ -4471,13 +4471,18 @@ def repair_state(home, profile, args):
         if owner is not None and owner["session"] != session:
             raise NativeError("INTERRUPTED_OWNERSHIP_REQUIRED")
         quarantined = directory / (session + ".json.invalid")
-        with state_lock(home, session, allow_invalid=True) as (_state, _path):
+        # state_lock creates the lock file, so its prior existence is the only
+        # evidence that a now-missing state file was ever started.
+        lock_existed = (directory / (session + ".lock")).exists()
+        with state_lock(home, session, allow_invalid=True) as (current, _path):
+            if current is not None:
+                raise NativeError("REPAIR_STATE_NOT_INVALID")
             if state_path.exists() or state_path.is_symlink():
                 if quarantined.exists() or quarantined.is_symlink():
                     raise NativeError("REPAIR_QUARANTINE_TAKEN")
                 os.replace(state_path, quarantined)
             else:
-                if not (directory / (session + ".lock")).exists():
+                if not lock_existed:
                     raise NativeError("REPAIR_STATE_NOT_INVALID")
                 if quarantined.exists() or quarantined.is_symlink():
                     raise NativeError("REPAIR_QUARANTINE_TAKEN")

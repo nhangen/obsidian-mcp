@@ -350,6 +350,18 @@ except namespace['NativeError'] as error:
                 self.assertEqual(remaining["commits"], {})
                 self.assertNotEqual(self.git("rev-parse", "HEAD").stdout, head)
 
+    def repair(self, session):
+        return self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            session,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+
     def load_native(self):
         script = self.bundle / "bin/obsidian-mcp-native"
         module = types.ModuleType("native_under_test")
@@ -2369,6 +2381,30 @@ class NativeCaptureTest(NativeCaptureFixture):
             module.retained_locator(home, session, envelope)
         self.assertEqual(str(raised.exception), "RETENTION_ARCHIVE_INVALID")
         self.assertTrue(locator.exists())
+
+    def test_repair_state_refuses_a_session_that_never_started(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        state = json.loads(self.state_paths()[0].read_text())
+        skipped = self.cli(
+            "skip",
+            "--home",
+            str(self.home),
+            "--session",
+            self.session_key("session-1"),
+            "--turn",
+            state["turn"],
+            "--reason",
+            "no_meaningful_work",
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        unknown = self.session_key("never-started")
+
+        refused = self.repair(unknown)
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
+        self.assertFalse((self.home / "capture-state" / (unknown + ".json")).exists())
 
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
@@ -7186,6 +7222,24 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
             self.git("rev-parse", "HEAD").stdout.strip(),
             [pending["event"].get("commit") for pending in captured["commits"].values()],
         )
+
+    def test_repair_state_refuses_a_valid_state(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+        before = path.read_bytes()
+
+        refused = self.repair(self.session_key("session-1"))
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(path.with_name(path.name + ".invalid").exists())
 
     def test_missing_enrolled_state_reports_stable_code(self):
         self.configure()
