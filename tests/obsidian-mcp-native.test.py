@@ -6612,6 +6612,235 @@ module.hook(home, descriptor, json.loads(event))
         self.assertEqual(self.gate_owner(worktree_child), session)
         self.drain()
 
+    def test_rebind_gate_rechecked_at_write_time_refuses_foreign_gate(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.pending_commit()
+        original_child = self.home / "workspaces" / self.workspace_key(self.project)
+        before = self.session_state(original_child).read_bytes()
+        worktree = self.add_worktree()
+        worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
+        foreign = dict(
+            schemaVersion=1,
+            session=self.session_key("session-2"),
+            reason="commit_capture",
+            since=1,
+        )
+        native = self.load_native()
+        original_write = native.atomic_write
+
+        def racing_write(path, *args, **kwargs):
+            if path.parent.name == "rebind-journal":
+                active_path = worktree_child / "capture-state" / native.ACTIVE
+                active_path.write_text(json.dumps(foreign))
+                os.chmod(active_path, 0o600)
+            return original_write(path, *args, **kwargs)
+
+        home, profile = native.load_profile(self.home)
+        with mock.patch.object(native, "atomic_write", racing_write):
+            output = native.hook(
+                home,
+                profile,
+                self.event("UserPromptSubmit", cwd=str(worktree), prompt="next"),
+            )
+        active = worktree_child / "capture-state" / "active.json"
+        self.assertIn(
+            "destination capture gate is held by another session",
+            json.dumps(output),
+        )
+        self.assertEqual(json.loads(active.read_bytes()), foreign)
+        self.assertEqual(self.session_state(original_child).read_bytes(), before)
+        self.assertFalse(self.session_state(worktree_child).exists())
+        self.assertEqual(self.binding()["project"], str(self.project))
+        self.assertFalse(any((self.home / "rebind-journal").glob("*.json")))
+
+    def test_rebind_refuses_when_commit_capture_is_in_flight(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path, state, _ = self.pending_commit()
+        commit_hash = next(iter(state["commits"]))
+        state["commits"][commit_hash]["in_flight"] = True
+        path.write_text(json.dumps(state))
+        worktree = self.add_worktree()
+        output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertIn(
+            "resolve in-flight commit capture before a workspace transition",
+            json.dumps(output),
+        )
+        self.assertEqual(self.binding()["project"], str(self.project))
+        worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
+        self.assertFalse(self.session_state(worktree_child).exists())
+
+    def test_rebind_refuses_when_commit_capture_is_recovery(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path, state, _ = self.pending_commit()
+        commit_hash = next(iter(state["commits"]))
+        state["commits"][commit_hash]["recovery"] = True
+        path.write_text(json.dumps(state))
+        worktree = self.add_worktree()
+        output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertIn(
+            "resolve in-flight commit capture before a workspace transition",
+            json.dumps(output),
+        )
+        self.assertEqual(self.binding()["project"], str(self.project))
+        worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
+        self.assertFalse(self.session_state(worktree_child).exists())
+
+    def test_managed_worktree_transition_refuses_foreign_not_captured_evidence(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        original_key = self.workspace_key(self.project)
+        original_child = self.home / "workspaces" / original_key
+        session_key = self.session_key("session-1")
+        state_path = self.session_state(original_child)
+        forged = json.loads(state_path.read_bytes())
+        forged["commits"]["f0" * 31 + "aa"] = dict(
+            status="not_captured",
+            event=dict(
+                schemaVersion=1,
+                event="git.commit",
+                outcome="success",
+                repository=str(self.directory / "unrelated"),
+                commit="0" * 40,
+            ),
+            metadata={},
+        )
+        state_path.write_text(json.dumps(forged))
+        worktree = self.add_worktree()
+        advisory = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(advisory))
+        self.assertIn("pending evidence belongs to another repository", json.dumps(advisory))
+        self.assertEqual(json.loads(state_path.read_bytes()), forged)
+        record = json.loads(
+            (self.home / "bindings" / (session_key + ".json")).read_bytes()
+        )
+        self.assertEqual(record["project"], str(self.project))
+        self.assertFalse(
+            (self.home / "workspaces" / self.workspace_key(worktree)).exists()
+        )
+
+    def test_rebind_refuses_when_destination_already_holds_session_state(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        session_key = self.session_key("session-1")
+        worktree = self.add_worktree()
+        worktree_key = self.workspace_key(worktree)
+        native = self.load_native()
+        home, profile = native.load_profile(self.home)
+        child = native.provision_child(home, profile, str(worktree), "git")
+        orphan = child / "capture-state" / (session_key + ".json")
+        orphan.write_text("{}")
+        os.chmod(orphan, 0o600)
+        output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertIn(
+            "destination already holds state for this session",
+            json.dumps(output),
+        )
+        self.assertIn(
+            "remove or drain the destination workspace state to rebind",
+            json.dumps(output),
+        )
+        self.assertEqual(self.binding()["project"], str(self.project))
+        orphan.unlink()
+        output2 = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertNotIn("SESSION_WORKSPACE_CHANGED", json.dumps(output2))
+        self.assertEqual(self.binding()["project"], str(worktree))
+        self.assertEqual(self.binding()["workspace"], worktree_key)
+        self.drain()
+
+    def test_stray_rebind_journal_file_names_file_in_hooks_and_drain_status(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        journal_dir = self.home / "rebind-journal"
+        journal_dir.mkdir(mode=0o700, exist_ok=True)
+        stray = journal_dir / "stray-entry.txt"
+        stray.write_text("invalid journal contents")
+        os.chmod(stray, 0o600)
+        output = self.hook("UserPromptSubmit", prompt="another")
+        self.assertIn("REBIND_JOURNAL_INVALID", json.dumps(output))
+        self.assertIn("stray-entry.txt", json.dumps(output))
+        status = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        data = json.loads(status.stdout)
+        self.assertFalse(data["quiescent"])
+        self.assertFalse(data["complete"])
+        self.assertIn("REBIND_JOURNAL_INVALID", data["reason"])
+        self.assertIn("stray-entry.txt", data["reason"])
+        self.assertEqual(data["rebind_journal"], ["stray-entry.txt"])
+        for op in ("status", "request"):
+            with self.subTest(operation=op):
+                res = self.cli(
+                    op,
+                    "--home",
+                    str(self.home),
+                    "--session",
+                    self.session_key("session-1"),
+                )
+                self.assertEqual(res.returncode, 64)
+                self.assertIn("REBIND_JOURNAL_PENDING", res.stderr)
+                self.assertIn("stray-entry.txt", res.stderr)
+        stray.unlink()
+        output2 = self.hook("UserPromptSubmit", prompt="recovered")
+        self.assertNotIn("REBIND_JOURNAL_INVALID", json.dumps(output2))
+        self.drain()
+
+    def test_rebind_journal_reason_names_the_offending_file(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.pending_commit()
+        worktree = self.add_worktree()
+        native = self.load_native()
+        original_write = native.atomic_write
+
+        def crash(path, *args, **kwargs):
+            if path.parent.name == "rebind-journal":
+                original_write(path, *args, **kwargs)
+                raise OSError("simulated crash")
+            return original_write(path, *args, **kwargs)
+
+        home, profile = native.load_profile(self.home)
+        with mock.patch.object(native, "atomic_write", crash):
+            native.hook(
+                home,
+                profile,
+                self.event("UserPromptSubmit", cwd=str(worktree), prompt="next"),
+            )
+        session = self.session_key("session-1")
+        journal = self.home / "rebind-journal" / (session + ".json")
+        self.assertTrue(journal.exists())
+        status = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(
+            json.loads(status.stdout)["rebind_journal"], [session + ".json"]
+        )
+        self.assertEqual(
+            json.loads(status.stdout)["reason"], "REBIND_JOURNAL_PENDING"
+        )
+        for operation in ("status", "request"):
+            with self.subTest(operation=operation):
+                result = self.cli(
+                    operation, "--home", str(self.home), "--session", session
+                )
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("REBIND_JOURNAL_PENDING", result.stderr)
+                self.assertIn(session + ".json", result.stderr)
+        output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(output))
+        self.assertFalse(journal.exists())
+        self.assertTrue(
+            (
+                self.home
+                / "workspaces"
+                / self.workspace_key(worktree)
+                / "capture-state"
+                / (session + ".json")
+            ).exists()
+        )
+        self.drain()
+
     def test_unresolved_previous_turn_is_retained_and_next_prompt_is_advisory(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
