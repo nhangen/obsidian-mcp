@@ -318,7 +318,8 @@ enrollment date (`ENROLLMENT_PUBLICATION_INVALID`,
 A commit-shaped tool call during such a failure runs unchanged with the code in
 its advisory, but the HEAD reflog watch does not run while the file stays
 damaged. Restoring the original file lets the next hook event record the commit.
-When the original bytes cannot be restored, `takeover --repair-state <session>`
+When the original bytes cannot be restored,
+`takeover --repair-state --session <session> --verification command-stopped-and-history-inspected`
 moves the unparseable file aside (`.json.invalid`), rebuilds a minimal valid state,
 and records a `snapshot_resolutions` entry with `status="not_captured"` and the
 current HEAD as `observed_head`. The outage commit is not captured retroactively;

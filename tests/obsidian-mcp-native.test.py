@@ -22,6 +22,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 
+REPAIR_STATE_HINT = (
+    "takeover --repair-state --session <session> "
+    "--verification command-stopped-and-history-inspected"
+)
+
+
 class NativeCaptureFixture(unittest.TestCase):
     expected_rewrite_decision = "allow"
     initialize_git = True
@@ -7365,14 +7371,14 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(st.returncode, 0, st.stderr)
         st_data = json.loads(st.stdout)
         self.assertTrue(st_data.get("state_invalid"))
-        self.assertEqual(st_data.get("state_invalid_repair"), "takeover --repair-state")
+        self.assertEqual(st_data.get("state_invalid_repair"), REPAIR_STATE_HINT)
 
         # profile-status surfaces state_invalid
         prof = self.cli("profile-status", "--home", str(self.home))
         self.assertEqual(prof.returncode, 0, prof.stderr)
         prof_data = json.loads(prof.stdout)
         self.assertTrue(prof_data.get("state_invalid"))
-        self.assertEqual(prof_data.get("state_invalid_repair"), "takeover --repair-state")
+        self.assertEqual(prof_data.get("state_invalid_repair"), REPAIR_STATE_HINT)
         self.assertIn(session_key, prof_data.get("at_risk", []))
 
 

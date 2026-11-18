@@ -1300,6 +1300,12 @@ def verify_managed_worktree_transition(record, project, mode):
 REBIND_JOURNAL = "rebind-journal"
 
 
+REPAIR_STATE_HINT = (
+    "takeover --repair-state --session <session> "
+    "--verification command-stopped-and-history-inspected"
+)
+
+
 def is_outage_resolution(resolution):
     """A resolution written by takeover --repair-state for an unparseable state."""
     return isinstance(resolution, dict) and resolution.get("reason") == "state_invalid"
@@ -2392,7 +2398,7 @@ def user_drain_status(home, profile):
                 if str(error) != "STATE_INVALID":
                     raise
                 note_at_risk(entry.stem, record["workspace"], str(error))
-                at_risk[-1]["repair"] = "takeover --repair-state"
+                at_risk[-1]["repair"] = REPAIR_STATE_HINT
                 continue
             hot_count += 1
             if reasons:
@@ -4807,13 +4813,13 @@ def dispatch_command(args, extra, locks):
                 result.update(project=profile["project"], projectMode=mode)
                 if args.session and state_unavailable(home, args.session):
                     result["state_invalid"] = True
-                    result["state_invalid_repair"] = "takeover --repair-state"
+                    result["state_invalid_repair"] = REPAIR_STATE_HINT
             elif scope == "user":
                 if args.session:
                     rec, _ = read_binding(home, args.session, restore=False)
                     if rec and child_state_invalid(home, profile, rec):
                         result["state_invalid"] = True
-                        result["state_invalid_repair"] = "takeover --repair-state"
+                        result["state_invalid_repair"] = REPAIR_STATE_HINT
                 else:
                     at_risk_sessions = []
                     for entry in streamed_entries(home / "bindings"):
@@ -4824,7 +4830,7 @@ def dispatch_command(args, extra, locks):
                     if at_risk_sessions:
                         result["at_risk"] = at_risk_sessions[:MAX_DRAIN_SESSIONS]
                         result["state_invalid"] = True
-                        result["state_invalid_repair"] = "takeover --repair-state"
+                        result["state_invalid_repair"] = REPAIR_STATE_HINT
         elif args.operation == "drain-status":
             result = (
                 user_drain_status(home, profile)
@@ -4837,7 +4843,7 @@ def dispatch_command(args, extra, locks):
                 and state_unavailable(home, args.session)
             ):
                 result["state_invalid"] = True
-                result["state_invalid_repair"] = "takeover --repair-state"
+                result["state_invalid_repair"] = REPAIR_STATE_HINT
         elif args.operation == "execute-commit":
             return execute_commit(home, profile, args, locks)
         elif args.operation == "hook":
@@ -4919,7 +4925,7 @@ def dispatch_command(args, extra, locks):
                     result = status_result(state, active_request(home))
                     if state is None and state_unavailable(home, args.session):
                         result["state_invalid"] = True
-                        result["state_invalid_repair"] = "takeover --repair-state"
+                        result["state_invalid_repair"] = REPAIR_STATE_HINT
         elif args.operation == "disable":
             if profile["host"] == "claude-plugin":
                 raise NativeError("PLUGIN_OWNERSHIP_MANAGED_EXTERNALLY")
