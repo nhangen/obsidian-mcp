@@ -82,7 +82,7 @@ def go_major_minor(version: str) -> tuple[int, int] | None:
 
 def toolchain_license_bytes(version: str):
     goroot = Path(go_setting("GOROOT"))
-    # Homebrew layouts keep the cell LICENSE one level above the gocr
+    # Homebrew layouts keep the cell LICENSE one level above the
     # GOROOT root; canonical installs keep it at the GOROOT root.
     candidates = (
         goroot / "LICENSE",
@@ -91,12 +91,10 @@ def toolchain_license_bytes(version: str):
     for candidate in candidates:
         if candidate.is_file():
             return candidate.read_bytes(), str(candidate.relative_to(candidate.parents[-2]))
-        if candidate == candidates[0]:
-            continue
     parts = go_major_minor(version)
     if parts is None:
         fail(f"cannot determine the Go toolchain license for {version}")
-    github = f"https://raw.githubusercontent.com/golang/go/go{version}/LICENSE"
+    github = f"https://raw.githubusercontent.com/golang/go/{version}/LICENSE"
     fail(
         "cannot read the Go toolchain license file; no LICENSE found in "
         f"{goroot} or {goroot.parent}; for a pinned toolchain build use the "
@@ -244,7 +242,6 @@ def main() -> int:
     if output.exists():
         fail(f"build output {output} exists; remove it before rebuilding")
     regular_directory_chain(HELPER, "helper source")
-    output.mkdir(parents=True)
     go_version = go_setting("GOVERSION")
     if go_version != EXPECTED_GOVERSION:
         fail(f"unexpected Go toolchain version {go_version}")
@@ -254,6 +251,7 @@ def main() -> int:
         fail("a go workspace file is present; workspace replacements are rejected")
     validate_platform_entries(PLATFORMS)
     verify_dependency_checksums()
+    output.mkdir(parents=True)
     source_hashes = {}
     for relative in SOURCE_FILES:
         contents = regular_file(HELPER / relative, f"helper source {relative}")

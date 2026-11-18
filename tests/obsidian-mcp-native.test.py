@@ -8085,6 +8085,20 @@ class CaptureShellParserTest(NativeCaptureFixture):
             self.assertIn(
                 "unsupported commit command", str(raised.exception), repr(command)
             )
+        for command in (
+            "git commit -m \"foo\x00bar\"",
+            "git commit -m \"foo\x01bar\"",
+            "git commit -m \"foo\tbar\"",
+            "git commit -m \"foo\x1fbar\"",
+            "git commit -m \"foo\x7fbar\"",
+        ):
+            with self.assertRaises(module.NativeError) as raised:
+                module.shell_commit(command, self.project, self.project)
+            self.assertEqual(
+                str(raised.exception),
+                "unsupported commit command; contains control characters",
+                repr(command),
+            )
 
     def test_needs_validation_matches_helper_outcome(self):
         module = self.native()
@@ -8978,6 +8992,130 @@ class CaptureShellParserTest(NativeCaptureFixture):
         )
         self.assertTrue(
             all(p["status"] == "pending" for p in state["commits"].values())
+        )
+
+    def test_pretool_command_with_nul_is_not_wrapped(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="work")
+        cmd = "git commit -m 'hello\x00world'"
+        result = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id="nul-call",
+            tool_input={"command": cmd},
+        )
+        guidance = self.assert_bash_advisory(result)
+        self.assertIn("unsupported commit command", guidance)
+        self.assertIn("HEAD reflog", guidance)
+
+    def test_helper_parse_runs_helper_with_minimal_environment(self):
+        seen = Path(self.temp.name) / "helper-env"
+        self.stub_helper(
+            f'printf "%s|%s|%s" "${{GOTRACEBACK-unset}}" "$PATH" "$LC_ALL" > {seen}\n'
+            "exit 1"
+        )
+        with mock.patch.dict(os.environ, {"GOTRACEBACK": "crash"}):
+            with self.assertRaises(self.native().ShellParseError):
+                self.native().helper_parse("git status")
+        self.assertEqual(seen.read_text(), "unset|/usr/bin:/bin|C.UTF-8")
+
+    def stop_watched_then_two_commits(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.assertTrue(self.watched_state().get("stop_watched"))
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assertTrue(self.watched_state().get("stop_watched"))
+        # Two commits in one window retain a snapshot instead of capturing.
+        self.empty_commit("one")
+        self.empty_commit("two")
+        return path
+
+    def stop_with_failing_writes(self, failures, **extra):
+        program = """
+import json, runpy, sys
+script, failures, *arguments = sys.argv[1:]
+remaining = int(failures)
+namespace = runpy.run_path(script)
+globals_ = namespace['engine_hook'].__globals__
+original = globals_['atomic_write']
+def write(path, contents, *args, **kwargs):
+    global remaining
+    try:
+        state = json.loads(contents)
+    except ValueError:
+        state = {}
+    if remaining and state.get('snapshots'):
+        remaining -= 1
+        raise OSError('fixture state write failure')
+    return original(path, contents, *args, **kwargs)
+globals_['atomic_write'] = write
+sys.argv = [script, *arguments]
+raise SystemExit(namespace['main']())
+"""
+        result = subprocess.run(
+            [
+                sys.executable, "-B", "-c", program,
+                str(self.bundle / "bin/obsidian-mcp-native"), str(failures),
+                "hook", "--home", str(self.home),
+            ],
+            input=json.dumps(self.event("Stop", **extra)),
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout or "{}")
+
+    def test_stop_watch_write_failure_still_reports_unavailable(self):
+        self.stop_watched_then_two_commits()
+        result = self.stop_with_failing_writes(99, stop_hook_active=True)
+        self.assertIn("history check unavailable", result["systemMessage"])
+
+    def test_stop_watch_transient_write_failure_clears_stop_watched(self):
+        self.stop_watched_then_two_commits()
+        result = self.stop_with_failing_writes(1, stop_hook_active=True)
+        self.assertIn("history check unavailable", result["systemMessage"])
+        state = self.watched_state()
+        self.assertTrue(state["snapshots"])
+        self.assertNotIn("stop_watched", state)
+
+    def test_stale_stop_watched_cleared_when_snapshots_remain(self):
+        path = self.stop_watched_then_two_commits()
+        self.hook("Stop", stop_hook_active=False)
+        state_after_stop = self.watched_state()
+        self.assertTrue(bool(state_after_stop["snapshots"]))
+        self.assertNotIn("stop_watched", state_after_stop)
+
+        self.empty_commit("hidden")
+
+        snapshot = next(iter(state_after_stop["snapshots"]))
+        resolved = self.cli(
+            "resolve-snapshot",
+            "--home",
+            str(self.home),
+            "--session",
+            path.stem,
+            "--snapshot",
+            snapshot,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+
+        self.next_turn()
+        state_next = self.watched_state()
+        self.assertEqual(state_next["turn"], "turn-1")
+        self.assertEqual(
+            [p["event"]["commit"] for p in state_next["commits"].values()],
+            [self.head()],
         )
 
 

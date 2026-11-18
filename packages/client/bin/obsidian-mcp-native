@@ -1476,6 +1476,7 @@ SCHEMA = "shell-capture-parser@1"
 HELPER_INPUT_BYTES = 262144
 HELPER_OUTPUT_BYTES = 4096
 HELPER_TIMEOUT_SECONDS = 5
+HELPER_ENVIRONMENT = {"LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
 HELPER_TIMEOUT_CODE = "HELPER_TIMEOUT"
 HELPER_UNAVAILABLE_CODE = "HELPER_UNAVAILABLE"
 HELPER_FAILED_CODE = "HELPER_FAILED"
@@ -1618,6 +1619,7 @@ def helper_parse(command):
             capture_output=True,
             timeout=HELPER_TIMEOUT_SECONDS,
             check=False,
+            env=HELPER_ENVIRONMENT,
         )
     except subprocess.TimeoutExpired:
         raise shell_parse_failure(
@@ -2860,8 +2862,12 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         if "commit" in words:
             raise NativeError("unsupported git options before commit")
         return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in command):
+        raise NativeError(
+            "unsupported commit command; contains control characters"
+        )
     if (
-        any(c in command for c in "\n\r;$`|&<>")
+        any(c in ";$`|&<>" for c in command)
         or (root != Path(project) and not allow_subdirectory)
         or any(w in ("-c", "--config-env") for w in words)
     ):
@@ -3875,9 +3881,17 @@ def engine_hook(home, profile, event):
                     watch_git_history(home, session, state, path, profile, routes)
                     if not state["snapshots"]:
                         state["stop_watched"] = True
-                        atomic_write(path, encode(state))
+                    else:
+                        state.pop("stop_watched", None)
+                    atomic_write(path, encode(state))
                 except WATCH_ERRORS:
                     watch_failed = True
+                    if state.get("snapshots"):
+                        state.pop("stop_watched", None)
+                        try:
+                            atomic_write(path, encode(state))
+                        except WATCH_ERRORS:
+                            pass
             guidance = capture_guidance(home, state, profile["host"], routes)
             if not guidance:
                 return dict(systemMessage=WATCH_UNAVAILABLE) if watch_failed else {}
