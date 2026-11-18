@@ -9006,7 +9006,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
         )
         self.assertNotIn("GOTRACEBACK", module.HELPER_ENVIRONMENT)
 
-    def test_stale_stop_watched_cleared_when_snapshots_remain(self):
+    def stop_watched_then_two_commits(self):
         self.configure()
         self.empty_commit("base")
         self.hook("UserPromptSubmit", prompt="work")
@@ -9015,30 +9015,74 @@ class CaptureShellParserTest(NativeCaptureFixture):
         state["disposition"] = "skipped_by_policy"
         state["skip_reason"] = "no_meaningful_work"
         path.write_text(json.dumps(state))
-
-        # First Stop: no snapshots, turn is clean -> sets stop_watched = True
         self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
         self.assertTrue(self.watched_state().get("stop_watched"))
-
-        # Continuation prompt: state must remain frozen
         self.hook("UserPromptSubmit", prompt="work")
         self.assertTrue(self.watched_state().get("stop_watched"))
-
-        # Two commits made with NO Bash
+        # Two commits in one window retain a snapshot instead of capturing.
         self.empty_commit("one")
         self.empty_commit("two")
+        return path
 
-        # Second Stop: watch_git_history retains a snapshot for multiple commits.
-        # stop_watched MUST be popped!
+    def stop_with_failing_writes(self, failures, **extra):
+        program = """
+import json, runpy, sys
+script, failures, *arguments = sys.argv[1:]
+remaining = int(failures)
+namespace = runpy.run_path(script)
+globals_ = namespace['engine_hook'].__globals__
+original = globals_['atomic_write']
+def write(path, contents, *args, **kwargs):
+    global remaining
+    try:
+        state = json.loads(contents)
+    except ValueError:
+        state = {}
+    if remaining and state.get('snapshots') and 'stop_watched' not in state:
+        remaining -= 1
+        raise OSError('fixture state write failure')
+    return original(path, contents, *args, **kwargs)
+globals_['atomic_write'] = write
+sys.argv = [script, *arguments]
+raise SystemExit(namespace['main']())
+"""
+        result = subprocess.run(
+            [
+                sys.executable, "-B", "-c", program,
+                str(self.bundle / "bin/obsidian-mcp-native"), str(failures),
+                "hook", "--home", str(self.home),
+            ],
+            input=json.dumps(self.event("Stop", **extra)),
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout or "{}")
+
+    def test_stop_watch_write_failure_still_reports_unavailable(self):
+        self.stop_watched_then_two_commits()
+        result = self.stop_with_failing_writes(99, stop_hook_active=True)
+        self.assertIn("history check unavailable", result["systemMessage"])
+
+    def test_stop_watch_transient_write_failure_clears_stop_watched(self):
+        self.stop_watched_then_two_commits()
+        result = self.stop_with_failing_writes(1, stop_hook_active=True)
+        self.assertIn("history check unavailable", result["systemMessage"])
+        state = self.watched_state()
+        self.assertTrue(state["snapshots"])
+        self.assertNotIn("stop_watched", state)
+
+    def test_stale_stop_watched_cleared_when_snapshots_remain(self):
+        path = self.stop_watched_then_two_commits()
         self.hook("Stop", stop_hook_active=False)
         state_after_stop = self.watched_state()
         self.assertTrue(bool(state_after_stop["snapshots"]))
         self.assertNotIn("stop_watched", state_after_stop)
 
-        # Hidden commit made outside
         self.empty_commit("hidden")
 
-        # Snapshot resolved outside Bash
         snapshot = next(iter(state_after_stop["snapshots"]))
         resolved = self.cli(
             "resolve-snapshot",
@@ -9053,7 +9097,6 @@ class CaptureShellParserTest(NativeCaptureFixture):
         )
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
 
-        # Next prompt: reconciles reflog and captures the hidden commit
         self.next_turn()
         state_next = self.watched_state()
         self.assertEqual(state_next["turn"], "turn-1")

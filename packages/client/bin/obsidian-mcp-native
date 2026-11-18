@@ -3881,10 +3881,13 @@ def engine_hook(home, profile, event):
                         state.pop("stop_watched", None)
                     atomic_write(path, encode(state))
                 except WATCH_ERRORS:
+                    watch_failed = True
                     if state.get("snapshots"):
                         state.pop("stop_watched", None)
-                        atomic_write(path, encode(state))
-                    watch_failed = True
+                        try:
+                            atomic_write(path, encode(state))
+                        except WATCH_ERRORS:
+                            pass
             guidance = capture_guidance(home, state, profile["host"], routes)
             if not guidance:
                 return dict(systemMessage=WATCH_UNAVAILABLE) if watch_failed else {}
