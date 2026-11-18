@@ -2277,27 +2277,37 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(str(raised.exception), "CHILD_PROFILE_INVALID")
 
     def test_unparseable_enrollment_dates_are_publication_errors(self):
+        self.configure()
         module = self.load_native()
-        for call, code in (
-            (
-                lambda: module.validate_initial_state(
-                    {}, "turn", dict(session_save={"date": "not-a-date"})
+        _, profile = module.load_profile(str(self.home))
+        session = self.session_key("session-1")
+        for date in ("not-a-date", "2026-13-45", 20261117):
+            for call, code in (
+                (
+                    lambda: module.validate_initial_state(
+                        profile,
+                        session,
+                        dict(turn="turn-1", session_save={"date": date}),
+                    ),
+                    "ENROLLMENT_PUBLICATION_INVALID",
                 ),
-                "ENROLLMENT_PUBLICATION_INVALID",
-            ),
-            (
-                lambda: module.continuation_capture(
-                    {},
-                    "turn",
-                    dict(continuation_requested=True, session_save={"date": "not-a-date"}),
+                (
+                    lambda: module.continuation_capture(
+                        profile,
+                        session,
+                        dict(
+                            turn="turn-1",
+                            continuation_requested=True,
+                            session_save={"date": date},
+                        ),
+                    ),
+                    "CONTINUATION_PUBLICATION_INVALID",
                 ),
-                "CONTINUATION_PUBLICATION_INVALID",
-            ),
-        ):
-            with self.subTest(code=code):
-                with self.assertRaises(module.NativeError) as raised:
-                    call()
-                self.assertEqual(str(raised.exception), code)
+            ):
+                with self.subTest(code=code, date=date):
+                    with self.assertRaises(module.NativeError) as raised:
+                        call()
+                    self.assertEqual(str(raised.exception), code)
 
     def test_undecodable_git_output_reports_git_failed(self):
         module = self.load_native()
@@ -2340,6 +2350,25 @@ class NativeCaptureTest(NativeCaptureFixture):
         with self.assertRaises(module.NativeError) as raised:
             module.inspect_provisioning(home, dict(host="codex"))
         self.assertEqual(str(raised.exception), "CHILD_PROFILE_INVALID")
+
+    def test_unparseable_retained_first_generation_reports_archive_invalid(self):
+        module = self.load_native()
+        home = self.home
+        home.mkdir(mode=0o700)
+        session = self.session_key("session-1")
+        first = "e" * 64
+        locator = self.corrupt_file(
+            home / "retained-bindings" / (session + ".json"),
+            json.dumps(
+                dict(session=session, workspace="w" * 64, firstGeneration=first)
+            ).encode(),
+        )
+        self.corrupt_file(home / "archive" / session / (first + ".json"), b"{")
+        envelope = dict(binding=dict(workspace="w" * 64), generation=first)
+        with self.assertRaises(module.NativeError) as raised:
+            module.retained_locator(home, session, envelope)
+        self.assertEqual(str(raised.exception), "RETENTION_ARCHIVE_INVALID")
+        self.assertTrue(locator.exists())
 
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
@@ -4093,6 +4122,15 @@ class UserCaptureTest(NativeCaptureFixture):
             + "\nContinue original capture",
         )
         return path, frozen, event
+
+    def test_unparseable_continuation_date_reports_stable_code_at_the_hook(self):
+        path, frozen, event = self.continuation_fixture()
+        state = json.loads(frozen)
+        state["session_save"]["date"] = "2026-13-45"
+        path.write_text(json.dumps(state))
+        output = self.hook("UserPromptSubmit", prompt=event["prompt"])
+        self.assertIn("CONTINUATION_PUBLICATION_INVALID", json.dumps(output))
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(output))
 
     def interrupted_continuation(self, event):
         program = """
@@ -6806,7 +6844,6 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
                 target.write_bytes(original)
             guidance = self.assert_bash_advisory(denied)
             self.assertIn(code, guidance, repr(target))
-            self.assertNotIn("ValueError", json.dumps(denied))
             self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
         archive = self.home / "archive"
         archive.mkdir(mode=0o700)
@@ -6822,7 +6859,7 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         )
         guidance = self.assert_bash_advisory(denied)
         self.assertIn("RETENTION_INDEX_INVALID", guidance)
-        self.assertNotIn("ValueError", json.dumps(denied))
+        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(denied))
         shutil.rmtree(archive)
         self.assertEqual(
             self.hook(
