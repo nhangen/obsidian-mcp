@@ -1186,8 +1186,39 @@ def bound_child(home, profile, record, *, inspect=False):
             if archived_record(home, record["session"], index)["binding"] != record:
                 raise NativeError("RETENTION_CONFLICT")
         else:
-            private_read(child / "capture-state" / (record["session"] + ".json"))
+            try:
+                private_read(child / "capture-state" / (record["session"] + ".json"))
+            except FileNotFoundError:
+                raise NativeError("ENROLLED_STATE_MISSING") from None
     return child, descriptor
+
+
+def session_state_path(home, session):
+    return home / "capture-state" / (session + ".json")
+
+
+def read_state_lenient(home, key):
+    """Parse a session state file without raising STATE_INVALID.
+
+    Returns (state, valid) where valid is False when the file is missing,
+    unparseable, or fails schema/session checks (state is then None).
+    """
+    path = session_state_path(home, key)
+    try:
+        text = private_read(path)
+    except FileNotFoundError:
+        return None, False
+    try:
+        state = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, False
+    if (
+        not isinstance(state, dict)
+        or state.get("schemaVersion") != 1
+        or state.get("session") != key
+    ):
+        return None, False
+    return state, True
 
 
 def event_workspace(event):
@@ -1968,18 +1999,23 @@ def reconcile_enrollment(home, profile):
         if archive_index(home, path.stem) is not None:
             continue
         child, descriptor = bound_child(home, profile, record, inspect=True)
-        with state_lock(child, path.stem) as (state, state_path):
-            candidate = select_publication(state_path.parent, lambda value: True)
-            if candidate is not None:
-                validate_initial_state(descriptor, path.stem, candidate[2])
-                if state is not None and state != candidate[2]:
-                    raise NativeError("PUBLICATION_CONFLICT")
-                publish_candidate(candidate, state_path)
-                clean_retention_temporaries({state_path.parent: (candidate[1],)})
-                state = candidate[2]
-            if state is not None:
-                validate_initial_state(descriptor, path.stem, state)
-                atomic_write(path, encode(dict(record, enrolled=True)))
+        try:
+            with state_lock(child, path.stem) as (state, state_path):
+                candidate = select_publication(state_path.parent, lambda value: True)
+                if candidate is not None:
+                    validate_initial_state(descriptor, path.stem, candidate[2])
+                    if state is not None and state != candidate[2]:
+                        raise NativeError("PUBLICATION_CONFLICT")
+                    publish_candidate(candidate, state_path)
+                    clean_retention_temporaries({state_path.parent: (candidate[1],)})
+                    state = candidate[2]
+                if state is not None:
+                    validate_initial_state(descriptor, path.stem, state)
+                    atomic_write(path, encode(dict(record, enrolled=True)))
+        except NativeError:
+            # STATE_INVALID (corrupt state) leaves the binding unenrolled and
+            # non-paused; the supported repair is takeover --repair-state.
+            continue
 
 
 def retained_capture_event(home, profile, event):
@@ -2192,7 +2228,10 @@ def inspect_child_records(home, child):
     with gate_lock(child, nonblocking=True):
         owner = active_request(child)
         for entry in streamed_entries(checked_state_directory(child)):
-            if entry.name in (ACTIVE, "active.lock"):
+            if (
+                entry.name in (ACTIVE, "active.lock")
+                or entry.name.endswith(".invalid")
+            ):
                 continue
             if (
                 entry.suffix not in (".json", ".lock")
@@ -2288,22 +2327,49 @@ def user_drain_status(home, profile):
                 complete=False,
                 reason="REBIND_JOURNAL_PENDING",
             )
-        inspect_provisioning(home, profile)
         hot_count = archive_count = workspace_count = unresolved_count = 0
         sessions = []
         workspaces = []
+        at_risk = []
+        at_risk_keys = set()
         quiescent = True
+
+        def note_at_risk(session, workspace, reason):
+            nonlocal quiescent
+            at_risk.append(
+                dict(
+                    session=session,
+                    workspace=workspace,
+                    reason=reason,
+                    status="not_captured",
+                )
+            )
+            at_risk_keys.add(session)
+            quiescent = False
+
+        inspect_provisioning(home, profile)
         for entry in streamed_entries(home / "bindings"):
             if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
                 raise NativeError("SESSION_BINDING_INVALID")
             record, _ = read_binding(home, entry.stem, restore=False)
             if record is None:
                 raise NativeError("SESSION_BINDING_INVALID")
-            child, _ = bound_child(home, profile, record, inspect=True)
-            with state_lock(child, entry.stem) as (state, _):
-                reasons = drain_reasons(state) if state is not None else []
-                if record["enrolled"] != (state is not None):
-                    raise NativeError("SESSION_BINDING_INVALID")
+            if str(entry.stem) in at_risk_keys:
+                hot_count += 1
+                quiescent = False
+                continue
+            try:
+                child, _ = bound_child(home, profile, record, inspect=True)
+                with state_lock(child, entry.stem) as (state, _):
+                    reasons = drain_reasons(state) if state is not None else []
+                    if record["enrolled"] != (state is not None):
+                        raise NativeError("SESSION_BINDING_INVALID")
+            except NativeError as error:
+                if str(error) != "STATE_INVALID":
+                    raise
+                note_at_risk(entry.stem, record["workspace"], str(error))
+                at_risk[-1]["repair"] = "takeover --repair-state"
+                continue
             hot_count += 1
             if reasons:
                 unresolved_count += 1
@@ -2354,7 +2420,23 @@ def user_drain_status(home, profile):
                 raise NativeError("CHILD_PROFILE_INVALID")
             child, descriptor = load_profile(child, inspect=True)
             validate_child(home, profile, child, descriptor)
-            owner = inspect_child_records(home, child)
+            try:
+                owner = inspect_child_records(home, child)
+            except NativeError as error:
+                if str(error) != "STATE_INVALID":
+                    raise
+                note_at_risk(
+                    "workspace:" + child.name,
+                    child.name,
+                    str(error),
+                )
+                quiescent = False
+                workspace_count += 1
+                if len(workspaces) < MAX_DRAIN_SESSIONS:
+                    workspaces.append(
+                        dict(workspace=child.name, active_request=None)
+                    )
+                continue
             workspace_count += 1
             if owner is not None:
                 record, _ = read_hot_binding(home, owner["session"])
@@ -2363,8 +2445,8 @@ def user_drain_status(home, profile):
                 quiescent = False
             if len(workspaces) < MAX_DRAIN_SESSIONS:
                 workspaces.append(dict(workspace=child.name, active_request=owner))
-        return dict(
-            status="inspected",
+        result = dict(
+            status="inspected" if not at_risk else "incomplete",
             complete=True,
             quiescent=quiescent,
             workspace_count=workspace_count,
@@ -2375,9 +2457,16 @@ def user_drain_status(home, profile):
             sessions=sessions,
             workspaces=workspaces,
             details_truncated=workspace_count > len(workspaces)
-            or unresolved_count > len(sessions),
+            or unresolved_count > len(sessions)
+            or len(at_risk) > MAX_DRAIN_SESSIONS,
             active_request=None,
         )
+        if at_risk:
+            result["drain_at_risk"] = True
+            result["at_risk"] = at_risk[:MAX_DRAIN_SESSIONS]
+        if at_risk and result["status"] == "incomplete":
+            result["reason"] = "STATE_INVALID_AT_RISK"
+        return result
 
 
 def checked_state_directory(home):
@@ -2422,7 +2511,7 @@ def exclusive_flock(fd, wait=None):
 
 
 @contextmanager
-def state_lock(home, key, *, create=True, wait=None):
+def state_lock(home, key, *, create=True, wait=None, allow_invalid=False):
     if not isinstance(key, str) or HEX.fullmatch(key) is None:
         raise NativeError("SESSION_KEY_INVALID")
     directory = checked_state_directory(home)
@@ -2441,13 +2530,17 @@ def state_lock(home, key, *, create=True, wait=None):
                 else None
             )
         except ValueError:
-            raise NativeError("STATE_INVALID") from None
+            if not allow_invalid:
+                raise NativeError("STATE_INVALID") from None
+            state = None
         if state is not None and (
             not isinstance(state, dict)
             or state.get("schemaVersion") != 1
             or state.get("session") != key
         ):
-            raise NativeError("STATE_INVALID")
+            if not allow_invalid:
+                raise NativeError("STATE_INVALID")
+            state = None
         yield state, path
     finally:
         os.close(fd)
@@ -2550,7 +2643,10 @@ def drain_reasons(state):
             or pending.get("recovery")
         ):
             reasons.append("commit_pending_or_unresolved")
-    if state.get("snapshot_resolutions"):
+    if any(
+        r.get("reason") != "state_invalid"
+        for r in state.get("snapshot_resolutions", [])
+    ):
         reasons.append("uncaptured_snapshot_evidence")
     return sorted(set(reasons))
 
@@ -2561,7 +2657,10 @@ def drain_status(home):
         owner = active_request(home)
         keys = set()
         for entry in directory.iterdir():
-            if entry.name in (ACTIVE, "active.lock"):
+            if (
+                entry.name in (ACTIVE, "active.lock")
+                or entry.name.endswith(".invalid")
+            ):
                 continue
             if (
                 entry.suffix not in (".json", ".lock")
@@ -3427,7 +3526,13 @@ def normalize_claude(event, state):
         drain_reasons(state)
     identity = claude_transcript(event)
     if state and state.get("claude_transcript") != identity:
-        raise NativeError("TRANSCRIPT_IDENTITY_CHANGED")
+        outage_repair = any(
+            r.get("reason") == "state_invalid"
+            for r in (state.get("snapshot_resolutions") or [])
+        )
+        if not (outage_repair and state.get("claude_transcript") is None):
+            raise NativeError("TRANSCRIPT_IDENTITY_CHANGED")
+        state["claude_transcript"] = identity
     normalized = dict(event)
     if name == "UserPromptSubmit":
         prompt = event.get("prompt")
@@ -3683,7 +3788,14 @@ def engine_hook(home, profile, event):
             )
             reconcile_note = ""
             if not continuation and (state is None or state["turn"] != turn):
-                if state and (
+                outage_repair = bool(
+                    state
+                    and any(
+                        r.get("reason") == "state_invalid"
+                        for r in (state.get("snapshot_resolutions") or [])
+                    )
+                )
+                if state and not outage_repair and (
                     state["disposition"] == "pending"
                     or state.get("session_recovery")
                     or state.get("snapshots")
@@ -3691,10 +3803,18 @@ def engine_hook(home, profile, event):
                         p["status"] in ("pending", "not_captured")
                         for p in state["commits"].values()
                     )
-                    or state.get("snapshot_resolutions")
+                    or any(
+                        r.get("reason") != "state_invalid"
+                        for r in state.get("snapshot_resolutions", [])
+                    )
                 ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
-                if state and attached_profile(profile) and drain_reasons(state):
+                if (
+                    state
+                    and not outage_repair
+                    and attached_profile(profile)
+                    and drain_reasons(state)
+                ):
                     raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
                 if state and mode == "git" and not state.get("stop_watched"):
                     try:
@@ -4324,6 +4444,80 @@ def review_retry(home, profile, args):
     return payload
 
 
+def repair_state(home, profile, args):
+    """Repair an unparseable session state file under a supported outage.
+
+    The corrupt file is moved aside for inspection, a minimal valid state is
+    rebuilt, and the outage window is recorded as a `not_captured`
+    resolution with the observed HEAD. A commit made while the file was
+    unparseable is never captured retroactively; the loss is named instead.
+    """
+    require_git_profile(profile)
+    if args.verification != "command-stopped-and-history-inspected":
+        raise NativeError("INTERRUPTED_VERIFICATION_REQUIRED")
+    session = args.session
+    if HEX.fullmatch(session) is None:
+        raise NativeError("SESSION_KEY_INVALID")
+    directory = checked_state_directory(home)
+    state_path = directory / (session + ".json")
+    with gate_lock(home) as gate:
+        try:
+            owner = active_request(home)
+        except NativeError as error:
+            if str(error) != "ACTIVE_STATE_INVALID":
+                raise
+            release_gate(gate)
+            return dict(status="cleared_invalid_gate")
+        if owner is not None and owner["session"] != session:
+            raise NativeError("INTERRUPTED_OWNERSHIP_REQUIRED")
+        quarantined = directory / (session + ".json.invalid")
+        with state_lock(home, session, allow_invalid=True) as (_state, _path):
+            if state_path.exists() or state_path.is_symlink():
+                if quarantined.exists() or quarantined.is_symlink():
+                    raise NativeError("REPAIR_QUARANTINE_TAKEN")
+                os.replace(state_path, quarantined)
+            else:
+                if not (directory / (session + ".lock")).exists():
+                    raise NativeError("REPAIR_STATE_NOT_INVALID")
+                if quarantined.exists() or quarantined.is_symlink():
+                    raise NativeError("REPAIR_QUARANTINE_TAKEN")
+        observed_head = (
+            git(
+                Path(profile["project"]),
+                "rev-parse",
+                "--verify",
+                "HEAD",
+                allow_failure=True,
+            ).strip()
+            or None
+        )
+        state = initial_session_state(
+            profile, session, digest(b"repair-state-outage")
+        )
+        state["snapshot_resolutions"] = [
+            dict(
+                owner=session,
+                observed_head=observed_head,
+                status="not_captured",
+                reason="state_invalid",
+            )
+        ]
+        try:
+            state["git_watch"] = git_position(Path(profile["project"]))
+        except WATCH_ERRORS:
+            pass
+        atomic_write(state_path, encode(state))
+        if owner is not None:
+            release_gate(gate)
+        return dict(
+            status="repaired",
+            session=session,
+            quarantine=str(quarantined),
+            observed_head=observed_head,
+            head_unavailable=observed_head is None,
+        )
+
+
 def takeover(home, profile, args):
     require_git_profile(profile)
     if args.verification != "command-stopped-and-history-inspected":
@@ -4437,6 +4631,7 @@ def main():
     parser.add_argument(
         "--reason", choices=("no_meaningful_work", "user_requested_no_capture")
     )
+    parser.add_argument("--repair-state", action="store_true")
     args, extra = parser.parse_known_args()
     with ExitStack() as locks:
         return dispatch_command(args, extra, locks)
@@ -4450,6 +4645,23 @@ def status_result(state, owner):
         pending.pop("native_arguments", None)
     result["gate"] = owner
     return result
+
+
+def state_unavailable(home, session):
+    """True when the session state file exists but cannot be parsed."""
+    _, valid = read_state_lenient(home, session)
+    return not valid
+
+
+def child_state_invalid(home, profile, record):
+    if not record["enrolled"]:
+        return False
+    try:
+        child, _ = bound_child(home, profile, record, inspect=True)
+    except NativeError:
+        return False
+    _, valid = read_state_lenient(child, record["session"])
+    return not valid
 
 
 def dispatch_command(args, extra, locks):
@@ -4572,12 +4784,39 @@ def dispatch_command(args, extra, locks):
                 result["profileMode"] = profile["profileMode"]
             if scope == "project":
                 result.update(project=profile["project"], projectMode=mode)
+                if args.session and state_unavailable(home, args.session):
+                    result["state_invalid"] = True
+                    result["state_invalid_repair"] = "takeover --repair-state"
+            elif scope == "user":
+                if args.session:
+                    rec, _ = read_binding(home, args.session, restore=False)
+                    if rec and child_state_invalid(home, profile, rec):
+                        result["state_invalid"] = True
+                        result["state_invalid_repair"] = "takeover --repair-state"
+                else:
+                    at_risk_sessions = []
+                    for entry in streamed_entries(home / "bindings"):
+                        if entry.suffix == ".json" and HEX.fullmatch(entry.stem):
+                            rec, _ = read_binding(home, entry.stem, restore=False)
+                            if rec and child_state_invalid(home, profile, rec):
+                                at_risk_sessions.append(entry.stem)
+                    if at_risk_sessions:
+                        result["at_risk"] = at_risk_sessions[:MAX_DRAIN_SESSIONS]
+                        result["state_invalid"] = True
+                        result["state_invalid_repair"] = "takeover --repair-state"
         elif args.operation == "drain-status":
             result = (
                 user_drain_status(home, profile)
                 if scope == "user"
                 else drain_status(home)
             )
+            if (
+                scope == "project"
+                and args.session
+                and state_unavailable(home, args.session)
+            ):
+                result["state_invalid"] = True
+                result["state_invalid_repair"] = "takeover --repair-state"
         elif args.operation == "execute-commit":
             return execute_commit(home, profile, args, locks)
         elif args.operation == "hook":
@@ -4600,7 +4839,10 @@ def dispatch_command(args, extra, locks):
                 atomic_write(path, encode(state))
                 result = {"status": "skipped_by_policy"}
         elif args.operation == "takeover":
-            result = takeover(home, profile, args)
+            if args.repair_state:
+                result = repair_state(home, profile, args)
+            else:
+                result = takeover(home, profile, args)
         elif args.operation == "resolve-snapshot":
             if args.verification != "command-stopped-and-history-inspected":
                 raise NativeError("TOOL_COMPLETION_VERIFICATION_REQUIRED")
@@ -4647,13 +4889,16 @@ def dispatch_command(args, extra, locks):
             if note:
                 result["note"] = note.lstrip("\n")
         elif args.operation in ("status", "request"):
-            with state_lock(home, args.session) as (state, _path):
+            with state_lock(home, args.session, allow_invalid=True) as (state, _path):
                 if args.operation == "request":
                     result = (state or {}).get(
                         "session_request", {"status": "request_unavailable"}
                     )
                 else:
                     result = status_result(state, active_request(home))
+                    if state is None and state_unavailable(home, args.session):
+                        result["state_invalid"] = True
+                        result["state_invalid_repair"] = "takeover --repair-state"
         elif args.operation == "disable":
             if profile["host"] == "claude-plugin":
                 raise NativeError("PLUGIN_OWNERSHIP_MANAGED_EXTERNALLY")
