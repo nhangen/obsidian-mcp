@@ -2527,6 +2527,44 @@ class NativeCaptureTest(NativeCaptureFixture):
             self.assertIn("REPAIR_STATE_NOT_INVALID", refused.stderr)
         self.assertFalse((self.home / "capture-state" / (unknown + ".json")).exists())
 
+    def test_repair_state_records_durable_outage_in_project_scope(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        session = path.stem
+        self.corrupt_file(path, b"not json")
+        repaired = self.repair(session)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        outcome = json.loads(repaired.stdout)
+        self.assertFalse(outcome["range_known"])
+
+        records = json.loads((self.home / "outage-journal").read_text())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["session"], session)
+        self.assertFalse(records[0]["range_known"])
+
+        drain = json.loads(self.cli("drain-status", "--home", str(self.home)).stdout)
+        self.assertEqual(drain["status"], "inspected")
+        self.assertEqual(drain["outages"][0]["session"], session)
+        self.assertFalse(drain["outages"][0]["range_known"])
+
+        # Even if quarantine and state file are unlinked, journal survives and drain surfaces it
+        path.with_name(path.name + ".invalid").unlink()
+        path.unlink()
+        after = json.loads(self.cli("drain-status", "--home", str(self.home)).stdout)
+        self.assertEqual(after["status"], "inspected")
+        self.assertTrue(after["quiescent"])
+        self.assertEqual(after["outages"][0]["session"], session)
+        self.assertFalse(after["outages"][0]["range_known"])
+
+    def test_corrupt_outage_journal_fails_closed(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        self.corrupt_file(self.home / "outage-journal", b"not json")
+        drain = self.cli("drain-status", "--home", str(self.home))
+        self.assertEqual(drain.returncode, 64)
+        self.assertIn("OUTAGE_JOURNAL_INVALID", drain.stderr)
+
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
@@ -7616,6 +7654,7 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(outcome["observed_head"], outage_head)
         self.assertFalse(outcome["head_unavailable"])
         self.assertFalse(outcome["watch_unavailable"])
+        self.assertFalse(outcome["range_known"])
         quarantined = Path(outcome["quarantine"])
         self.assertEqual(quarantined.read_bytes(), b"not json")
         self.assertTrue(path.exists())
@@ -7634,12 +7673,26 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
         self.assertEqual(len(resolutions), 1)
         self.assertEqual(resolutions[0]["status"], "not_captured")
         self.assertEqual(resolutions[0]["observed_head"], outage_head)
+        self.assertFalse(resolutions[0]["range_known"])
         self.assertEqual(
             resolutions[0]["verification"], "command-stopped-and-history-inspected"
         )
         self.assertEqual(
             state["git_watch"]["head"], self.git("rev-parse", "HEAD").stdout.strip()
         )
+        # The outage journal is the durable record: it survives the state
+        # rebuild below, where the short-lived resolution disappears.
+        journal = (self.home / "outage-journal").read_text()
+        record = json.loads(journal)[0]
+        self.assertEqual(record["schemaVersion"], 1)
+        self.assertEqual(record["session"], self.session_key("session-1"))
+        self.assertEqual(record["project"], str(self.project))
+        self.assertEqual(record["observed_head"], outage_head)
+        self.assertFalse(record["range_known"])
+        self.assertEqual(
+            record["verification"], "command-stopped-and-history-inspected"
+        )
+
         # The outage resolution is not drain evidence: only the repaired
         # session's pending turn remains, and the at-risk window is gone.
         after = self.drain()
@@ -7650,6 +7703,8 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
             "uncaptured_snapshot_evidence",
             [reason for session in after["sessions"] for reason in session.get("unresolved", [])],
         )
+        self.assertEqual(after["outages"][0]["observed_head"], outage_head)
+        self.assertFalse(after["outages"][0]["range_known"])
 
         # A later commit is captured by the resumed watch.
         (self.project / "after.txt").write_text("after\n")
@@ -7667,6 +7722,91 @@ print(json.dumps(module.hook(home, descriptor, json.loads(event))))
             self.git("rev-parse", "HEAD").stdout.strip(),
             [pending["event"].get("commit") for pending in captured["commits"].values()],
         )
+        # The outage journal and quarantine remain as durable traces.
+        self.assertEqual(
+            json.loads((self.home / "outage-journal").read_text())[0][
+                "observed_head"
+            ],
+            outage_head,
+        )
+        self.assertEqual(quarantined.read_bytes(), b"not json")
+        drain = self.drain()
+        self.assertEqual(drain["outages"][0]["observed_head"], outage_head)
+        self.assertFalse(drain["outages"][0]["range_known"])
+
+    def test_repair_state_appends_one_record_per_repair(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + self.session_key("session-1") + ".json"
+            )
+        )
+        self.corrupt_file(path, b"not json")
+        self.assertEqual(self.repair(self.session_key("session-1")).returncode, 0)
+        # Quarantine must be cleared or moved before the same session can be repaired again
+        path.with_name(path.name + ".invalid").unlink()
+        self.corrupt_file(path, b"still not json")
+        self.assertEqual(self.repair(self.session_key("session-1")).returncode, 0)
+
+        records = json.loads((self.home / "outage-journal").read_text())
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            records[1]["observed_head"], self.git("rev-parse", "HEAD").stdout.strip()
+        )
+        self.assertTrue(all(not record["range_known"] for record in records))
+
+    def test_outage_journal_survives_a_corrupt_quarantine_and_state(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        session = self.session_key("session-1")
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + session + ".json"
+            )
+        )
+        self.corrupt_file(path, b"not json")
+        self.assertEqual(self.repair(session).returncode, 0)
+        # A later reader may lose the quarantine; the journal must still name the outage.
+        path.with_name(path.name + ".invalid").unlink()
+        drain = self.drain()
+        self.assertEqual(drain["status"], "inspected")
+        self.assertFalse(drain["quiescent"])
+        self.assertEqual(drain["outages"][0]["session"], session)
+        self.assertFalse(drain["outages"][0]["range_known"])
+
+    def test_outage_resolution_replaced_on_user_prompt_submit_but_journal_survives(self):
+        self.configure()
+        self.git("commit", "--allow-empty", "-m", "base")
+        self.terminal_session()
+        session = self.session_key("session-1")
+        path = next(
+            (self.home / "workspaces").glob(
+                "*/capture-state/" + session + ".json"
+            )
+        )
+        self.corrupt_file(path, b"not json")
+        repaired = self.repair(session)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        state_after_repair = json.loads(path.read_text())
+        self.assertIn("snapshot_resolutions", state_after_repair)
+
+        # The next prompt rebuilds the state, replacing snapshot_resolutions
+        output = self.hook("UserPromptSubmit", session_id="session-1", prompt="next prompt")
+        self.assertNotIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        state_after_prompt = json.loads(path.read_text())
+        self.assertNotIn("snapshot_resolutions", state_after_prompt)
+
+        # The outage journal and drain-status still name the outage
+        records = json.loads((self.home / "outage-journal").read_text())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["session"], session)
+        self.assertFalse(records[0]["range_known"])
+        drain = self.drain()
+        self.assertEqual(drain["outages"][0]["session"], session)
+        self.assertFalse(drain["outages"][0]["range_known"])
 
     def test_repair_state_refuses_a_valid_state(self):
         self.configure()

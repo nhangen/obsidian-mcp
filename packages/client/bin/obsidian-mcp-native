@@ -1327,6 +1327,85 @@ def is_outage_resolution(resolution):
     return isinstance(resolution, dict) and resolution.get("reason") == "state_invalid"
 
 
+OUTAGE_JOURNAL = "outage-journal"
+
+
+def outage_entry(record):
+    """Validate one outage journal record; None rejects it."""
+    return (
+        record
+        if isinstance(record, dict)
+        and set(record)
+        == {
+            "schemaVersion",
+            "session",
+            "project",
+            "observed_head",
+            "range_known",
+            "verification",
+        }
+        and record["schemaVersion"] == 1
+        and HEX.fullmatch(record["session"]) is not None
+        and isinstance(record["project"], str)
+        and record["project"]
+        and (
+            record["observed_head"] is None
+            or HASH.fullmatch(record["observed_head"]) is not None
+        )
+        and record["range_known"] is False
+        and record["verification"]
+        == "command-stopped-and-history-inspected"
+        else None
+    )
+
+
+def read_outage_journal(home):
+    """Return the durable outage journal entries, or [] when absent.
+
+    Every entry is validated, so a later reader of the journal is never
+    shown an outage record it cannot trust.
+    """
+    try:
+        text = private_read(home / OUTAGE_JOURNAL)
+    except FileNotFoundError:
+        return []
+    except NativeError as error:
+        if str(error) not in ("PRIVATE_FILE_INVALID", "STATE_TOO_LARGE"):
+            raise
+        raise NativeError("OUTAGE_JOURNAL_INVALID") from None
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise NativeError("OUTAGE_JOURNAL_INVALID") from None
+    if not isinstance(value, list) or len(value) > MAX_DRAIN_SESSIONS:
+        raise NativeError("OUTAGE_JOURNAL_INVALID")
+    entries = [entry for entry in map(outage_entry, value)]
+    if len(entries) != len(value):
+        raise NativeError("OUTAGE_JOURNAL_INVALID")
+    return entries
+
+
+def append_outage_record(home, record):
+    """Append one outage record to the durable journal and fsync it.
+
+    The append is the commit point; the state rebuild is derived from it.
+    """
+    entry = outage_entry(record)
+    if entry is None:
+        raise NativeError("OUTAGE_RECORD_INVALID")
+    existing = read_outage_journal(home)
+    if len(existing) >= MAX_DRAIN_SESSIONS:
+        raise NativeError("OUTAGE_JOURNAL_LIMIT")
+    try:
+        atomic_write(home / OUTAGE_JOURNAL, encode(existing + [entry]))
+    except NativeError as error:
+        if str(error) == "STATE_TOO_LARGE":
+            raise NativeError("OUTAGE_JOURNAL_LIMIT") from error
+        raise
+    except OSError as error:
+        raise NativeError("OUTAGE_JOURNAL_WRITE_FAILED") from error
+
+
 def has_outage_resolution(state):
     return any(
         is_outage_resolution(r) for r in (state.get("snapshot_resolutions") or [])
@@ -2524,6 +2603,7 @@ def user_drain_status(home, profile):
             unresolved_session_count=unresolved_count,
             sessions=sessions,
             workspaces=workspaces,
+            outages=read_outage_journal(home),
             details_truncated=workspace_count > len(workspaces)
             or unresolved_count > len(sessions)
             or len(at_risk) > MAX_DRAIN_SESSIONS,
@@ -2762,11 +2842,13 @@ def drain_status(home):
             raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
         if {p.stem for p in directory.glob("*.json") if p.name != ACTIVE} != present:
             raise NativeError("DRAIN_STATE_CHANGED")
+        journal = read_outage_journal(home)
         return dict(
             status="inspected",
             quiescent=owner is None and all(not s["unresolved"] for s in sessions),
             session_count=len(sessions),
             sessions=sessions,
+            outages=journal,
             active_request=owner,
         )
 
@@ -4544,8 +4626,13 @@ def repair_state(home, profile, args):
 
     The corrupt file is moved aside for inspection, a minimal valid state is
     rebuilt, and the outage window is recorded as a `not_captured`
-    resolution with the observed HEAD. A commit made while the file was
-    unparseable is never captured retroactively; the loss is named instead.
+    resolution. The range of commits made during the outage cannot be
+    reconstructed (the earlier git_watch baseline lived in the corrupt
+    file), so it is recorded as unknown and the observed HEAD is only a
+    reference point. Before anything is rebuilt, one outage record is
+    appended to the durable outage journal: the state file is replaced on
+    the next UserPromptSubmit, the `.json.invalid` quarantine may be
+    inspected and deleted, but the journal survives both.
     """
     require_git_profile(profile)
     if args.verification != "command-stopped-and-history-inspected":
@@ -4575,7 +4662,6 @@ def repair_state(home, profile, args):
                 raise NativeError("REPAIR_STATE_NOT_INVALID")
             if quarantined.exists() or quarantined.is_symlink():
                 raise NativeError("REPAIR_QUARANTINE_TAKEN")
-            os.replace(state_path, quarantined)
             observed_head = (
                 git(
                     Path(profile["project"]),
@@ -4586,6 +4672,21 @@ def repair_state(home, profile, args):
                 ).strip()
                 or None
             )
+            parent_home = (
+                Path(profile["parentHome"]) if "parentHome" in profile else home
+            )
+            append_outage_record(
+                parent_home,
+                dict(
+                    schemaVersion=1,
+                    session=session,
+                    project=profile["project"],
+                    observed_head=observed_head,
+                    range_known=False,
+                    verification=args.verification,
+                ),
+            )
+            os.replace(state_path, quarantined)
             state = initial_session_state(
                 profile, session, digest(b"repair-state-outage")
             )
@@ -4593,6 +4694,7 @@ def repair_state(home, profile, args):
                 dict(
                     owner=session,
                     observed_head=observed_head,
+                    range_known=False,
                     status="not_captured",
                     reason="state_invalid",
                     verification=args.verification,
@@ -4612,6 +4714,7 @@ def repair_state(home, profile, args):
             quarantine=str(quarantined),
             observed_head=observed_head,
             head_unavailable=observed_head is None,
+            range_known=False,
             watch_unavailable=watch_unavailable,
         )
 
