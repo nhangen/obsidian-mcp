@@ -6636,9 +6636,8 @@ module.hook(home, descriptor, json.loads(event))
 
         def racing_write(path, *args, **kwargs):
             if path.parent.name == "rebind-journal":
-                active_path = worktree_child / "capture-state" / native.ACTIVE
-                active_path.write_text(json.dumps(foreign))
-                os.chmod(active_path, 0o600)
+                with native.gate_lock(worktree_child) as gate:
+                    original_write(gate / native.ACTIVE, json.dumps(foreign).encode())
             return original_write(path, *args, **kwargs)
 
         home, profile = native.load_profile(self.home)
@@ -6662,10 +6661,16 @@ module.hook(home, descriptor, json.loads(event))
     def test_rebind_refuses_when_commit_capture_is_in_flight(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
-        path, state, _ = self.pending_commit()
-        commit_hash = next(iter(state["commits"]))
-        state["commits"][commit_hash]["in_flight"] = True
-        path.write_text(json.dumps(state))
+        path, _, commit = self.pending_commit()
+        prepared = self.prepare(path, commit)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        arguments = json.loads(prepared.stdout)["arguments"]
+        call = ClaudePluginCaptureTest.commit_event(self, arguments, "in-flight-append")
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        before = path.read_bytes()
+        self.assertEqual(
+            json.loads(before)["commits"][commit]["in_flight"], "in-flight-append"
+        )
         worktree = self.add_worktree()
         output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
         self.assertIn(
@@ -6673,16 +6678,35 @@ module.hook(home, descriptor, json.loads(event))
             json.dumps(output),
         )
         self.assertEqual(self.binding()["project"], str(self.project))
+        self.assertEqual(path.read_bytes(), before)
         worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
         self.assertFalse(self.session_state(worktree_child).exists())
 
     def test_rebind_refuses_when_commit_capture_is_recovery(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
-        path, state, _ = self.pending_commit()
-        commit_hash = next(iter(state["commits"]))
-        state["commits"][commit_hash]["recovery"] = True
-        path.write_text(json.dumps(state))
+        path, _, commit = self.pending_commit()
+        prepared = self.prepare(path, commit)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        arguments = json.loads(prepared.stdout)["arguments"]
+        call = ClaudePluginCaptureTest.commit_event(self, arguments, "recovery-append")
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        partial = ClaudePluginCaptureTest.commit_receipt(self, arguments)
+        partial.update(
+            status="partial",
+            error_code="PARTIAL",
+            recovery={"required": True, "action": "inspect"},
+            retryable=True,
+        )
+        self.hook(
+            "PostToolUse",
+            **call,
+            tool_response={"structuredContent": partial, "isError": True},
+        )
+        before = path.read_bytes()
+        self.assertTrue(
+            json.loads(before)["commits"][commit]["recovery"]["recovery"]["required"]
+        )
         worktree = self.add_worktree()
         output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
         self.assertIn(
@@ -6690,6 +6714,7 @@ module.hook(home, descriptor, json.loads(event))
             json.dumps(output),
         )
         self.assertEqual(self.binding()["project"], str(self.project))
+        self.assertEqual(path.read_bytes(), before)
         worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
         self.assertFalse(self.session_state(worktree_child).exists())
 
