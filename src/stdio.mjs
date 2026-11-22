@@ -920,16 +920,29 @@ function resourceResult(uri, text, mimeType) {
 }
 
 function taxonomyText(configuration) {
-  const lines = configuration.config.split(/\r?\n/);
-  const heading = lines.findIndex((line) => line.trim() === "## Project Taxonomy");
-  if (heading < 0) return "## Project Taxonomy\n";
   const table = [];
-  for (const line of lines.slice(heading + 1)) {
+  let inTaxonomy = false;
+  let fence = "";
+  for (const line of configuration.config.split(/\r?\n/)) {
     const trimmed = line.trim();
-    if (trimmed.startsWith("|")) {
-      table.push(line);
-    } else if (table.length || /^#{1,6}(?:\s|$)/.test(trimmed)) {
+    if (table.length && !trimmed.startsWith("|")) break;
+
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (delimiter && delimiter[1].startsWith(fence) && !delimiter[2].trim()) fence = "";
+      continue;
+    }
+    if (delimiter && (delimiter[1][0] === "~" || !delimiter[2].includes("`"))) {
+      fence = delimiter[1];
+      continue;
+    }
+
+    if (!inTaxonomy) {
+      inTaxonomy = trimmed === "## Project Taxonomy";
+    } else if (/^#{1,6}(?:\s|$)/.test(trimmed)) {
       break;
+    } else if (trimmed.startsWith("|")) {
+      table.push(line);
     }
   }
   return ["## Project Taxonomy", ...table].join("\n") + "\n";

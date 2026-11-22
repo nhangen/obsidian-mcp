@@ -100,6 +100,16 @@ capture_high_score: 0.75
 ## Project Taxonomy
 Configured domains and destinations.
 
+~~~~markdown
+~~~
+| Example desk | Red |
+~~~~~
+
+\`\`\`markdown
+~~~
+| Example chair | Blue |
+\`\`\`
+
 | Domain | Path | Keywords |
 |---|---|---|
 | Development | Projects/Development/ | dev, code |
@@ -266,7 +276,7 @@ test("stdio server preserves the session summary provider contract via prompts/g
   const text = promptGet.result.messages[0].content.text;
   for (const expected of promptFixtures.summarizeSession.requiredText) assert.match(text, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
   assert.match(text, /\| Development \| Projects\/Development\//);
-  assert.doesNotMatch(text, /Window seat/);
+  assert.doesNotMatch(text, /Window seat|Example desk|Example chair/);
   assert.doesNotMatch(text, /Projects\/Physics-AI-ML\/Research-Substrate/);
   assert.match(text, /substrate_object under a research destination defined by the configured taxonomy and routing rules/);
   assert.match(text, /no research destination is configured[\s\S]*project_note or daily_only[\s\S]*leave substrate_object empty/);
