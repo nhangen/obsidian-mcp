@@ -1426,11 +1426,20 @@ def record_repair_outage(
         raise NativeError("OUTAGE_JOURNAL_INVALID")
     if record is not None:
         sync_directory(directory)
+    prior = None
+    retained = None
     if quarantined.exists() or quarantined.is_symlink():
-        if record is None or private_read(quarantined) != payload:
-            raise NativeError("REPAIR_QUARANTINE_TAKEN")
-        sync_directory(quarantined.parent)
-        return record
+        prior = private_read(quarantined)
+        if prior == payload and record is not None:
+            sync_directory(quarantined.parent)
+            return record
+        if prior != payload:
+            retained = quarantined.parent / f"{session}.{outage}.json.invalid"
+            if (
+                (retained.exists() or retained.is_symlink())
+                and private_read(retained) != prior
+            ):
+                raise NativeError("REPAIR_QUARANTINE_AMBIGUOUS")
     if record is None:
         observed_head = (
             git(Path(project), "rev-parse", "--verify", "HEAD", allow_failure=True).strip()
@@ -1445,6 +1454,8 @@ def record_repair_outage(
             verification=verification,
         )
         atomic_write(entry, encode(record), staging=journal_home / (".repair-" + outage))
+    if retained is not None:
+        atomic_write(retained, prior, staging=staging)
     atomic_write(quarantined, payload, staging=staging)
     return record
 

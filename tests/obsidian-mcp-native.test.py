@@ -2608,6 +2608,250 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(len(list(journal.glob("*.json"))), 257)
         self.assertEqual((journal / f"{0:064x}.json").read_bytes(), older)
 
+    def test_repair_state_requires_explicit_verification(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        session = path.stem
+        self.corrupt_file(path, b"not json")
+        unsigned = self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            session,
+        )
+        self.assertEqual(unsigned.returncode, 64)
+        self.assertIn("INTERRUPTED_VERIFICATION_REQUIRED", unsigned.stderr)
+        self.assertEqual(path.read_bytes(), b"not json")
+        self.assertFalse((path.parent / (session + ".json.invalid")).exists())
+        self.assertEqual(list(self.home.glob("outage-journal/*.json")), [])
+
+    def test_repair_state_rejects_a_malformed_session_key(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        refused = self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            "not-hex",
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(refused.returncode, 64)
+        self.assertIn("SESSION_KEY_INVALID", refused.stderr)
+        self.assertEqual(list(self.home.glob("outage-journal/*.json")), [])
+        self.assertEqual(list((self.home / "capture-state").glob("*.invalid")), [])
+
+    def test_repair_state_requires_the_session_to_own_the_gate(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="session A")
+        self.live_snapshot()
+        second_key = self.session_key("session-2")
+        blocked = self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            second_key,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(blocked.returncode, 64)
+        self.assertIn("INTERRUPTED_OWNERSHIP_REQUIRED", blocked.stderr)
+        self.assertEqual(list(self.home.glob("outage-journal/*.json")), [])
+        self.assertEqual(list((self.home / "capture-state").glob("*.invalid")), [])
+
+    def test_repair_state_clears_an_invalid_gate_without_repairing(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        session = path.stem
+        self.corrupt_file(path, b"not json")
+        gate = self.home / "capture-state" / "active.json"
+        self.corrupt_file(gate, b"not json")
+        cleared = self.cli(
+            "takeover",
+            "--repair-state",
+            "--home",
+            str(self.home),
+            "--session",
+            session,
+            "--verification",
+            "command-stopped-and-history-inspected",
+        )
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(json.loads(cleared.stdout), {"status": "cleared_invalid_gate"})
+        self.assertFalse(gate.exists())
+        # The gate was cleared, but the state was not repaired.
+        self.assertEqual(path.read_bytes(), b"not json")
+        self.assertFalse((path.parent / (session + ".json.invalid")).exists())
+        self.assertEqual(list(self.home.glob("outage-journal/*.json")), [])
+
+    def test_repair_state_without_a_head_reports_head_unavailable(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        session = path.stem
+        self.corrupt_file(path, b"not json")
+        repaired = self.repair(session)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        outcome = json.loads(repaired.stdout)
+        self.assertEqual(outcome["status"], "repaired")
+        self.assertIsNone(outcome["observed_head"])
+        self.assertTrue(outcome["head_unavailable"])
+        self.assertFalse(outcome["range_known"])
+        entry, = (self.home / "outage-journal").glob("*.json")
+        record = json.loads(entry.read_bytes())
+        self.assertEqual(record["session"], session)
+        self.assertIsNone(record["observed_head"])
+        self.assertEqual(record["project"], str(self.project))
+        self.assertEqual(record["range_known"], False)
+
+    def test_repair_state_preserves_repeated_outages_with_identical_corruption(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        session = path.stem
+        quarantined = path.with_suffix(".json.invalid")
+        journal = self.home / "outage-journal"
+        expected = set()
+        for count, payload in enumerate((b"first", b"repeat", b"third", b"repeat"), 1):
+            with self.subTest(outage=count):
+                self.corrupt_file(path, payload)
+                repaired = self.repair(session)
+                self.assertEqual(repaired.returncode, 0, repaired.stderr)
+                outcome = json.loads(repaired.stdout)
+                self.assertEqual(outcome["status"], "repaired")
+                self.assertFalse(outcome["range_known"])
+                self.assertEqual(quarantined.read_bytes(), payload)
+                entries = list(journal.glob("*.json"))
+                self.assertEqual(len(entries), count)
+                self.assertEqual(
+                    {json.loads(entry.read_bytes())["session"] for entry in entries},
+                    {session},
+                )
+                expected.add(payload)
+                self.assertEqual(
+                    {entry.read_bytes() for entry in path.parent.glob("*.json.invalid")},
+                    expected,
+                )
+
+    def test_repair_state_preserves_quarantines_for_two_sessions(self):
+        self.configure()
+        for session_id, payload in (("session-1", b"first A"), ("session-2", b"first B")):
+            started = self.cli(
+                "hook",
+                "--home",
+                str(self.home),
+                payload={
+                    **self.event("UserPromptSubmit", prompt="original"),
+                    "session_id": session_id,
+                },
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            session = self.session_key(session_id)
+            path = self.home / "capture-state" / f"{session}.json"
+            for corruption in (payload, b"common truncation"):
+                self.corrupt_file(path, corruption)
+                repaired = self.repair(session)
+                self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            quarantine = path.with_suffix(".json.invalid")
+            self.assertEqual(quarantine.read_bytes(), b"common truncation")
+            retained, = path.parent.glob(f"{session}.*.json.invalid")
+            self.assertEqual(retained.read_bytes(), payload)
+            outage_id = retained.name.split(".")[1]
+            record = self.home / "outage-journal" / f"{outage_id}.json"
+            self.assertEqual(json.loads(record.read_bytes())["session"], session)
+
+    def interrupt_second_repair(self, path, *, before):
+        self.corrupt_file(path, b"first outage")
+        first = self.repair(path.stem)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.git("commit", "--allow-empty", "-m", "before interruption")
+        self.corrupt_file(path, b"second outage")
+
+        native = self.load_native()
+        atomic_write = native.atomic_write
+
+        def interrupted_write(destination, *args, **kwargs):
+            if destination == before:
+                raise OSError("fixture repair interruption")
+            return atomic_write(destination, *args, **kwargs)
+
+        argv = [
+            native.__file__, "takeover", "--repair-state", "--home", str(self.home),
+            "--session", path.stem,
+            "--verification", "command-stopped-and-history-inspected",
+        ]
+        with (
+            mock.patch.object(native, "atomic_write", interrupted_write),
+            mock.patch.object(sys, "argv", argv),
+            self.assertRaisesRegex(OSError, "fixture repair interruption"),
+        ):
+            native.main()
+
+        journal = self.home / "outage-journal"
+        entries = {entry.name: entry.read_bytes() for entry in journal.glob("*.json")}
+        self.assertEqual(len(entries), 2)
+        return entries
+
+    def test_repair_state_refuses_a_retained_entry_with_different_bytes(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="original")
+        path = self.state_paths()[0]
+        quarantined = path.with_suffix(".json.invalid")
+        entries = self.interrupt_second_repair(path, before=quarantined)
+        retained, = set(path.parent.glob("*.json.invalid")) - {quarantined}
+        self.corrupt_file(retained, b"second outage")
+
+        refused = self.repair(path.stem)
+        self.assertEqual(refused.returncode, 64)
+        self.assertIn("REPAIR_QUARANTINE_AMBIGUOUS", refused.stderr)
+        self.assertEqual(quarantined.read_bytes(), b"first outage")
+        self.assertEqual(retained.read_bytes(), b"second outage")
+        self.assertEqual(path.read_bytes(), b"second outage")
+        self.assertEqual(
+            {entry.name: entry.read_bytes() for entry in
+             (self.home / "outage-journal").glob("*.json")},
+            entries,
+        )
+
+    def test_repair_state_resumes_interrupted_quarantine_rotation(self):
+        for boundary in ("quarantine", "replacement"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory(
+                dir=self.directory
+            ) as fixture:
+                self.home = Path(fixture) / "codex"
+                self.configure()
+                self.hook("UserPromptSubmit", prompt="original")
+                path = self.state_paths()[0]
+                quarantined = path.with_suffix(".json.invalid")
+                entries = self.interrupt_second_repair(
+                    path, before=quarantined if boundary == "quarantine" else path
+                )
+                retained, = set(path.parent.glob("*.json.invalid")) - {quarantined}
+                self.assertEqual(retained.read_bytes(), b"first outage")
+                expected_head = self.git("rev-parse", "HEAD").stdout.strip()
+                self.git("commit", "--allow-empty", "-m", "before retry")
+
+                repaired = self.repair(path.stem)
+                self.assertEqual(repaired.returncode, 0, repaired.stderr)
+                outcome = json.loads(repaired.stdout)
+                self.assertEqual(outcome["status"], "repaired")
+                self.assertEqual(outcome["observed_head"], expected_head)
+                self.assertEqual(quarantined.read_bytes(), b"second outage")
+                self.assertEqual(retained.read_bytes(), b"first outage")
+                self.assertEqual(
+                    {entry.name: entry.read_bytes() for entry in
+                     (self.home / "outage-journal").glob("*.json")},
+                    entries,
+                )
+
 
 class ClaudePluginCaptureTest(NativeCaptureFixture):
     expected_rewrite_decision = None
@@ -7825,13 +8069,16 @@ module.__file__ = script
 exec(compile(Path(script).read_text(), script, "exec"), module.__dict__)
 replace = os.replace
 def interrupt(source, destination):
-    if str(destination) == target or Path(destination).parent.name == target:
+    path = Path(destination)
+    if str(path) == target or path.parent.name == target:
+        os._exit(73)
+    if target == "retained-quarantine" and path.name.count(".") == 3 and path.suffix == ".invalid":
         os._exit(73)
     return replace(source, destination)
 module.os.replace = interrupt
 raise SystemExit(module.main())
 """
-        targets = ("outage-journal", str(quarantine), str(path))
+        targets = ("outage-journal", "retained-quarantine", str(quarantine), str(path))
         for index, target in enumerate(targets, start=1):
             with self.subTest(publication=Path(target).name):
                 payload = f"corrupt state {index}".encode()
@@ -7873,7 +8120,10 @@ raise SystemExit(module.main())
                 self.assertEqual(len(records), index)
                 self.assertEqual(records[0]["observed_head"], observed)
                 self.assertEqual(list(self.home.rglob(".repair-*")), [])
-                quarantine.unlink()
+                self.assertEqual(
+                    {entry.read_bytes() for entry in path.parent.glob("*.json.invalid")},
+                    {f"corrupt state {previous}".encode() for previous in range(1, index + 1)},
+                )
 
     def test_repair_state_refuses_a_valid_state(self):
         self.configure()
