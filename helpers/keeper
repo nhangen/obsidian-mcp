@@ -650,10 +650,10 @@ keeper_daily_link_locked() {
 
 _cmd_insert_locked() {
   local vault_abs="$1" target="$2" body_file="$3" title="$4" sldate="$5" recover="$6" daily_path="$7"
-  local payload_hash="$8" full folder idx tmp wrote_note=0 idem_rc=0
-  keeper_idempotency_begin "$vault_abs" "$payload_hash" || idem_rc=$?
+  local payload_hash="$8" full folder idx tmp wrote_note=0 idem_rc=0 target_exists=0
+  keeper_idempotency_begin "$vault_abs" "$payload_hash" false || idem_rc=$?
   [ "$idem_rc" -ne 10 ] || return 0
-  [ "$idem_rc" -eq 0 ] || return "$idem_rc"
+  [ "$idem_rc" -eq 0 ] || [ "$idem_rc" -eq 11 ] || return "$idem_rc"
   [ "$KEEPER_RECOVERY_REQUIRED" != true ] || recover=1
   keeper_prepare_target "$vault_abs" "$target" >/dev/null \
     || { keeper_fail_locked "insert target is not writable inside the vault"; return 1; }
@@ -661,6 +661,7 @@ _cmd_insert_locked() {
   folder="$(dirname "$full")"
 
   if [ -e "$full" ]; then
+    target_exists=1
     if [ "$recover" != 1 ]; then
       keeper_conflict_locked "insert target already exists: $target"
       return 3
@@ -669,7 +670,12 @@ _cmd_insert_locked() {
       keeper_conflict_locked "recovery target differs from the requested note: $target"
       return 3
     fi
-  else
+  fi
+  if [ "$idem_rc" -eq 11 ]; then
+    keeper_idempotency_begin "$vault_abs" "$payload_hash" \
+      || { keeper_fail_locked "could not create idempotency state for $target"; return 1; }
+  fi
+  if [ "$target_exists" -eq 0 ]; then
     tmp="$(mktemp "$folder/.keeper-insert-XXXXXX")" \
       || { keeper_fail_locked "could not stage insert for $target"; return 1; }
     cp "$body_file" "$tmp" \

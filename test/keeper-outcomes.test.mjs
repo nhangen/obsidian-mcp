@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
@@ -113,4 +113,30 @@ test("a keeper that fails after writing the note reports its diagnostics without
   assert.equal(error.outcome?.status, "partial", error.message);
   assert.match(error.message, /injected fault at after_note/);
   assert.doesNotMatch(error.message, /keeper-progress/);
+});
+
+test("retrying a refused keyed insert preserves the note, index and daily links", async (t) => {
+  const vault = await mkdtemp(join(tmpdir(), "keeper-conflict-"));
+  t.after(() => rm(vault, { recursive: true, force: true }));
+  await mkdir(join(vault, "Inbox"));
+  await mkdir(join(vault, "Daily"));
+  const notes = [
+    ["Inbox/Existing.md", "Already here"],
+    ["Inbox/INDEX.md", "# Index\n"],
+    ["Daily/2026-11-22.md", "# Daily\n"],
+  ];
+  for (const [path, contents] of notes) await writeFile(join(vault, path), contents);
+  const input = {
+    title: "Existing", folder_hint: "Inbox", body: "Already here",
+    session_link_date: "2026-11-22", idempotency_key: "existing-note",
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(keeperSave(input, vault, undefined, "Daily"), (error) => {
+      assert.equal(error.outcome?.status, "conflict", error.message);
+      assert.equal(error.outcome.error_code, "CONFLICT");
+      assert.equal(error.outcome.recovery.required, false);
+      return true;
+    });
+    for (const [path, contents] of notes) assert.equal(await readFile(join(vault, path), "utf8"), contents);
+  }
 });
