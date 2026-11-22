@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { once } from "node:events";
 import { dirname, join, resolve } from "node:path";
@@ -217,8 +217,30 @@ test("HTTP hardening covers legacy negotiation, malformed signatures, body limit
     body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} }),
   });
   assert.equal(afterExpiry.status, 404);
+  assert.match(server.stderr(), /mcp-http-session .*"action":"created".*"pending_initializations":1/);
   assert.match(server.stderr(), /mcp-http-session .*"action":"capacity-rejected".*"reason":"session-cap"/);
   assert.match(server.stderr(), /mcp-http-request .*"status":429.*"rejection_reason":"session-cap"/);
+});
+
+test("session initialization recovers after configuration is restored", async (t) => {
+  const { directory, config } = await fixture();
+  const server = startServer(config, { MCP_HTTP_CONCURRENCY_LIMIT: "1" });
+  t.after(async () => {
+    await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const url = await server.ready;
+  const request = { method: "POST", headers: headers(url, token()), body: JSON.stringify(initialize()) };
+  const backup = join(directory, "saved-config.md");
+  await rename(config, backup);
+  await writeFile(config, "---\n---\n");
+  const failed = await fetch(`${url}/mcp`, request);
+  assert.equal(failed.status, 500);
+
+  await rename(backup, config);
+  const recovered = await fetch(`${url}/mcp`, request);
+  assert.equal(recovered.status, 200);
+  assert.ok(recovered.headers.get("mcp-session-id"));
 });
 
 test("HTTP session reservations and disconnected stream grace prevent pool exhaustion", async (t) => {

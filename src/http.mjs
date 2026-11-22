@@ -415,7 +415,6 @@ function createSession(configuration, auth) {
     server: createServer({ supportedProtocolVersions: protocolVersions, scopes: auth.scopes, requireWriteIdempotency: true }),
     transport,
   };
-  logSession({ action: "created", session, configuration });
   return session;
 }
 
@@ -676,8 +675,9 @@ async function handleRequest(req, res, configuration) {
         });
         throw new HttpBoundaryError(429, -32009, "Too many sessions");
       }
-      pendingSessionInitializations += 1;
       provisionalSession = createSession(configuration, auth);
+      pendingSessionInitializations += 1;
+      logSession({ action: "created", session: provisionalSession, configuration });
       await provisionalSession.server.connect(provisionalSession.transport);
       session = provisionalSession;
       session.inFlight = session.inFlight + 1;
