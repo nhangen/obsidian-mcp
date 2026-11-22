@@ -12,6 +12,7 @@ on:
       - 'tests/obsidian-mcp-*'
       - 'integrations/**'
       - 'contract.json'
+      - 'README.md'
       - '.github/workflows/client.yml'
   workflow_dispatch:
 
