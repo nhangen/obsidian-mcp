@@ -919,13 +919,22 @@ function resourceResult(uri, text, mimeType) {
   return { contents: [{ uri: uri.href, mimeType, text }] };
 }
 
+function startsTaxonomyTable(header, separator) {
+  if (!/^ {0,3}\|/.test(separator)) return false;
+  const cells = (row) => row.trim().slice(1).replace(/\|$/, "").split("|");
+  const columns = cells(separator);
+  return columns.every((cell) => /^:?-+:?$/.test(cell.trim())) &&
+    columns.length === cells(header.replace(/\\./g, "x")).length;
+}
+
 function taxonomyText(configuration) {
   const table = [];
   let inTaxonomy = false;
   let fence = "";
-  for (const line of configuration.config.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (table.length && !trimmed.startsWith("|")) break;
+  const lines = configuration.config.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
+    const content = line.replace(/^ {0,3}/, "").trimEnd();
+    if (table.length && !content.startsWith("|")) break;
 
     const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
@@ -938,10 +947,10 @@ function taxonomyText(configuration) {
     }
 
     if (!inTaxonomy) {
-      inTaxonomy = trimmed === "## Project Taxonomy";
-    } else if (/^#{1,6}(?:\s|$)/.test(trimmed)) {
+      inTaxonomy = content === "## Project Taxonomy";
+    } else if (/^#{1,6}(?:\s|$)/.test(content)) {
       break;
-    } else if (trimmed.startsWith("|")) {
+    } else if (content.startsWith("|") && (table.length || startsTaxonomyTable(content, lines[index + 1] ?? ""))) {
       table.push(line);
     }
   }
