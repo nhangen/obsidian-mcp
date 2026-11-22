@@ -320,15 +320,16 @@ its advisory, but the HEAD reflog watch does not run while the file stays
 damaged. Restoring the original file lets the next hook event record the commit.
 When the original bytes cannot be restored,
 `takeover --repair-state --session <session> --verification command-stopped-and-history-inspected`
-moves the unparseable file aside (`.json.invalid`), rebuilds a minimal valid state,
-and records a `snapshot_resolutions` entry with `status="not_captured"` and the
-current HEAD as `observed_head`. The outage commit is not captured retroactively;
-the loss is named explicitly, and the reflog watch resumes from the fresh baseline.
-That record is short-lived and partial: `observed_head` names only the HEAD at
-repair time, not each commit made during the outage, and the next
-`UserPromptSubmit` replaces the state that holds it. The command's JSON output and
-the `.json.invalid` file are what remain, so keep the output if the outage
-matters (#49).
+writes a durable record in the profile's `outage-journal/` directory and
+saves the unparseable bytes as `.json.invalid` before replacing the state.
+If interrupted before state replacement, rerun the same repair command.
+The replacement records a `not_captured` resolution and resumes the reflog
+watch from a fresh baseline. `observed_head` is HEAD when the journal record
+was created, and `range_known: false` marks the outage's commit range as
+unknown. The next `UserPromptSubmit` replaces the state-file resolution.
+In both scopes, `drain-status` reports up to 256 recent records in
+`outages` and sets `outages_truncated` when older records remain in the
+journal (#49).
 A missing state file under an enrolled binding reports `ENROLLED_STATE_MISSING`
 instead of a leaked filesystem error. User-scope `drain-status` and
 `profile-status` surface at-risk sessions with the repair command; project-scope
@@ -544,7 +545,7 @@ Dispatcher commands (JSON stdout, nonzero exit on invalid profile/state):
 | --- | --- |
 | `profile-status --home <profile>` | Validates the descriptor and release; returns `status: "validated"`, `scope`, `host`, `bundle`, `folder`, `daily_folder`, `release_id`, `release_sha256`, `active`, and `apiVersion`. Project scope also returns `project` and `projectMode`. Does not require a session ID. |
 | `hook --home <profile>` | Reads the full Claude hook JSON from stdin; emits host hook JSON. The dispatcher performs no turn normalization. |
-| `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, and `active_request`. Emits no saved body or transcript. |
+| `drain-status --home <profile>` | Inspects **all** persisted sessions; returns `status: "inspected"`, `quiescent`, `session_count`, hashed session IDs with unresolved reason codes, `outages`, `outages_truncated`, and `active_request`. Emits no saved body or transcript. |
 
 The plugin must close its ownership/admission barrier **before** draining and keep
 it closed through owner or profile remapping. Drain is an observation, not a
