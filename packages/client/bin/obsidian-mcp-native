@@ -1400,6 +1400,49 @@ def read_outage_journal(home):
     )
 
 
+def rotate_quarantine(
+    journal_home, quarantined, payload, record, outage, session, project, verification, staging
+):
+    """Recover a second outage for a session whose quarantine already exists.
+
+    A quarantine written by an earlier repair of the same outage is replayed
+    as-is: the prior record is returned and the quarantine is left untouched.
+    A quarantine holding different bytes is an outage the operator did not
+    repair: its original bytes are preserved under a digest-named entry, the
+    current bytes are quarantined, and a fresh journal record is written.
+    """
+    prior = private_read(quarantined)
+    if record is not None and prior == payload:
+        sync_directory(quarantined.parent)
+        return record
+    retained = quarantined.parent / (digest(payload) + ".json.invalid")
+    if (
+        retained.exists() or retained.is_symlink()
+    ) and private_read(retained) not in (prior, payload):
+        raise NativeError("REPAIR_QUARANTINE_AMBIGUOUS")
+    if record is None:
+        observed_head = (
+            git(Path(project), "rev-parse", "--verify", "HEAD", allow_failure=True).strip()
+            or None
+        )
+        record = dict(
+            schemaVersion=1,
+            session=session,
+            project=project,
+            observed_head=observed_head,
+            range_known=False,
+            verification=verification,
+        )
+        atomic_write(
+            journal_home / OUTAGE_JOURNAL / (outage + ".json"),
+            encode(record),
+            staging=journal_home / (".repair-" + outage),
+        )
+    atomic_write(retained, prior, staging=staging)
+    atomic_write(quarantined, payload, staging=staging)
+    return record
+
+
 def record_repair_outage(
     home, profile, session, state_path, quarantined, staging, verification
 ):
@@ -1427,10 +1470,17 @@ def record_repair_outage(
     if record is not None:
         sync_directory(directory)
     if quarantined.exists() or quarantined.is_symlink():
-        if record is None or private_read(quarantined) != payload:
-            raise NativeError("REPAIR_QUARANTINE_TAKEN")
-        sync_directory(quarantined.parent)
-        return record
+        return rotate_quarantine(
+            journal_home,
+            quarantined,
+            payload,
+            record,
+            outage,
+            session,
+            project,
+            verification,
+            staging,
+        )
     if record is None:
         observed_head = (
             git(Path(project), "rev-parse", "--verify", "HEAD", allow_failure=True).strip()

@@ -327,6 +327,12 @@ The replacement records a `not_captured` resolution and resumes the reflog
 watch from a fresh baseline. `observed_head` is HEAD when the journal record
 was created, and `range_known: false` marks the outage's commit range as
 unknown. The next `UserPromptSubmit` replaces the state-file resolution.
+A session can have a second outage while the first quarantine still exists.
+Rerunning the same repair command preserves the first unparseable bytes under
+`<digest of the new bytes>.json.invalid`, quarantines the new bytes as
+`.json.invalid`, and writes a second outage-journal record; both byte sets stay
+recoverable. A repair is refused with `REPAIR_QUARANTINE_AMBIGUOUS` only when a
+retained entry already holds different bytes.
 In both scopes, `drain-status` reports up to 256 recent records in
 `outages` and sets `outages_truncated` when older records remain in the
 journal (#49).
