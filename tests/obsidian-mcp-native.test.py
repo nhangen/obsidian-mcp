@@ -9119,7 +9119,7 @@ class CaptureShellParserTest(NativeCaptureFixture):
         guidance = self.assert_bash_advisory(denied)
         self.assertTrue(
             guidance.startswith(
-                "Obsidian capture advisory: Obsidian capture could not analyze"
+                "Obsidian capture advisory: could not analyze"
             ),
             guidance,
         )

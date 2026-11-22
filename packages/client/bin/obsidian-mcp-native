@@ -3776,6 +3776,10 @@ def hook(home, profile, event):
         and specific.get("permissionDecision") == "deny"
     ):
         reason = specific.get("permissionDecisionReason", "Capture unavailable")
+        if reason.startswith(ADVISORY_PREFIX):
+            reason = reason[len(ADVISORY_PREFIX) :]
+        if reason.startswith("Obsidian capture "):
+            reason = reason[len("Obsidian capture ") :]
         if not reason.startswith(ADVISORY_PREFIX):
             reason = ADVISORY_PREFIX + reason
         return context(
