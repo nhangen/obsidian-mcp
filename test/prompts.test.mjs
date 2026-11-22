@@ -97,10 +97,41 @@ intent_margin: 0.20
 capture_high_score: 0.75
 ---
 
-## Project Taxonomy
+    ## Project Taxonomy
+| Example archive | Gray |
+|---|---|
+
+  ## Project Taxonomy
+Configured domains and destinations.
+
+| Example note without a table
+
+    | Example lamp | Yellow |
+    |---|---|
+\t## Example heading
+\t| Example shelf | White |
+\t|---|---|
+
+~~~~markdown
+~~~
+| Example desk | Red |
+|---|---|
+~~~~~
+
+\`\`\`markdown
+~~~
+| Example chair | Blue |
+|---|---|
+\`\`\`
+
 | Domain | Path | Keywords |
-|---|---|---|
-| Development | Projects/Development/ | dev, code |
+|:---|:---:|---:|
+   | Development | Projects/Development/ | dev, code |
+
+## Office layout
+| Desk | Color |
+|---|---|
+| Window seat | Green |
 
 ## Routing Rules
 Development work routes to Projects/Development/.
@@ -258,6 +289,8 @@ test("stdio server preserves the session summary provider contract via prompts/g
   assert.equal(promptGet.result.messages.length, 1);
   const text = promptGet.result.messages[0].content.text;
   for (const expected of promptFixtures.summarizeSession.requiredText) assert.match(text, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  assert.match(text, /\| Development \| Projects\/Development\//);
+  assert.doesNotMatch(text, /Window seat|Example (?:desk|chair|archive|lamp|shelf|note)/);
   assert.doesNotMatch(text, /Projects\/Physics-AI-ML\/Research-Substrate/);
   assert.match(text, /substrate_object under a research destination defined by the configured taxonomy and routing rules/);
   assert.match(text, /no research destination is configured[\s\S]*project_note or daily_only[\s\S]*leave substrate_object empty/);

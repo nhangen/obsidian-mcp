@@ -115,7 +115,7 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
   await writeFile(join(vault, "Daily", "2026-09-20.md"), "# Daily\nA daily resource.\n");
   await writeFile(join(vault, "Librarian.md"), "# Librarian\nAn index resource.\n");
   await writeFile(join(vault, "Pending.md"), "# Pending\n- [ ] A pending item\n");
-  await writeFile(config, `---\nvault_path: "${vault}" # quoted config\ndaily_path: Daily/\napi_token: top-secret\n---\n\n# Obsidian Plugin Config\n\nVault is at \`${vault}\`.\n\n## Project Taxonomy\n\n| Domain | Vault path | Precedence | Notes |\n|--------|------------|------------|-------|\n| Development | Projects/Development/ | 10 | Code |\n`);
+  await writeFile(config, `---\nvault_path: "${vault}" # quoted config\ndaily_path: Daily/\napi_token: top-secret\n---\n\n# Obsidian Plugin Config\n\nVault is at \`${vault}\`.\n\n## Project Taxonomy\n\n| Domain | Vault path | Precedence | Notes |\n|--------|------------|------------|-------|\n| Development | Projects/Development/ | 10 | Code |\n\n| Desk | Color |\n|---|---|\n| Window seat | Green |\n`);
 
   const server = startServer(config);
   t.after(async () => {
@@ -206,7 +206,8 @@ test("stdio server exposes read-only tools with clean MCP framing", async (t) =>
   assert.equal(taxonomy.result.contents[0].mimeType, "text/plain");
   assert.doesNotMatch(taxonomy.result.contents[0].text, new RegExp(vault.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(taxonomy.result.contents[0].text, /top-secret/);
-  assert.match(taxonomy.result.contents[0].text, /Project Taxonomy/);
+  assert.match(taxonomy.result.contents[0].text, /\| Development \| Projects\/Development\//);
+  assert.doesNotMatch(taxonomy.result.contents[0].text, /Window seat/);
 
   const librarian = await server.request(
     { jsonrpc: "2.0", id: 51, method: "resources/read", params: { uri: "obsidian://librarian" } },

@@ -919,11 +919,41 @@ function resourceResult(uri, text, mimeType) {
   return { contents: [{ uri: uri.href, mimeType, text }] };
 }
 
+function startsTaxonomyTable(header, separator) {
+  if (!/^ {0,3}\|/.test(separator)) return false;
+  const cells = (row) => row.trim().slice(1).replace(/\|$/, "").split("|");
+  const columns = cells(separator);
+  return columns.every((cell) => /^:?-+:?$/.test(cell.trim())) &&
+    columns.length === cells(header.replace(/\\./g, "x")).length;
+}
+
 function taxonomyText(configuration) {
+  const table = [];
+  let inTaxonomy = false;
+  let fence = "";
   const lines = configuration.config.split(/\r?\n/);
-  const heading = lines.findIndex((line) => line.trim() === "## Project Taxonomy");
-  if (heading < 0) return "## Project Taxonomy\n";
-  const table = lines.slice(heading + 1).filter((line) => line.trim().startsWith("|"));
+  for (const [index, line] of lines.entries()) {
+    const content = line.replace(/^ {0,3}/, "").trimEnd();
+    if (table.length && !content.startsWith("|")) break;
+
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (delimiter && delimiter[1].startsWith(fence) && !delimiter[2].trim()) fence = "";
+      continue;
+    }
+    if (delimiter && (delimiter[1][0] === "~" || !delimiter[2].includes("`"))) {
+      fence = delimiter[1];
+      continue;
+    }
+
+    if (!inTaxonomy) {
+      inTaxonomy = content === "## Project Taxonomy";
+    } else if (/^#{1,6}(?:\s|$)/.test(content)) {
+      break;
+    } else if (content.startsWith("|") && (table.length || startsTaxonomyTable(content, lines[index + 1] ?? ""))) {
+      table.push(line);
+    }
+  }
   return ["## Project Taxonomy", ...table].join("\n") + "\n";
 }
 
