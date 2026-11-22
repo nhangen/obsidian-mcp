@@ -1357,48 +1357,58 @@ def clear_session_files(child, session):
     sync_directory(directory)
 
 
+def rebind_journal_source_to_clear(home, entry):
+    invalid = f"REBIND_JOURNAL_INVALID; journal entry {ascii(entry.name)}"
+    if entry.name.startswith(".capture-"):
+        try:
+            temporary = entry.lstat()
+        except OSError:
+            raise NativeError(invalid) from None
+        if (
+            not stat.S_ISREG(temporary.st_mode)
+            or temporary.st_uid != os.getuid()
+            or temporary.st_nlink != 1
+            or stat.S_IMODE(temporary.st_mode) != 0o600
+        ):
+            raise NativeError(invalid)
+        return None
+    if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+        raise NativeError(invalid)
+    try:
+        value = json.loads(private_read(entry))
+    except (NativeError, OSError, ValueError, RecursionError):
+        raise NativeError(invalid) from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "session", "source", "target"}
+        or value["schemaVersion"] != 1
+        or value["session"] != entry.stem
+        or not all(
+            isinstance(value[k], str) and HEX.fullmatch(value[k])
+            for k in ("source", "target")
+        )
+        or value["source"] == value["target"]
+    ):
+        raise NativeError(invalid)
+    try:
+        record, _ = read_hot_binding(home, entry.stem)
+    except (NativeError, OSError, RecursionError):
+        raise NativeError(invalid + "; session binding unreadable") from None
+    if record is None or record["workspace"] not in (value["source"], value["target"]):
+        raise NativeError(invalid + "; session binding mismatch")
+    return value["source"] if record["workspace"] == value["target"] else value["target"]
+
+
 def reconcile_rebinds(home):
     """Finish or roll back interrupted rebinds; the binding is the commit point."""
     directory = home / REBIND_JOURNAL
     if not directory.exists() and not directory.is_symlink():
         return
     for entry in list(streamed_entries(directory)):
-        if entry.name.startswith(".capture-"):
+        stale = rebind_journal_source_to_clear(home, entry)
+        if stale is None:
             entry.unlink()
             continue
-        if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
-            raise NativeError(
-                f"REBIND_JOURNAL_INVALID; stray journal file: {entry.name}"
-            )
-        try:
-            value = json.loads(private_read(entry))
-        except ValueError:
-            raise NativeError(
-                f"REBIND_JOURNAL_INVALID; malformed json in journal file: {entry.name}"
-            ) from None
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"schemaVersion", "session", "source", "target"}
-            or value["schemaVersion"] != 1
-            or value["session"] != entry.stem
-            or not all(
-                isinstance(value[k], str) and HEX.fullmatch(value[k])
-                for k in ("source", "target")
-            )
-            or value["source"] == value["target"]
-        ):
-            raise NativeError(
-                f"REBIND_JOURNAL_INVALID; invalid journal schema in {entry.name}"
-            )
-        record, _ = read_hot_binding(home, entry.stem)
-        if record is None or record["workspace"] not in (
-            value["source"],
-            value["target"],
-        ):
-            raise NativeError(
-                f"REBIND_JOURNAL_INVALID; binding mismatch for {entry.name}"
-            )
-        stale = value["source"] if record["workspace"] == value["target"] else value["target"]
         clear_session_files(home / "workspaces" / stale, entry.stem)
         entry.unlink()
         sync_directory(directory)
@@ -2359,59 +2369,22 @@ def user_drain_status(home, profile):
                 reason="RETENTION_JOURNAL_PENDING",
             )
         rebinds = home / REBIND_JOURNAL
-        if (rebinds.exists() or rebinds.is_symlink()) and any(
-            streamed_entries(rebinds)
-        ):
-            entries = list(streamed_entries(rebinds))
-            invalid_entry = None
-            for entry in entries:
-                if entry.name.startswith(".capture-"):
-                    continue
-                if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
-                    invalid_entry = entry.name
-                    break
+        if rebinds.exists() or rebinds.is_symlink():
+            reason = None
+            for entry in streamed_entries(rebinds):
                 try:
-                    val = json.loads(private_read(entry))
-                    if (
-                        not isinstance(val, dict)
-                        or set(val) != {"schemaVersion", "session", "source", "target"}
-                        or val.get("schemaVersion") != 1
-                        or val.get("session") != entry.stem
-                        or not all(
-                            isinstance(val[k], str) and HEX.fullmatch(val[k])
-                            for k in ("source", "target")
-                        )
-                        or val.get("source") == val.get("target")
-                    ):
-                        invalid_entry = entry.name
-                        break
-                    rec, _ = read_hot_binding(home, entry.stem)
-                    if rec is None or rec["workspace"] not in (
-                        val["source"],
-                        val["target"],
-                    ):
-                        invalid_entry = entry.name
-                        break
-                except Exception:
-                    invalid_entry = entry.name
+                    rebind_journal_source_to_clear(home, entry)
+                except NativeError as error:
+                    reason = str(error)
                     break
-            if invalid_entry is not None:
+                reason = "REBIND_JOURNAL_PENDING"
+            if reason is not None:
                 return dict(
                     status="incomplete",
                     quiescent=False,
                     complete=False,
-                    reason=f"REBIND_JOURNAL_INVALID; stray or corrupt journal entry: {invalid_entry}",
-                    rebind_journal=[entry.name for entry in entries],
+                    reason=reason,
                 )
-            return dict(
-                status="incomplete",
-                quiescent=False,
-                complete=False,
-                reason="REBIND_JOURNAL_PENDING",
-                rebind_journal=[
-                    entry.name for entry in entries
-                ],
-            )
         hot_count = archive_count = workspace_count = unresolved_count = 0
         sessions = []
         workspaces = []
@@ -4809,14 +4782,7 @@ def dispatch_command(args, extra, locks):
                 raise NativeError("RETENTION_JOURNAL_PENDING")
             if inspection and (home / REBIND_JOURNAL).exists():
                 if any(streamed_entries(home / REBIND_JOURNAL)):
-                    raise NativeError(
-                        "REBIND_JOURNAL_PENDING; "
-                        + "rebind journal entries: "
-                        + ", ".join(
-                            entry.name
-                            for entry in streamed_entries(home / REBIND_JOURNAL)
-                        )
-                    )
+                    raise NativeError("REBIND_JOURNAL_PENDING")
             if not inspection:
                 reconcile_retention(home)
                 reconcile_rebinds(home)

@@ -6601,10 +6601,15 @@ module.hook(home, descriptor, json.loads(event))
         worktree_child = self.home / "workspaces" / self.workspace_key(worktree)
         self.assertEqual(self.binding()["project"], str(worktree))
         self.assertTrue(self.session_state(original_child).exists())
+        temporary = self.home / "rebind-journal" / ".capture-interrupted"
+        temporary.touch(mode=0o600)
         status = self.cli("drain-status", "--home", str(self.home))
-        self.assertIn("REBIND_JOURNAL_PENDING", status.stdout + status.stderr)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["reason"], "REBIND_JOURNAL_PENDING")
+        self.assertTrue(temporary.exists())
         output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
         self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(output))
+        self.assertFalse(temporary.exists())
         self.assertFalse((self.home / "rebind-journal" / (session + ".json")).exists())
         self.assertFalse(self.session_state(original_child).exists())
         self.assertIsNone(self.gate_owner(original_child))
@@ -6751,94 +6756,49 @@ module.hook(home, descriptor, json.loads(event))
         self.assertEqual(self.binding()["workspace"], worktree_key)
         self.drain()
 
-    def test_stray_rebind_journal_file_names_file_in_hooks_and_drain_status(self):
+    def test_invalid_rebind_journal_names_entry_in_hook_and_drain(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="original")
+        (state_path,) = self.state_paths()
+        before = state_path.read_bytes()
         journal_dir = self.home / "rebind-journal"
         journal_dir.mkdir(mode=0o700, exist_ok=True)
-        stray = journal_dir / "stray-entry.txt"
-        stray.write_text("invalid journal contents")
-        os.chmod(stray, 0o600)
-        output = self.hook("UserPromptSubmit", prompt="another")
-        self.assertIn("REBIND_JOURNAL_INVALID", json.dumps(output))
-        self.assertIn("stray-entry.txt", json.dumps(output))
-        status = self.cli("drain-status", "--home", str(self.home))
-        self.assertEqual(status.returncode, 0, status.stderr)
-        data = json.loads(status.stdout)
-        self.assertFalse(data["quiescent"])
-        self.assertFalse(data["complete"])
-        self.assertIn("REBIND_JOURNAL_INVALID", data["reason"])
-        self.assertIn("stray-entry.txt", data["reason"])
-        self.assertEqual(data["rebind_journal"], ["stray-entry.txt"])
-        for op in ("status", "request"):
-            with self.subTest(operation=op):
-                res = self.cli(
-                    op,
-                    "--home",
-                    str(self.home),
-                    "--session",
-                    self.session_key("session-1"),
-                )
-                self.assertEqual(res.returncode, 64)
-                self.assertIn("REBIND_JOURNAL_PENDING", res.stderr)
-                self.assertIn("stray-entry.txt", res.stderr)
-        stray.unlink()
-        output2 = self.hook("UserPromptSubmit", prompt="recovered")
-        self.assertNotIn("REBIND_JOURNAL_INVALID", json.dumps(output2))
-        self.drain()
-
-    def test_rebind_journal_reason_names_the_offending_file(self):
-        self.configure()
-        self.hook("UserPromptSubmit", prompt="original")
-        self.pending_commit()
-        worktree = self.add_worktree()
-        native = self.load_native()
-        original_write = native.atomic_write
-
-        def crash(path, *args, **kwargs):
-            if path.parent.name == "rebind-journal":
-                original_write(path, *args, **kwargs)
-                raise OSError("simulated crash")
-            return original_write(path, *args, **kwargs)
-
-        home, profile = native.load_profile(self.home)
-        with mock.patch.object(native, "atomic_write", crash):
-            native.hook(
-                home,
-                profile,
-                self.event("UserPromptSubmit", cwd=str(worktree), prompt="next"),
-            )
-        session = self.session_key("session-1")
-        journal = self.home / "rebind-journal" / (session + ".json")
-        self.assertTrue(journal.exists())
-        status = self.cli("drain-status", "--home", str(self.home))
-        self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertEqual(
-            json.loads(status.stdout)["rebind_journal"], [session + ".json"]
-        )
-        self.assertEqual(
-            json.loads(status.stdout)["reason"], "REBIND_JOURNAL_PENDING"
-        )
-        for operation in ("status", "request"):
-            with self.subTest(operation=operation):
-                result = self.cli(
-                    operation, "--home", str(self.home), "--session", session
-                )
-                self.assertEqual(result.returncode, 64, result.stderr)
-                self.assertIn("REBIND_JOURNAL_PENDING", result.stderr)
-                self.assertIn(session + ".json", result.stderr)
-        output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
-        self.assertNotIn("USER_CAPTURE_UNAVAILABLE", json.dumps(output))
-        self.assertFalse(journal.exists())
-        self.assertTrue(
-            (
-                self.home
-                / "workspaces"
-                / self.workspace_key(worktree)
-                / "capture-state"
-                / (session + ".json")
-            ).exists()
-        )
+        canonical = self.session_key("session-1") + ".json"
+        for filename, contents, mode, expected_name in (
+            ("stray\nentry.txt", b"stray", 0o600, r"stray\nentry.txt"),
+            (canonical, b"{", 0o600, canonical),
+            (canonical, b"{}", 0o644, canonical),
+            (".capture-unexpected", None, 0o700, ".capture-unexpected"),
+        ):
+            with self.subTest(filename=filename, mode=mode):
+                entry = journal_dir / filename
+                if contents is None:
+                    entry.mkdir(mode=mode)
+                else:
+                    entry.write_bytes(contents)
+                    entry.chmod(mode)
+                try:
+                    status = self.cli("drain-status", "--home", str(self.home))
+                    self.assertEqual(status.returncode, 0, status.stderr)
+                    data = json.loads(status.stdout)
+                    self.assertFalse(data["quiescent"])
+                    self.assertFalse(data["complete"])
+                    self.assertIn("REBIND_JOURNAL_INVALID", data["reason"])
+                    self.assertIn(expected_name, data["reason"])
+                    self.assertNotIn("\n", data["reason"])
+                    output = self.hook("UserPromptSubmit", prompt="another")
+                    advisory = output["hookSpecificOutput"]["additionalContext"]
+                    self.assertIn(data["reason"], advisory)
+                    self.assertEqual(state_path.read_bytes(), before)
+                    if contents is not None:
+                        self.assertEqual(entry.read_bytes(), contents)
+                finally:
+                    if contents is None:
+                        entry.rmdir()
+                    else:
+                        entry.unlink()
+        output = self.hook("UserPromptSubmit", prompt="recovered")
+        self.assertNotIn("REBIND_JOURNAL_INVALID", json.dumps(output))
         self.drain()
 
     def test_unresolved_previous_turn_is_retained_and_next_prompt_is_advisory(self):
