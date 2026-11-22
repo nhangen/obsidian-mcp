@@ -6736,20 +6736,22 @@ module.hook(home, descriptor, json.loads(event))
         home, profile = native.load_profile(self.home)
         child = native.provision_child(home, profile, str(worktree), "git")
         orphan = child / "capture-state" / (session_key + ".json")
-        orphan.write_text("{}")
-        os.chmod(orphan, 0o600)
+        (source_state,) = self.state_paths()
+        before = source_state.read_bytes()
+        orphan.write_bytes(before)
+        orphan.chmod(0o600)
         output = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
         self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
         self.assertIn(
             "destination already holds state for this session",
             json.dumps(output),
         )
-        self.assertIn(
-            "remove or drain the destination workspace state to rebind",
-            json.dumps(output),
-        )
+        advisory = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"inspect and back up '{orphan}'", advisory)
+        self.assertEqual(orphan.read_bytes(), before)
+        self.assertEqual(source_state.read_bytes(), before)
         self.assertEqual(self.binding()["project"], str(self.project))
-        orphan.unlink()
+        orphan.rename(self.directory / "saved-orphan.json")
         output2 = self.hook("UserPromptSubmit", cwd=str(worktree), prompt="next")
         self.assertNotIn("SESSION_WORKSPACE_CHANGED", json.dumps(output2))
         self.assertEqual(self.binding()["project"], str(worktree))

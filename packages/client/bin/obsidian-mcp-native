@@ -1435,12 +1435,11 @@ def rebind_workspace(home, profile, record, path, project, mode):
                 raise NativeError("SESSION_WORKSPACE_CHANGED; " + refusal)
             new_child = provision_child(home, profile, project, mode)
             new_directory = checked_state_directory(new_child)
-            if (new_directory / (session + ".json")).exists() or (
-                new_directory / (session + ".json")
-            ).is_symlink():
+            destination_state = new_directory / (session + ".json")
+            if destination_state.exists() or destination_state.is_symlink():
                 raise NativeError(
                     "SESSION_WORKSPACE_CHANGED; destination already holds state for this session; "
-                    "remove or drain the destination workspace state to rebind"
+                    f"inspect and back up {ascii(str(destination_state))} before moving it aside"
                 )
             with gate_lock(old_child):
                 active = active_request(old_child)
@@ -1467,7 +1466,7 @@ def rebind_workspace(home, profile, record, path, project, mode):
             )
             try:
                 if state is not None:
-                    atomic_write(new_directory / (session + ".json"), encode(state))
+                    atomic_write(destination_state, encode(state))
                 if carries_gate:
                     with gate_lock(new_child) as gate:
                         owner = active_request(new_child)
