@@ -12,6 +12,7 @@ on:
       - 'tests/obsidian-mcp-*'
       - 'integrations/**'
       - 'contract.json'
+      - 'README.md'
       - '.github/workflows/client.yml'
   workflow_dispatch:
 
@@ -63,6 +64,27 @@ jobs:
           cp packages/client/vendor/mcp-remote-read/build-package.json "$RUNNER_TEMP/bridge-dependency-audit/package.json"
           cp packages/client/vendor/mcp-remote-read/build-package-lock.json "$RUNNER_TEMP/bridge-dependency-audit/package-lock.json"
           python3 -c 'import os, runpy; from pathlib import Path; build = runpy.run_path("packages/client/vendor/mcp-remote-read/build.py"); build["audit_dependencies"](Path(os.environ["RUNNER_TEMP"]) / "bridge-dependency-audit", dict(os.environ))'
+      - name: Install the pinned server for the capture pairing test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          catalog=packages/client/catalog.json
+          server="$RUNNER_TEMP/capture-pairing"
+          mkdir "$server"
+          asset=$(jq -er '.release.asset.name' "$catalog")
+          metadata=$(jq -er '.release.metadata.name' "$catalog")
+          gh release download "$(jq -er '.release.tag' "$catalog")" --repo "$(jq -er '.contract.repository' "$catalog")" \
+            --pattern "$asset" --pattern "$metadata" --dir "$server"
+          jq -r '.release | .asset, .metadata | "\(.sha256)  \(.name)"' "$catalog" > "$server/checksums"
+          (cd "$server" && sha256sum --check checksums)
+          jq -e --slurpfile pins "$catalog" '
+            .release_tag == $pins[0].release.tag and .source_commit == $pins[0].release.sourceCommit and
+            .contract_sha256 == $pins[0].contract.sha256 and .artifact.sha256 == $pins[0].release.asset.sha256
+          ' "$server/$metadata"
+          tar -xzf "$server/$asset" -C "$server"
+          cp "$server/package/dist/runtime-lock.json" "$server/package/package-lock.json"
+          npm ci --omit=dev --ignore-scripts --prefix "$server/package"
+          echo "OBSIDIAN_MCP_TEST_RELEASE_SERVER=$server/package/dist/http.mjs" >> "$GITHUB_ENV"
       - name: Run portable client fixture suites
         run: |
           python3 tests/obsidian-mcp-bridge-build.test.py
