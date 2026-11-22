@@ -1373,40 +1373,58 @@ def clear_session_files(child, session):
     sync_directory(directory)
 
 
+def rebind_journal_source_to_clear(home, entry):
+    invalid = f"REBIND_JOURNAL_INVALID; journal entry {ascii(entry.name)}"
+    if entry.name.startswith(".capture-"):
+        try:
+            temporary = entry.lstat()
+        except OSError:
+            raise NativeError(invalid) from None
+        if (
+            not stat.S_ISREG(temporary.st_mode)
+            or temporary.st_uid != os.getuid()
+            or temporary.st_nlink != 1
+            or stat.S_IMODE(temporary.st_mode) != 0o600
+        ):
+            raise NativeError(invalid)
+        return None
+    if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+        raise NativeError(invalid)
+    try:
+        value = json.loads(private_read(entry))
+    except (NativeError, OSError, ValueError, RecursionError):
+        raise NativeError(invalid) from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "session", "source", "target"}
+        or value["schemaVersion"] != 1
+        or value["session"] != entry.stem
+        or not all(
+            isinstance(value[k], str) and HEX.fullmatch(value[k])
+            for k in ("source", "target")
+        )
+        or value["source"] == value["target"]
+    ):
+        raise NativeError(invalid)
+    try:
+        record, _ = read_hot_binding(home, entry.stem)
+    except (NativeError, OSError, RecursionError):
+        raise NativeError(invalid + "; session binding unreadable") from None
+    if record is None or record["workspace"] not in (value["source"], value["target"]):
+        raise NativeError(invalid + "; session binding mismatch")
+    return value["source"] if record["workspace"] == value["target"] else value["target"]
+
+
 def reconcile_rebinds(home):
     """Finish or roll back interrupted rebinds; the binding is the commit point."""
     directory = home / REBIND_JOURNAL
     if not directory.exists() and not directory.is_symlink():
         return
     for entry in list(streamed_entries(directory)):
-        if entry.name.startswith(".capture-"):
+        stale = rebind_journal_source_to_clear(home, entry)
+        if stale is None:
             entry.unlink()
             continue
-        if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
-            raise NativeError("REBIND_JOURNAL_INVALID")
-        try:
-            value = json.loads(private_read(entry))
-        except ValueError:
-            raise NativeError("REBIND_JOURNAL_INVALID") from None
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"schemaVersion", "session", "source", "target"}
-            or value["schemaVersion"] != 1
-            or value["session"] != entry.stem
-            or not all(
-                isinstance(value[k], str) and HEX.fullmatch(value[k])
-                for k in ("source", "target")
-            )
-            or value["source"] == value["target"]
-        ):
-            raise NativeError("REBIND_JOURNAL_INVALID")
-        record, _ = read_hot_binding(home, entry.stem)
-        if record is None or record["workspace"] not in (
-            value["source"],
-            value["target"],
-        ):
-            raise NativeError("REBIND_JOURNAL_INVALID")
-        stale = value["source"] if record["workspace"] == value["target"] else value["target"]
         clear_session_files(home / "workspaces" / stale, entry.stem)
         entry.unlink()
         sync_directory(directory)
@@ -1433,11 +1451,11 @@ def rebind_workspace(home, profile, record, path, project, mode):
                 raise NativeError("SESSION_WORKSPACE_CHANGED; " + refusal)
             new_child = provision_child(home, profile, project, mode)
             new_directory = checked_state_directory(new_child)
-            if (new_directory / (session + ".json")).exists() or (
-                new_directory / (session + ".json")
-            ).is_symlink():
+            destination_state = new_directory / (session + ".json")
+            if destination_state.exists() or destination_state.is_symlink():
                 raise NativeError(
-                    "SESSION_WORKSPACE_CHANGED; destination already holds state for this session"
+                    "SESSION_WORKSPACE_CHANGED; destination already holds state for this session; "
+                    f"inspect and back up {ascii(str(destination_state))} before moving it aside"
                 )
             with gate_lock(old_child):
                 active = active_request(old_child)
@@ -1464,7 +1482,7 @@ def rebind_workspace(home, profile, record, path, project, mode):
             )
             try:
                 if state is not None:
-                    atomic_write(new_directory / (session + ".json"), encode(state))
+                    atomic_write(destination_state, encode(state))
                 if carries_gate:
                     with gate_lock(new_child) as gate:
                         owner = active_request(new_child)
@@ -2367,15 +2385,22 @@ def user_drain_status(home, profile):
                 reason="RETENTION_JOURNAL_PENDING",
             )
         rebinds = home / REBIND_JOURNAL
-        if (rebinds.exists() or rebinds.is_symlink()) and any(
-            streamed_entries(rebinds)
-        ):
-            return dict(
-                status="incomplete",
-                quiescent=False,
-                complete=False,
-                reason="REBIND_JOURNAL_PENDING",
-            )
+        if rebinds.exists() or rebinds.is_symlink():
+            reason = None
+            for entry in streamed_entries(rebinds):
+                try:
+                    rebind_journal_source_to_clear(home, entry)
+                except NativeError as error:
+                    reason = str(error)
+                    break
+                reason = "REBIND_JOURNAL_PENDING"
+            if reason is not None:
+                return dict(
+                    status="incomplete",
+                    quiescent=False,
+                    complete=False,
+                    reason=reason,
+                )
         hot_count = archive_count = workspace_count = unresolved_count = 0
         sessions = []
         workspaces = []
