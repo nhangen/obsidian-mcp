@@ -923,7 +923,15 @@ function taxonomyText(configuration) {
   const lines = configuration.config.split(/\r?\n/);
   const heading = lines.findIndex((line) => line.trim() === "## Project Taxonomy");
   if (heading < 0) return "## Project Taxonomy\n";
-  const table = lines.slice(heading + 1).filter((line) => line.trim().startsWith("|"));
+  const table = [];
+  for (const line of lines.slice(heading + 1)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("|")) {
+      table.push(line);
+    } else if (table.length || /^#{1,6}(?:\s|$)/.test(trimmed)) {
+      break;
+    }
+  }
   return ["## Project Taxonomy", ...table].join("\n") + "\n";
 }
 
