@@ -2,24 +2,24 @@
   "catalogVersion": 1,
   "contract": {
     "repository": "nhangen/obsidian-mcp",
-    "commit": "64370eafc1656f53b86b6437f1d778c2ef216874",
+    "commit": "1da2ce1441c6603b15261f80254ded24f67a4df6",
     "path": "contract.json",
     "contractVersion": "0.1.3",
     "sha256": "bc2000589e90ac8306fdc8516ab3a5bfb7e1657eb3d9197548103ab74d6fe324"
   },
   "release": {
-    "tag": "mcp-v0.2.1",
-    "url": "https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.1",
-    "sourceCommit": "64370eafc1656f53b86b6437f1d778c2ef216874",
+    "tag": "mcp-v0.2.2",
+    "url": "https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.2",
+    "sourceCommit": "1da2ce1441c6603b15261f80254ded24f67a4df6",
     "asset": {
-      "name": "claude-obsidian-mcp-server-0.2.1.tgz",
-      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.1/claude-obsidian-mcp-server-0.2.1.tgz",
-      "sha256": "4a5fb741411d62df709a71c07a4acf1f7fcc2373302dce97b32e53ebbb381cd4"
+      "name": "claude-obsidian-mcp-server-0.2.2.tgz",
+      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.2/claude-obsidian-mcp-server-0.2.2.tgz",
+      "sha256": "46e84ec1c6caa6adbdba8dfc00885f67f8e5de101ba3aede20e437104ddbfd92"
     },
     "metadata": {
-      "name": "claude-obsidian-mcp-server-0.2.1.release.json",
-      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.1/claude-obsidian-mcp-server-0.2.1.release.json",
-      "sha256": "b84e8509aa10047982ee430d542487231a0851a461dbeeea1108831983a03490"
+      "name": "claude-obsidian-mcp-server-0.2.2.release.json",
+      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.2/claude-obsidian-mcp-server-0.2.2.release.json",
+      "sha256": "f958844dd808fa902204b72a7f175fbd95f71e62f1a8ad77468979b8e7fe6795"
     }
   },
   "server": {

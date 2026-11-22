@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import base64
 import hashlib
+import hmac
 import json
 import os
+import select
 import shutil
 import subprocess
 import tempfile
@@ -43,7 +46,7 @@ for line in sys.stdin:
         handle.write(request.get("method", "") + "\n")
     if request.get("method") == "initialize":
         Path(os.environ["FAKE_INITIALIZE_PROTOCOL"]).write_text(request["params"]["protocolVersion"])
-        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ.get("FAKE_VERSION", "0.2.1")}}
+        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ.get("FAKE_VERSION", "0.2.2")}}
         if scenario == "protocol-mismatch":
             result["protocolVersion"] = "2026-07-28"
         elif scenario == "protocol-missing":
@@ -301,6 +304,61 @@ class CaptureCommitTest(unittest.TestCase):
         self.assertNotEqual(call["skip_if_hash"], self.commit[:8])
         self.assertIn('Branch: "codex/939-mcp-capture"', call["content"])
         self.assertIn("Implemented the bounded capture consumer.", call["content"])
+
+    @unittest.skipUnless(os.environ.get("OBSIDIAN_MCP_TEST_RELEASE_SERVER"),
+                         "requires the installed catalog-pinned server")
+    def test_packed_capture_commits_to_the_published_server(self):
+        vault = self.root / "vault"
+        vault.mkdir()
+        config = self.root / "obsidian.local.md"
+        config.write_text(f"---\nvault_path: {vault}\ndaily_path: Daily/\n---\n")
+        secret = os.urandom(32).hex()
+        server_env = self.environment(
+            OBSIDIAN_LOCAL_MD=str(config), MCP_HTTP_BIND="127.0.0.1", MCP_HTTP_PORT="0",
+            MCP_HTTP_JWT_SECRET=secret, MCP_HTTP_JWT_ISSUER="pairing",
+            MCP_HTTP_JWT_AUDIENCE="test", MCP_HTTP_ALLOWED_HOSTS="127.0.0.1",
+            MCP_HTTP_ALLOWED_ORIGINS="https://capture.example",
+        )
+        server = subprocess.Popen(
+            ["node", os.environ["OBSIDIAN_MCP_TEST_RELEASE_SERVER"]], env=server_env,
+            cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            ready, _, _ = select.select([server.stderr], [], [], 10)
+            self.assertTrue(ready, "release server startup timed out")
+            line = server.stderr.readline().decode().strip()
+            self.assertRegex(line, r"^mcp-http-listening http://127\.0\.0\.1:\d+$")
+            endpoint = line.split()[1] + "/mcp"
+
+            def segment(data):
+                return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+            header = segment(b'{"alg":"HS256","typ":"JWT"}')
+            claims = segment(json.dumps(dict(iss="pairing", aud="test", sub="fixture",
+                                             scope="vault:write", exp=int(time.time()) + 60)).encode())
+            signed = header + b"." + claims
+            signature = segment(hmac.digest(secret.encode(), signed, "sha256"))
+            env = self.environment(
+                OBSIDIAN_MCP_ALLOW_HTTP="1", OBSIDIAN_MCP_WRITE_ENDPOINT=endpoint,
+                OBSIDIAN_MCP_WRITE_ORIGIN="https://capture.example",
+                OBSIDIAN_MCP_WRITE_CREDENTIAL_PROVIDER="env",
+                OBSIDIAN_MCP_WRITE_TOKEN_ENV="PAIRING_TOKEN",
+                PAIRING_TOKEN=(signed + b"." + signature).decode(),
+            )
+            result = subprocess.run([str(DEFAULT_BUNDLE / "bin/obsidian-mcp-capture-commit")],
+                                    input=json.dumps(self.event()), env=env, capture_output=True,
+                                    text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = "Projects/Development/example-owner/example-repo/2026-10-09.md"
+            self.assertEqual(json.loads(result.stdout), {"status": "committed", "path": target})
+            note = (vault / target).read_text()
+            self.assertIn(self.commit, note)
+            self.assertIn("Verified the packed production entry point.", note)
+        finally:
+            server.kill()
+            server.wait(timeout=5)
+            server.stderr.close()
 
     def test_exact_replay_skip_is_reported_separately(self):
         result = self.run_capture(self.event(), scenario="skipped")

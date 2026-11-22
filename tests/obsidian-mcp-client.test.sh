@@ -29,17 +29,23 @@ test -f "$bundle/LICENSE" || fail "project license missing"
 cmp "$ROOT/LICENSE" "$bundle/LICENSE" || fail "project license does not match source"
 test -x "$bundle/vendor/mcp-remote-read/xdg-open" || fail "Linux browser helper lost executable permission"
 
-python3 - "$bundle/manifest.json" "$bundle/contract.json" <<'PY'
+python3 - "$bundle/manifest.json" "$bundle/contract.json" "$ROOT/README.md" <<'PY'
 import hashlib
 import json
 import pathlib
+import re
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
 contract_bytes = pathlib.Path(sys.argv[2]).read_bytes()
 assert manifest["bundleVersion"] == 1
 assert manifest["mcpRemotePackage"] == "mcp-remote@0.14.3"
-assert manifest["pinnedServer"]["release"] == "mcp-v0.2.1"
+documented_release = re.search(
+    r"^The standalone server release is \[([^\]]+)\]\(https://github\.com/nhangen/obsidian-mcp/releases/tag/\1\)",
+    pathlib.Path(sys.argv[3]).read_text(), re.MULTILINE,
+)
+assert documented_release, "standalone server release missing from the root README"
+assert manifest["pinnedServer"]["release"] == documented_release.group(1), "default capture pin differs from the documented server"
 assert manifest["pinnedServer"]["contractVersion"] == "0.1.3"
 assert len(manifest["pinnedServer"]["contractSha256"]) == 64
 assert hashlib.sha256(contract_bytes).hexdigest() == manifest["pinnedServer"]["contractSha256"]
@@ -522,8 +528,8 @@ with tempfile.TemporaryDirectory() as directory:
 PY
 
 grep -Fq 'plugin-free' "$bundle/README.md" || fail "README does not state client boundary"
-grep -Fq "The default pin is \`mcp-v0.2.1\`" "$bundle/README.md" || fail "README does not name the pinned release"
-grep -Fq "\`mcp-v0.2.1\` provides exact-target append" "$bundle/README.md" || fail "README capability wording does not match the pinned release"
+grep -Fq "The default pin is \`mcp-v0.2.2\`" "$bundle/README.md" || fail "README does not name the pinned release"
+grep -Fq "\`mcp-v0.2.2\` provides exact-target append" "$bundle/README.md" || fail "README capability wording does not match the pinned release"
 grep -Fq 'live server version and discovered schema to match' "$bundle/README.md" || fail "README does not preserve the live capability gate"
 ! grep -R -E '/Users/|100\.[0-9]+\.|obsidian-mcp-read-token' "$bundle" >/dev/null || fail "packed bundle contains a personal path, endpoint, or credential service"
 
