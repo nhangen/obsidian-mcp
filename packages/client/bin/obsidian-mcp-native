@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 import datetime
 import fcntl
 import hashlib
+from heapq import nlargest
 import json
 import os
 from pathlib import Path
@@ -163,10 +164,17 @@ def private_read(path, *, limit=LIMIT):
     return value
 
 
-def atomic_write(path, value, *, limit=LIMIT):
+def atomic_write(path, value, *, limit=LIMIT, staging=None):
     if len(value) > limit:
         raise NativeError("STATE_TOO_LARGE")
-    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".capture-")
+    if staging is None:
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".capture-")
+    else:
+        staging.unlink(missing_ok=True)
+        temporary = staging
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(value)
@@ -1330,11 +1338,15 @@ def is_outage_resolution(resolution):
 OUTAGE_JOURNAL = "outage-journal"
 
 
-def outage_entry(record):
-    """Validate one outage journal record; None rejects it."""
-    return (
-        record
-        if isinstance(record, dict)
+def read_outage_record(path):
+    try:
+        record = json.loads(private_read(path))
+    except FileNotFoundError:
+        raise
+    except (NativeError, OSError, ValueError, RecursionError):
+        raise NativeError("OUTAGE_JOURNAL_INVALID") from None
+    if not (
+        isinstance(record, dict)
         and set(record)
         == {
             "schemaVersion",
@@ -1344,66 +1356,97 @@ def outage_entry(record):
             "range_known",
             "verification",
         }
+        and type(record["schemaVersion"]) is int
         and record["schemaVersion"] == 1
+        and isinstance(record["session"], str)
         and HEX.fullmatch(record["session"]) is not None
         and isinstance(record["project"], str)
-        and record["project"]
+        and Path(record["project"]).is_absolute()
         and (
             record["observed_head"] is None
-            or HASH.fullmatch(record["observed_head"]) is not None
+            or (
+                isinstance(record["observed_head"], str)
+                and HASH.fullmatch(record["observed_head"]) is not None
+            )
         )
         and record["range_known"] is False
         and record["verification"]
         == "command-stopped-and-history-inspected"
-        else None
-    )
+    ):
+        raise NativeError("OUTAGE_JOURNAL_INVALID")
+    return record
 
 
 def read_outage_journal(home):
-    """Return the durable outage journal entries, or [] when absent.
-
-    Every entry is validated, so a later reader of the journal is never
-    shown an outage record it cannot trust.
-    """
+    directory = home / OUTAGE_JOURNAL
     try:
-        text = private_read(home / OUTAGE_JOURNAL)
+        private_directory(directory)
     except FileNotFoundError:
-        return []
-    except NativeError as error:
-        if str(error) not in ("PRIVATE_FILE_INVALID", "STATE_TOO_LARGE"):
-            raise
+        return dict(outages=[], outages_truncated=False)
+    except (NativeError, OSError):
         raise NativeError("OUTAGE_JOURNAL_INVALID") from None
+
+    def entries():
+        for entry in streamed_entries(directory):
+            if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
+                raise NativeError("OUTAGE_JOURNAL_INVALID")
+            record = read_outage_record(entry)
+            yield (entry.stat().st_mtime_ns, entry.name), record
+
+    latest = nlargest(MAX_DRAIN_SESSIONS + 1, entries(), key=lambda entry: entry[0])
+    return dict(
+        outages=[record for _, record in latest[:MAX_DRAIN_SESSIONS]],
+        outages_truncated=len(latest) > MAX_DRAIN_SESSIONS,
+    )
+
+
+def record_repair_outage(
+    home, profile, session, state_path, quarantined, staging, verification
+):
+    project = profile["project"]
+    payload = private_read(state_path)
+    item = state_path.stat()
+    # The original state remains in place until the rebuilt state is published.
+    identity = [session, project, item.st_dev, item.st_ino, item.st_mtime_ns]
+    outage = digest(encode([*identity, digest(payload)]))
+    journal_home = Path(profile.get("parentHome", home))
+    directory = journal_home / OUTAGE_JOURNAL
+    directory.mkdir(mode=0o700, exist_ok=True)
+    private_directory(directory)
+    sync_directory(journal_home)
+    entry = directory / (outage + ".json")
     try:
-        value = json.loads(text)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise NativeError("OUTAGE_JOURNAL_INVALID") from None
-    if not isinstance(value, list) or len(value) > MAX_DRAIN_SESSIONS:
+        record = read_outage_record(entry)
+    except FileNotFoundError:
+        record = None
+    if record is not None and (record["session"], record["project"]) != (
+        session,
+        project,
+    ):
         raise NativeError("OUTAGE_JOURNAL_INVALID")
-    entries = [entry for entry in map(outage_entry, value)]
-    if len(entries) != len(value):
-        raise NativeError("OUTAGE_JOURNAL_INVALID")
-    return entries
-
-
-def append_outage_record(home, record):
-    """Append one outage record to the durable journal and fsync it.
-
-    The append is the commit point; the state rebuild is derived from it.
-    """
-    entry = outage_entry(record)
-    if entry is None:
-        raise NativeError("OUTAGE_RECORD_INVALID")
-    existing = read_outage_journal(home)
-    if len(existing) >= MAX_DRAIN_SESSIONS:
-        raise NativeError("OUTAGE_JOURNAL_LIMIT")
-    try:
-        atomic_write(home / OUTAGE_JOURNAL, encode(existing + [entry]))
-    except NativeError as error:
-        if str(error) == "STATE_TOO_LARGE":
-            raise NativeError("OUTAGE_JOURNAL_LIMIT") from error
-        raise
-    except OSError as error:
-        raise NativeError("OUTAGE_JOURNAL_WRITE_FAILED") from error
+    if record is not None:
+        sync_directory(directory)
+    if quarantined.exists() or quarantined.is_symlink():
+        if record is None or private_read(quarantined) != payload:
+            raise NativeError("REPAIR_QUARANTINE_TAKEN")
+        sync_directory(quarantined.parent)
+        return record
+    if record is None:
+        observed_head = (
+            git(Path(project), "rev-parse", "--verify", "HEAD", allow_failure=True).strip()
+            or None
+        )
+        record = dict(
+            schemaVersion=1,
+            session=session,
+            project=project,
+            observed_head=observed_head,
+            range_known=False,
+            verification=verification,
+        )
+        atomic_write(entry, encode(record), staging=journal_home / (".repair-" + outage))
+    atomic_write(quarantined, payload, staging=staging)
+    return record
 
 
 def has_outage_resolution(state):
@@ -2603,7 +2646,7 @@ def user_drain_status(home, profile):
             unresolved_session_count=unresolved_count,
             sessions=sessions,
             workspaces=workspaces,
-            outages=read_outage_journal(home),
+            **read_outage_journal(home),
             details_truncated=workspace_count > len(workspaces)
             or unresolved_count > len(sessions)
             or len(at_risk) > MAX_DRAIN_SESSIONS,
@@ -2842,13 +2885,12 @@ def drain_status(home):
             raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
         if {p.stem for p in directory.glob("*.json") if p.name != ACTIVE} != present:
             raise NativeError("DRAIN_STATE_CHANGED")
-        journal = read_outage_journal(home)
         return dict(
             status="inspected",
             quiescent=owner is None and all(not s["unresolved"] for s in sessions),
             session_count=len(sessions),
             sessions=sessions,
-            outages=journal,
+            **read_outage_journal(home),
             active_request=owner,
         )
 
@@ -4624,15 +4666,8 @@ def review_retry(home, profile, args):
 def repair_state(home, profile, args):
     """Repair an unparseable session state file under a supported outage.
 
-    The corrupt file is moved aside for inspection, a minimal valid state is
-    rebuilt, and the outage window is recorded as a `not_captured`
-    resolution. The range of commits made during the outage cannot be
-    reconstructed (the earlier git_watch baseline lived in the corrupt
-    file), so it is recorded as unknown and the observed HEAD is only a
-    reference point. Before anything is rebuilt, one outage record is
-    appended to the durable outage journal: the state file is replaced on
-    the next UserPromptSubmit, the `.json.invalid` quarantine may be
-    inspected and deleted, but the journal survives both.
+    Publish the journal and quarantine before replacing the corrupt state.
+    A retry can still identify the same outage until replacement succeeds.
     """
     require_git_profile(profile)
     if args.verification != "command-stopped-and-history-inspected":
@@ -4653,6 +4688,7 @@ def repair_state(home, profile, args):
         if owner is not None and owner["session"] != session:
             raise NativeError("INTERRUPTED_OWNERSHIP_REQUIRED")
         quarantined = directory / (session + ".json.invalid")
+        staging = home / (".repair-state-" + session)
         with state_lock(home, session, allow_invalid=True) as (current, _path):
             # Only an existing, unparseable file is repairable. A lock file is
             # no evidence of a prior state: every state_lock call creates one.
@@ -4660,33 +4696,11 @@ def repair_state(home, profile, args):
                 state_path.exists() or state_path.is_symlink()
             ):
                 raise NativeError("REPAIR_STATE_NOT_INVALID")
-            if quarantined.exists() or quarantined.is_symlink():
-                raise NativeError("REPAIR_QUARANTINE_TAKEN")
-            observed_head = (
-                git(
-                    Path(profile["project"]),
-                    "rev-parse",
-                    "--verify",
-                    "HEAD",
-                    allow_failure=True,
-                ).strip()
-                or None
+            outage = record_repair_outage(
+                home, profile, session, state_path, quarantined, staging,
+                args.verification,
             )
-            parent_home = (
-                Path(profile["parentHome"]) if "parentHome" in profile else home
-            )
-            append_outage_record(
-                parent_home,
-                dict(
-                    schemaVersion=1,
-                    session=session,
-                    project=profile["project"],
-                    observed_head=observed_head,
-                    range_known=False,
-                    verification=args.verification,
-                ),
-            )
-            os.replace(state_path, quarantined)
+            observed_head = outage["observed_head"]
             state = initial_session_state(
                 profile, session, digest(b"repair-state-outage")
             )
@@ -4705,9 +4719,9 @@ def repair_state(home, profile, args):
                 state["git_watch"] = git_position(Path(profile["project"]))
             except WATCH_ERRORS:
                 watch_unavailable = True
-            atomic_write(state_path, encode(state))
-        if owner is not None:
-            release_gate(gate)
+            if owner is not None:
+                release_gate(gate)
+            atomic_write(state_path, encode(state), staging=staging)
         return dict(
             status="repaired",
             session=session,
