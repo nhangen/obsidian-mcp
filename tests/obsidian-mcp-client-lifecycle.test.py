@@ -1032,6 +1032,28 @@ class ClientLifecycleTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(self.inventory_snapshot(), before)
 
+    def test_dry_run_rejects_existing_destination_trusted_under_another_digest(
+        self,
+    ) -> None:
+        self.install(self.bundle_a)
+        reformatted = self.root / "reformatted-metadata-b"
+        shutil.copytree(self.bundle_b, reformatted)
+        metadata_path = reformatted / "release.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata_path.write_text(json.dumps(metadata, separators=(",", ":")) + "\n")
+        reformatted_digest = sha256(metadata_path)
+        digest_b = sha256(self.bundle_b / "release.json")
+        self.assertNotEqual(reformatted_digest, digest_b)
+        installer = load_installer(self.installer(reformatted))
+        source = installer.verify_source(reformatted, reformatted_digest)
+        installer.persist_release(
+            self.prefix, reformatted, source[0], source[1], reformatted_digest, source[2]
+        )
+        self.assertEqual(self.slots()["current"], self.release_id(self.bundle_a))
+        self.assert_preview_and_live_refuse(
+            self.bundle_b, digest_b, "different release.json digest"
+        )
+
     def test_dry_run_refuses_unsafe_managed_parents_like_the_live_run(self) -> None:
         self.install(self.bundle_a)
         digest_b = sha256(self.bundle_b / "release.json")
