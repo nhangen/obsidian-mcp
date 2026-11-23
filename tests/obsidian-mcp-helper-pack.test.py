@@ -344,6 +344,103 @@ class PackerHelperValidationTest(unittest.TestCase):
             self.assertEqual(entries[vendor]["sha256"], hashlib.sha256(files[vendor]).hexdigest())
         self.assertEqual(entries["vendor/shell-capture-parser/BUILD-PROVENANCE.json"]["mode"], 0o644)
 
+    def test_read_json_object_validates_mapping_shape(self):
+        packer = self.load_packer()
+        self.assertEqual(
+            packer.read_json_object(b'{"key": "value"}', "test"),
+            {"key": "value"},
+        )
+        with self.assertRaisesRegex(ValueError, "test must be a JSON object"):
+            packer.read_json_object(b"[]", "test")
+        with self.assertRaisesRegex(ValueError, "test must be a JSON object"):
+            packer.read_json_object(b'"string"', "test")
+        with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
+            packer.read_json_object(b"not json", "test")
+
+    def test_server_reference_rejects_non_mapping_inputs(self):
+        packer = self.load_packer()
+        with self.assertRaisesRegex(
+            ValueError, "catalog input must be a JSON object"
+        ):
+            packer.server_reference([], b"{}")
+        with self.assertRaisesRegex(
+            ValueError, "contract input must be a JSON object"
+        ):
+            packer.server_reference({}, b"[]")
+        with self.assertRaisesRegex(
+            ValueError, "contract input is not valid JSON"
+        ):
+            packer.server_reference({}, b"not json")
+
+    def server_reference_inputs(self, contract: bytes) -> dict:
+        return {
+            "contract": {
+                "sha256": hashlib.sha256(contract).hexdigest(),
+                "contractVersion": 1,
+                "commit": "abc",
+            },
+            "release": {"tag": "v1", "sourceCommit": "abc"},
+        }
+
+    def test_server_reference_rejects_nested_non_mapping_shapes(self):
+        packer = self.load_packer()
+        contract = b'{"contractVersion": 1}'
+        valid = self.server_reference_inputs(contract)
+        self.assertEqual(
+            packer.server_reference(valid, contract)["release"], "v1"
+        )
+        for key, value in (
+            ("contract", []),
+            ("contract", "x"),
+            ("release", []),
+            ("release", "x"),
+        ):
+            with self.subTest(key=key, value=value):
+                catalog = self.server_reference_inputs(contract)
+                catalog[key] = value
+                with self.assertRaises(ValueError):
+                    packer.server_reference(catalog, contract)
+
+    def test_server_reference_rejects_hash_matched_non_mapping_contract(self):
+        packer = self.load_packer()
+        contract = b"[]"
+        catalog = self.server_reference_inputs(contract)
+        with self.assertRaisesRegex(
+            ValueError, "contract input must be a JSON object"
+        ):
+            packer.server_reference(catalog, contract)
+
+    def test_server_reference_reports_missing_pin_fields(self):
+        packer = self.load_packer()
+        contract = b"{}"
+        catalog = self.server_reference_inputs(contract)
+        del catalog["contract"]["contractVersion"]
+        with self.assertRaisesRegex(
+            ValueError, "catalog contract version is missing"
+        ):
+            packer.server_reference(catalog, contract)
+
+        catalog = self.server_reference_inputs(contract)
+        catalog["contract"]["contractVersion"] = None
+        del catalog["contract"]["commit"]
+        del catalog["release"]["sourceCommit"]
+        with self.assertRaisesRegex(
+            ValueError, "catalog contract commit is missing"
+        ):
+            packer.server_reference(catalog, contract)
+
+    def test_read_json_object_rejects_non_utf8_bytes(self):
+        packer = self.load_packer()
+        with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
+            packer.read_json_object(b"\x80abc", "test")
+
+    def test_read_json_object_rejects_unparseable_extremes(self):
+        packer = self.load_packer()
+        for data in (b"[" * 200000 + b"]" * 200000, b"9" * 5000):
+            with self.subTest(size=len(data)):
+                with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
+                    packer.read_json_object(data, "test")
+
 
 if __name__ == "__main__":
     unittest.main()

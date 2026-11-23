@@ -2140,6 +2140,112 @@ runpy.run_path(script, run_name="__main__")
                     self.assertEqual((output / "README.md").read_bytes(), before)
                     self.assertFalse((output / "release.json").exists())
 
+    def test_invalid_catalog_and_contract_inputs_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="obsidian-packer-invalid-"
+        ) as directory:
+            root = pathlib.Path(directory).resolve()
+            output = root / "bundle"
+            valid_catalog = ROOT / "packages/client/catalog.json"
+            valid_contract = ROOT / "contract.json"
+
+            cases = (
+                ("catalog", "array", "[]\n", "catalog input must be a JSON object"),
+                ("catalog", "primitive", '"string"\n', "catalog input must be a JSON object"),
+                ("catalog", "malformed", "not valid json\n", "catalog input is not valid JSON"),
+                ("contract", "array", "[]\n", "contract input must be a JSON object"),
+                ("contract", "primitive", "123\n", "contract input must be a JSON object"),
+                ("contract", "malformed", "not valid json\n", "contract input is not valid JSON"),
+            )
+            for target, kind, content, expected_diagnostic in cases:
+                with self.subTest(target=target, kind=kind):
+                    bad_file = root / f"bad-{target}-{kind}.json"
+                    bad_file.write_text(content)
+                    catalog_arg = bad_file if target == "catalog" else valid_catalog
+                    contract_arg = bad_file if target == "contract" else valid_contract
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(PACK),
+                            "--catalog",
+                            str(catalog_arg),
+                            "--contract",
+                            str(contract_arg),
+                            "--output",
+                            str(output),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn("obsidian-mcp-client:", result.stderr)
+                    self.assertIn(expected_diagnostic, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertFalse(output.exists())
+
+            existing_output = root / "existing-bundle"
+            existing_output.mkdir()
+            canary = existing_output / "canary.txt"
+            canary.write_text("preserve-me")
+            bad_catalog = root / "array-catalog.json"
+            bad_catalog.write_text("[]\n")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PACK),
+                    "--catalog",
+                    str(bad_catalog),
+                    "--output",
+                    str(existing_output),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 64, result.stderr)
+            self.assertIn(
+                "obsidian-mcp-client: catalog input must be a JSON object",
+                result.stderr,
+            )
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(canary.read_text(), "preserve-me")
+
+    def test_non_mapping_catalog_server_is_rejected(self) -> None:
+        valid_catalog = json.loads(
+            (ROOT / "packages/client/catalog.json").read_text()
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="obsidian-packer-server-"
+        ) as directory:
+            root = pathlib.Path(directory).resolve()
+            output = root / "bundle"
+            for value in ("x", None, []):
+                with self.subTest(server=value):
+                    catalog = dict(valid_catalog, server=value)
+                    catalog_path = root / "catalog.json"
+                    catalog_path.write_text(json.dumps(catalog))
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(PACK),
+                            "--catalog",
+                            str(catalog_path),
+                            "--contract",
+                            str(ROOT / "contract.json"),
+                            "--output",
+                            str(output),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn(
+                        "catalog read bridge pin does not match bundle",
+                        result.stderr,
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
