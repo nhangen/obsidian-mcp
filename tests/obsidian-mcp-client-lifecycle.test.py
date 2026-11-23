@@ -991,15 +991,10 @@ class ClientLifecycleTest(unittest.TestCase):
             bundle_identity,
         )
         before_valid = self.inventory_snapshot()
-        preview_valid = self.run_installer(
-            self.bundle_b,
-            "--bundle",
-            str(self.bundle_b),
-            "--dry-run",
-            expected=digest_b,
-        )
         self.assertEqual(
-            json.loads(preview_valid.stdout),
+            self.dry_run_map(
+                self.bundle_b, "--bundle", str(self.bundle_b), expected=digest_b
+            ),
             {
                 "after": {
                     "current": release_b,
@@ -1048,9 +1043,16 @@ class ClientLifecycleTest(unittest.TestCase):
         digest_b = sha256(self.bundle_b / "release.json")
         self.assertNotEqual(reformatted_digest, digest_b)
         installer = load_installer(self.installer(reformatted))
-        source = installer.verify_source(reformatted, reformatted_digest)
+        metadata, metadata_bytes, bundle_identity = installer.verify_source(
+            reformatted, reformatted_digest
+        )
         installer.persist_release(
-            self.prefix, reformatted, source[0], source[1], reformatted_digest, source[2]
+            self.prefix,
+            reformatted,
+            metadata,
+            metadata_bytes,
+            reformatted_digest,
+            bundle_identity,
         )
         self.assertEqual(self.slots()["current"], self.release_id(self.bundle_a))
         self.assert_preview_and_live_refuse(
