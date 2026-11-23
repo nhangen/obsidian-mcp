@@ -495,6 +495,15 @@ def validate_managed_directory(path: Path, label: str) -> None:
         fail(f"{label} is unsafe")
 
 
+def validate_managed_parents(prefix: Path) -> None:
+    validate_managed_directory(prefix, "managed prefix")
+    releases = prefix / "releases"
+    if os.path.lexists(releases):
+        if releases.is_symlink() or not releases.is_dir():
+            fail("managed releases directory is unsafe")
+        validate_managed_directory(releases, "managed releases directory")
+
+
 def fsync_dir(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -927,11 +936,15 @@ def lifecycle(args: argparse.Namespace) -> str:
     if args.dry_run:
         if (prefix / JOURNAL).exists() or (prefix / JOURNAL).is_symlink():
             fail("dry run cannot proceed while recovery is required")
+        if os.path.lexists(prefix):
+            validate_managed_parents(prefix)
         before = slot_map(prefix) if prefix.exists() else {name: None for name in SLOTS}
         release_id = metadata["releaseId"] if metadata else None
         after, _ = desired_state(operation, before, release_id)
-        if after == before and operation == "install":
-            verify_installed_release(prefix, release_id, args.release_sha256)
+        if operation == "install":
+            destination = prefix / "releases" / release_id
+            if after == before or destination.exists() or destination.is_symlink():
+                verify_installed_release(prefix, release_id, args.release_sha256)
         return json.dumps(
             {
                 "after": after,
@@ -953,10 +966,8 @@ def lifecycle(args: argparse.Namespace) -> str:
         desired_state(operation, {name: None for name in SLOTS}, None)
 
     prefix.mkdir(parents=True, exist_ok=True, mode=0o700)
-    validate_managed_directory(prefix, "managed prefix")
+    validate_managed_parents(prefix)
     releases = prefix / "releases"
-    if releases.exists() and (releases.is_symlink() or not releases.is_dir()):
-        fail("managed releases directory is unsafe")
     releases.mkdir(mode=0o755, exist_ok=True)
     validate_managed_directory(releases, "managed releases directory")
     lock_path = prefix / ".install.lock"
