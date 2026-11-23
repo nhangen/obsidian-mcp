@@ -930,8 +930,10 @@ def lifecycle(args: argparse.Namespace) -> str:
         before = slot_map(prefix) if prefix.exists() else {name: None for name in SLOTS}
         release_id = metadata["releaseId"] if metadata else None
         after, _ = desired_state(operation, before, release_id)
-        if after == before and operation == "install":
-            verify_installed_release(prefix, release_id, args.release_sha256)
+        if operation == "install":
+            destination = prefix / "releases" / release_id
+            if after == before or destination.exists() or destination.is_symlink():
+                verify_installed_release(prefix, release_id, args.release_sha256)
         return json.dumps(
             {
                 "after": after,

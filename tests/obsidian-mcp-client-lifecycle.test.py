@@ -910,6 +910,104 @@ class ClientLifecycleTest(unittest.TestCase):
         self.assertEqual(result.returncode, 64)
         self.assertIn("different release.json digest", result.stderr)
 
+    def test_dry_run_upgrade_checks_existing_destination_and_leaves_state_untouched(
+        self,
+    ) -> None:
+        self.install(self.bundle_a)
+        release_b = self.release_id(self.bundle_b)
+        digest_b = sha256(self.bundle_b / "release.json")
+        incomplete_b = self.prefix / "releases" / release_b
+        incomplete_b.mkdir()
+        before = self.inventory_snapshot()
+
+        preview = self.run_installer(
+            self.bundle_b,
+            "--bundle",
+            str(self.bundle_b),
+            "--dry-run",
+            expected=digest_b,
+            check=False,
+        )
+        self.assertEqual(preview.returncode, 64)
+        self.assertIn("cannot read installed trust record", preview.stderr)
+        self.assertNotIn("Traceback", preview.stderr)
+        self.assertEqual(self.inventory_snapshot(), before)
+
+        live = self.run_installer(
+            self.bundle_b,
+            "--bundle",
+            str(self.bundle_b),
+            expected=digest_b,
+            check=False,
+        )
+        self.assertEqual(live.returncode, 64)
+        self.assertIn("cannot read installed trust record", live.stderr)
+        self.assertNotIn("Traceback", live.stderr)
+        self.assertEqual(self.inventory_snapshot(), before)
+
+    def test_dry_run_upgrade_destination_checks_fail_closed_and_leave_state_untouched(
+        self,
+    ) -> None:
+        self.install(self.bundle_a)
+        release_b = self.release_id(self.bundle_b)
+        digest_b = sha256(self.bundle_b / "release.json")
+        destination = self.prefix / "releases" / release_b
+        destination.symlink_to(self.prefix / "releases" / self.release_id(self.bundle_a))
+        before = self.inventory_snapshot()
+
+        preview = self.run_installer(
+            self.bundle_b,
+            "--bundle",
+            str(self.bundle_b),
+            "--dry-run",
+            expected=digest_b,
+            check=False,
+        )
+        self.assertEqual(preview.returncode, 64)
+        self.assertIn("managed release is missing or unsafe", preview.stderr)
+        self.assertNotIn("Traceback", preview.stderr)
+        self.assertEqual(self.inventory_snapshot(), before)
+
+        destination.unlink()
+        installer = load_installer(self.installer(self.bundle_b))
+        metadata, metadata_bytes, bundle_identity = installer.verify_source(
+            self.bundle_b, digest_b
+        )
+        installer.persist_release(
+            self.prefix,
+            self.bundle_b,
+            metadata,
+            metadata_bytes,
+            digest_b,
+            bundle_identity,
+        )
+        before_valid = self.inventory_snapshot()
+        preview_valid = self.run_installer(
+            self.bundle_b,
+            "--bundle",
+            str(self.bundle_b),
+            "--dry-run",
+            expected=digest_b,
+        )
+        self.assertEqual(
+            json.loads(preview_valid.stdout),
+            {
+                "after": {
+                    "current": release_b,
+                    "previous": self.release_id(self.bundle_a),
+                    "disabled": None,
+                },
+                "before": {
+                    "current": self.release_id(self.bundle_a),
+                    "previous": None,
+                    "disabled": None,
+                },
+                "dryRun": True,
+                "operation": "install",
+            },
+        )
+        self.assertEqual(self.inventory_snapshot(), before_valid)
+
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_filesystem_errors_fail_with_a_message_not_a_traceback(self) -> None:
         parent = self.home / "readonly"
