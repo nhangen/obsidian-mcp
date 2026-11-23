@@ -969,6 +969,12 @@ class ClientLifecycleTest(unittest.TestCase):
         self.assertEqual(self.inventory_snapshot(), before)
 
         destination.unlink()
+        destination.symlink_to(self.root / "missing-release")
+        self.assert_preview_and_live_refuse(
+            self.bundle_b, digest_b, "managed release is missing or unsafe"
+        )
+
+        destination.unlink()
         installer = load_installer(self.installer(self.bundle_b))
         metadata, metadata_bytes, bundle_identity = installer.verify_source(
             self.bundle_b, digest_b
