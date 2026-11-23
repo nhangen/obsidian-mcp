@@ -1967,7 +1967,7 @@ def resolve_vault_path(profile=None):
                                 vp = Path(val).expanduser()
                                 if vp.is_dir():
                                     return vp.resolve()
-            except Exception:
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, KeyError):
                 pass
     return None
 
@@ -1987,32 +1987,15 @@ def reconcile_in_flight_session(state, profile=None):
     matched = False
 
     try:
-        key_hash_direct = hashlib.sha256(idem_key.encode("utf-8")).hexdigest()
         stream = f"{len(idem_key)}:{idem_key}\n"
-        key_hash_field = hashlib.sha256(stream.encode("utf-8")).hexdigest()
-        for kh in (key_hash_field, key_hash_direct):
-            rec = vault_path / ".obsidian" / "keeper-idempotency" / kh
-            if rec.is_file():
-                lines = rec.read_text(encoding="utf-8").splitlines()
-                if len(lines) >= 2 and lines[1].strip() == "committed":
-                    matched = True
-                    break
-    except Exception:
+        key_hash = hashlib.sha256(stream.encode("utf-8")).hexdigest()
+        rec = vault_path / ".obsidian" / "keeper-idempotency" / key_hash
+        if rec.is_file():
+            lines = rec.read_text(encoding="utf-8").splitlines()
+            if len(lines) >= 2 and lines[1].strip() == "committed":
+                matched = True
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, KeyError):
         pass
-
-    if not matched:
-        try:
-            cand_p = Path(plan["path"])
-            if cand_p.is_absolute():
-                target = cand_p if vault_path in cand_p.parents or cand_p == vault_path else None
-            else:
-                target = vault_path / plan["path"]
-            if target and target.is_file():
-                content = target.read_text(encoding="utf-8")
-                if idem_key in content:
-                    matched = True
-        except Exception:
-            pass
 
     if matched:
         state["session_in_flight"] = False
@@ -4152,7 +4135,16 @@ def engine_hook(home, profile, event):
                 # every other unresolved condition still holds the gate.
                 outage_repair = bool(state and has_outage_resolution(state))
                 if state and (
-                    (state["disposition"] == "pending" and not outage_repair)
+                    (
+                        (
+                            state["disposition"] == "pending"
+                            or (
+                                state.get("continuation_requested")
+                                and state.get("disposition") not in ("saved", "skipped_by_policy")
+                            )
+                        )
+                        and not outage_repair
+                    )
                     or state.get("session_recovery")
                     or state.get("snapshots")
                     or any(
@@ -4216,6 +4208,7 @@ def engine_hook(home, profile, event):
             reconcile_in_flight_session(state, profile)
             if state.get("session_in_flight"):
                 state["session_in_flight"] = False
+                state["session_recovery"] = True
                 atomic_write(path, encode(state))
             if mode == "git":
                 try:

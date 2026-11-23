@@ -293,7 +293,7 @@ runpy.run_path(script, run_name='__main__')
         self.assertEqual(state["disposition"], "saved")
         self.assertFalse(state.get("session_in_flight"))
 
-        # And when note exists directly in vault containing idempotency_key
+        # Note content containing idempotency key does NOT reconcile (no substring matching)
         self.hook("UserPromptSubmit", turn_id="turn-id-2", prompt="Second turn")
         path2 = self.state_paths()[0]
         plan2 = json.loads(path2.read_bytes())["session_save"]
@@ -308,10 +308,109 @@ runpy.run_path(script, run_name='__main__')
         (vault / plan2["path"]).parent.mkdir(parents=True, exist_ok=True)
         (vault / plan2["path"]).write_text(f"# Note\n{plan2['idempotency_key']}\n")
         drain = self.drain()
+        self.assertFalse(drain["quiescent"])
+
+        # Uncommitted record in keeper does NOT reconcile
+        idem_key2 = plan2["idempotency_key"]
+        stream2 = f"{len(idem_key2)}:{idem_key2}\n"
+        kh2 = hashlib.sha256(stream2.encode("utf-8")).hexdigest()
+        (rec_dir / kh2).write_text("payload_hash\npending\n")
+        drain = self.drain()
+        self.assertFalse(drain["quiescent"])
+
+        # Once committed, keeper record reconciles
+        (rec_dir / kh2).write_text("payload_hash\ncommitted\n")
+        drain = self.drain()
         self.assertTrue(drain["quiescent"])
         state2 = json.loads(path2.read_bytes())
         self.assertEqual(state2["disposition"], "saved")
         self.assertFalse(state2.get("session_in_flight"))
+
+    def test_paused_workspace_pretool_suppression(self):
+        path = self.start()
+        binding_file = self.home / "bindings" / (path.stem + ".json")
+        binding = json.loads(binding_file.read_bytes())
+        binding["paused"] = True
+        binding_file.write_text(json.dumps(binding))
+
+        # Non-commit command on paused workspace returns empty dict (suppresses advisory)
+        non_commit = dict(
+            tool_name="Bash",
+            tool_use_id="bash-ls",
+            tool_input=dict(command="ls -la"),
+        )
+        res = self.hook("PreToolUse", **non_commit)
+        self.assertEqual(res, {})
+
+        # Commit command on paused workspace still triggers validation and execute-commit wrapping
+        commit_cmd = dict(
+            tool_name="Bash",
+            tool_use_id="bash-commit",
+            tool_input=dict(command="git commit -m 'test'"),
+        )
+        res_commit = self.hook("PreToolUse", **commit_cmd)
+        self.assertIn("execute-commit", json.dumps(res_commit))
+
+    def test_binding_auto_unpause_on_reconciliation(self):
+        path = self.start()
+        binding_file = self.home / "bindings" / (path.stem + ".json")
+        binding = json.loads(binding_file.read_bytes())
+        binding["paused"] = True
+        binding_file.write_text(json.dumps(binding))
+
+        # Set vault path
+        vault = self.directory / "test-vault"
+        vault.mkdir(exist_ok=True)
+        self.environment["OBSIDIAN_VAULT_PATH"] = str(vault)
+
+        # Start in-flight save tool call
+        plan = json.loads(path.read_bytes())["session_save"]
+        event = dict(
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="write-reconcile-unpause",
+            tool_input=self.session_arguments(path),
+        )
+        self.hook("PreToolUse", **event)
+
+        # Negative control: with no committed record in vault, binding remains paused
+        non_commit = dict(
+            tool_name="Bash",
+            tool_use_id="bash-check",
+            tool_input=dict(command="pwd"),
+        )
+        self.hook("PreToolUse", **non_commit)
+        binding_mid = json.loads(binding_file.read_bytes())
+        self.assertTrue(binding_mid["paused"])
+
+        # Create committed keeper record in vault
+        idem_key = plan["idempotency_key"]
+        stream = f"{len(idem_key)}:{idem_key}\n"
+        kh = hashlib.sha256(stream.encode("utf-8")).hexdigest()
+        rec_dir = vault / ".obsidian" / "keeper-idempotency"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / kh).write_text("payload_hash\ncommitted\n")
+
+        # Non-commit command triggers reconciliation in user_hook and unpauses binding
+        self.hook("PreToolUse", **non_commit)
+        binding_after = json.loads(binding_file.read_bytes())
+        self.assertFalse(binding_after["paused"])
+
+    def test_stop_on_unconfirmed_in_flight_sets_session_recovery(self):
+        path = self.start()
+        event = dict(
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="unconfirmed-inflight",
+            tool_input=self.session_arguments(path),
+        )
+        self.hook("PreToolUse", **event)
+        state_before = json.loads(path.read_bytes())
+        self.assertEqual(state_before["session_in_flight"], "unconfirmed-inflight")
+
+        # Stop without vault confirmation clears in_flight but sets session_recovery
+        self.hook("Stop", stop_hook_active=True)
+        state_after = json.loads(path.read_bytes())
+        self.assertFalse(state_after.get("session_in_flight"))
+        self.assertTrue(state_after.get("session_recovery"))
 
     def test_workspace_binding_git_subdirectories_and_directory_session_only(self):
         nested = self.project / "nested"
@@ -417,12 +516,6 @@ runpy.run_path(script, run_name='__main__')
 
     def continuation_fixture(self):
         path = self.start()
-        event = dict(
-            tool_name="mcp__obsidian_write__obsidian_keeper_save",
-            tool_use_id="inflight",
-            tool_input=self.session_arguments(path),
-        )
-        self.hook("PreToolUse", **event)
         stopped = self.hook("Stop", stop_hook_active=False)
         self.assertEqual(stopped["decision"], "block")
         frozen = path.read_bytes()
