@@ -434,6 +434,13 @@ class PackerHelperValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
             packer.read_json_object(b"\x80abc", "test")
 
+    def test_read_json_object_rejects_unparseable_extremes(self):
+        packer = self.load_packer()
+        for data in (b"[" * 200000 + b"]" * 200000, b"9" * 5000):
+            with self.subTest(size=len(data)):
+                with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
+                    packer.read_json_object(data, "test")
+
 
 if __name__ == "__main__":
     unittest.main()

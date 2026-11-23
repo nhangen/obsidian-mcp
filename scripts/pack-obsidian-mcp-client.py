@@ -101,7 +101,7 @@ def regular_file_bytes(path: Path, label: str) -> bytes:
 def read_json_object(data: bytes, label: str) -> dict:
     try:
         value = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         fail(f"{label} is not valid JSON")
     if not isinstance(value, dict):
         fail(f"{label} must be a JSON object")
