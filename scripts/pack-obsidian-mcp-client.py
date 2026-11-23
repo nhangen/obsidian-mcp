@@ -98,10 +98,30 @@ def regular_file_bytes(path: Path, label: str) -> bytes:
     return path.read_bytes()
 
 
+def read_json_object(data: bytes, label: str) -> dict:
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{label} is not valid JSON")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object")
+    return value
+
+
 def server_reference(catalog: dict, contract_bytes: bytes) -> dict[str, str]:
-    contract = json.loads(contract_bytes)
-    contract_pin = catalog.get("contract", {})
-    release = catalog.get("release", {})
+    if not isinstance(catalog, dict):
+        fail("catalog input must be a JSON object")
+    contract = read_json_object(contract_bytes, "contract input")
+    contract_pin = (
+        catalog.get("contract")
+        if isinstance(catalog.get("contract"), dict)
+        else {}
+    )
+    release = (
+        catalog.get("release")
+        if isinstance(catalog.get("release"), dict)
+        else {}
+    )
     actual_sha256 = hashlib.sha256(contract_bytes).hexdigest()
     if contract_pin.get("sha256") != actual_sha256:
         fail("catalog contract hash does not match contract bytes")
@@ -111,6 +131,10 @@ def server_reference(catalog: dict, contract_bytes: bytes) -> dict[str, str]:
         fail("catalog release source commit does not match contract pin")
     if not isinstance(release.get("tag"), str) or not release["tag"]:
         fail("catalog release tag is missing")
+    if "contractVersion" not in contract_pin:
+        fail("catalog contract version does not match contract")
+    if "commit" not in contract_pin:
+        fail("catalog release source commit does not match contract pin")
     return {
         "release": release["tag"],
         "contractVersion": contract_pin["contractVersion"],
@@ -228,7 +252,9 @@ def validate_helper_vendor(files: dict[str, bytes]) -> dict:
 
 def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     contract_bytes = regular_file_bytes(contract_path, "contract input")
-    catalog = json.loads(regular_file_bytes(catalog_path, "catalog input"))
+    catalog = read_json_object(
+        regular_file_bytes(catalog_path, "catalog input"), "catalog input"
+    )
     files: dict[str, bytes] = {}
     for relative in FILES:
         path = SOURCE / relative
@@ -239,7 +265,11 @@ def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     bridge_pin = manifest.get("readBridge")
-    if bridge_pin != catalog.get("server", {}).get("readHttpBridge"):
+    server = catalog.get("server")
+    server_bridge = (
+        server.get("readHttpBridge") if isinstance(server, dict) else None
+    )
+    if bridge_pin != server_bridge:
         fail("catalog read bridge pin does not match bundle")
     verified_vendor = verifier.verified_files(SOURCE, bridge_pin)
     for relative, contents in verified_vendor.items():

@@ -344,6 +344,34 @@ class PackerHelperValidationTest(unittest.TestCase):
             self.assertEqual(entries[vendor]["sha256"], hashlib.sha256(files[vendor]).hexdigest())
         self.assertEqual(entries["vendor/shell-capture-parser/BUILD-PROVENANCE.json"]["mode"], 0o644)
 
+    def test_read_json_object_validates_mapping_shape(self):
+        packer = self.load_packer()
+        self.assertEqual(
+            packer.read_json_object(b'{"key": "value"}', "test"),
+            {"key": "value"},
+        )
+        with self.assertRaisesRegex(ValueError, "test must be a JSON object"):
+            packer.read_json_object(b"[]", "test")
+        with self.assertRaisesRegex(ValueError, "test must be a JSON object"):
+            packer.read_json_object(b'"string"', "test")
+        with self.assertRaisesRegex(ValueError, "test is not valid JSON"):
+            packer.read_json_object(b"not json", "test")
+
+    def test_server_reference_rejects_non_mapping_inputs(self):
+        packer = self.load_packer()
+        with self.assertRaisesRegex(
+            ValueError, "catalog input must be a JSON object"
+        ):
+            packer.server_reference([], b"{}")
+        with self.assertRaisesRegex(
+            ValueError, "contract input must be a JSON object"
+        ):
+            packer.server_reference({}, b"[]")
+        with self.assertRaisesRegex(
+            ValueError, "contract input is not valid JSON"
+        ):
+            packer.server_reference({}, b"not json")
+
 
 if __name__ == "__main__":
     unittest.main()

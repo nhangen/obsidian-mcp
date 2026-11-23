@@ -137,6 +137,38 @@ if python3 "$PACK" --catalog "$provenance/catalog.json" --contract "$provenance/
   fail "catalog contract version drift was accepted"
 fi
 
+python3 - "$provenance/catalog-array.json" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text("[]\n")
+PY
+set +e
+python3 "$PACK" --catalog "$provenance/catalog-array.json" --contract "$provenance/contract.json" --output "$tmp/provenance-array-catalog" >"$tmp/provenance-catalog-array.out" 2>"$tmp/provenance-catalog-array.err"
+code=$?
+set -e
+test "$code" -eq 64 || fail "catalog JSON array exited $code; expected 64"
+grep -q "obsidian-mcp-client: catalog input must be a JSON object" "$tmp/provenance-catalog-array.err" || fail "missing catalog array diagnostic"
+grep -q "Traceback" "$tmp/provenance-catalog-array.err" && fail "catalog array failure leaked traceback"
+test ! -e "$tmp/provenance-array-catalog" || fail "catalog array failure created output directory"
+
+python3 - "$provenance/contract-array.json" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text("[]\n")
+PY
+set +e
+python3 "$PACK" --catalog "$provenance/catalog.json" --contract "$provenance/contract-array.json" --output "$tmp/provenance-array-contract" >"$tmp/provenance-contract-array.out" 2>"$tmp/provenance-contract-array.err"
+code=$?
+set -e
+test "$code" -eq 64 || fail "contract JSON array exited $code; expected 64"
+grep -q "obsidian-mcp-client: contract input must be a JSON object" "$tmp/provenance-contract-array.err" || fail "missing contract array diagnostic"
+grep -q "Traceback" "$tmp/provenance-contract-array.err" && fail "contract array failure leaked traceback"
+test ! -e "$tmp/provenance-array-contract" || fail "contract array failure created output directory"
+
 python3 - "$PACK" "$ROOT/packages/client/catalog.json" "$ROOT/contract.json" <<'PY'
 import hashlib
 import importlib.util
