@@ -2115,12 +2115,17 @@ def provision_child(home, profile, project, mode):
 
 
 def initial_session_state(profile, session, turn, transcript=None, *, date=None):
+    disposition = (
+        "open"
+        if attached_profile(profile) and profile.get("host") == "codex"
+        else "pending"
+    )
     state = dict(
         schemaVersion=1,
         python=profile["python"],
         session=session,
         turn=turn,
-        disposition="open" if profile.get("host") == "codex" else "pending",
+        disposition=disposition,
         session_save=session_plan(profile, session, turn, date=date),
         snapshots={},
         commits={},
@@ -4237,7 +4242,8 @@ def engine_hook(home, profile, event):
                 "continuation_requested"
             ):
                 if (
-                    state["disposition"] == "open"
+                    attached_profile(profile)
+                    and state["disposition"] == "open"
                     and not has_pending_capture(state)
                     and not state.get("snapshots")
                     and not state.get("session_recovery")
