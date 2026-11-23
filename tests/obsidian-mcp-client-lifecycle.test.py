@@ -2210,6 +2210,42 @@ runpy.run_path(script, run_name="__main__")
             self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(canary.read_text(), "preserve-me")
 
+    def test_non_mapping_catalog_server_is_rejected(self) -> None:
+        valid_catalog = json.loads(
+            (ROOT / "packages/client/catalog.json").read_text()
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="obsidian-packer-server-"
+        ) as directory:
+            root = pathlib.Path(directory).resolve()
+            output = root / "bundle"
+            for value in ("x", None, []):
+                with self.subTest(server=value):
+                    catalog = dict(valid_catalog, server=value)
+                    catalog_path = root / "catalog.json"
+                    catalog_path.write_text(json.dumps(catalog))
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(PACK),
+                            "--catalog",
+                            str(catalog_path),
+                            "--contract",
+                            str(ROOT / "contract.json"),
+                            "--output",
+                            str(output),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn(
+                        "catalog read bridge pin does not match bundle",
+                        result.stderr,
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
