@@ -1008,6 +1008,57 @@ class ClientLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(self.inventory_snapshot(), before_valid)
 
+    def assert_preview_and_live_refuse(
+        self, bundle: pathlib.Path, digest: str, message: str
+    ) -> None:
+        before = self.inventory_snapshot()
+        for mode in (("--dry-run",), ()):
+            result = self.run_installer(
+                bundle,
+                "--bundle",
+                str(bundle),
+                *mode,
+                expected=digest,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 64, mode)
+            self.assertIn(message, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(self.inventory_snapshot(), before)
+
+    def test_dry_run_refuses_unsafe_managed_parents_like_the_live_run(self) -> None:
+        self.install(self.bundle_a)
+        digest_b = sha256(self.bundle_b / "release.json")
+        installer = load_installer(self.installer(self.bundle_b))
+        metadata, metadata_bytes, bundle_identity = installer.verify_source(
+            self.bundle_b, digest_b
+        )
+        installer.persist_release(
+            self.prefix,
+            self.bundle_b,
+            metadata,
+            metadata_bytes,
+            digest_b,
+            bundle_identity,
+        )
+        releases = self.prefix / "releases"
+        moved = self.prefix / "releases-moved"
+        releases.rename(moved)
+        releases.symlink_to(moved)
+        self.assert_preview_and_live_refuse(
+            self.bundle_b, digest_b, "managed releases directory is unsafe"
+        )
+
+        releases.unlink()
+        moved.rename(releases)
+        self.prefix.chmod(0o777)
+        try:
+            self.assert_preview_and_live_refuse(
+                self.bundle_b, digest_b, "managed prefix is unsafe"
+            )
+        finally:
+            self.prefix.chmod(0o700)
+
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_filesystem_errors_fail_with_a_message_not_a_traceback(self) -> None:
         parent = self.home / "readonly"
