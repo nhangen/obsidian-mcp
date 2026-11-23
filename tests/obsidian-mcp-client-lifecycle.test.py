@@ -974,7 +974,10 @@ class ClientLifecycleTest(unittest.TestCase):
             self.bundle_b, digest_b, "managed release is missing or unsafe"
         )
 
-        destination.unlink()
+    def test_dry_run_upgrade_accepts_a_valid_existing_destination(self) -> None:
+        self.install(self.bundle_a)
+        release_b = self.release_id(self.bundle_b)
+        digest_b = sha256(self.bundle_b / "release.json")
         installer = load_installer(self.installer(self.bundle_b))
         metadata, metadata_bytes, bundle_identity = installer.verify_source(
             self.bundle_b, digest_b
