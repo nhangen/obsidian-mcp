@@ -1177,9 +1177,13 @@ def retire_terminal_sessions(home, profile):
             continue
         try:
             with state_lock(child, entry.stem, wait=0) as (state, _):
-                if (state is not None and drain_reasons(state)) or (
-                    active_request(child) or {}
-                ).get("session") == entry.stem:
+                if (
+                    state is not None
+                    and (
+                        state.get("disposition") in ("open", "pending")
+                        or drain_reasons(state)
+                    )
+                ) or (active_request(child) or {}).get("session") == entry.stem:
                     active += 1
                     continue
                 if binding["enrolled"] and state is None:
@@ -1923,6 +1927,90 @@ def capture_pretool_needs_validation(event):
     return analysis["kind"] is not None
 
 
+def resolve_vault_path(profile=None):
+    if os.environ.get("OBSIDIAN_VAULT_PATH"):
+        candidate = Path(os.environ["OBSIDIAN_VAULT_PATH"]).expanduser()
+        if candidate.is_dir():
+            return candidate.resolve()
+    if profile and isinstance(profile.get("vault_path"), str):
+        candidate = Path(profile["vault_path"]).expanduser()
+        if candidate.is_dir():
+            return candidate.resolve()
+    candidates = []
+    if os.environ.get("OBSIDIAN_LOCAL_MD"):
+        candidates.append(Path(os.environ["OBSIDIAN_LOCAL_MD"]).expanduser())
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        candidates.append(Path(xdg) / "claude-obsidian" / "obsidian.local.md")
+    else:
+        candidates.append(Path.home() / ".config" / "claude-obsidian" / "obsidian.local.md")
+    for cfg in candidates:
+        if cfg.is_file():
+            try:
+                text = cfg.read_text(encoding="utf-8")
+                lines = text.splitlines()
+                if lines and lines[0].strip() == "---":
+                    for line in lines[1:]:
+                        if line.strip() == "---":
+                            break
+                        m = re.match(r"^vault_path:\s*(.*)$", line)
+                        if m:
+                            val = m.group(1).strip()
+                            if val.startswith(('"', "'")):
+                                quote = val[0]
+                                end = val.find(quote, 1)
+                                if end != -1:
+                                    val = val[1:end]
+                            else:
+                                val = re.sub(r"\s+#.*$", "", val).strip()
+                            if val:
+                                vp = Path(val).expanduser()
+                                if vp.is_dir():
+                                    return vp.resolve()
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, KeyError):
+                pass
+    return None
+
+
+def reconcile_in_flight_session(state, profile=None):
+    if not isinstance(state, dict) or not state.get("session_in_flight"):
+        return False
+    plan = state.get("session_save")
+    if not isinstance(plan, dict) or not plan.get("path") or not plan.get("idempotency_key"):
+        return False
+
+    vault_path = resolve_vault_path(profile)
+    if not vault_path:
+        return False
+
+    idem_key = plan["idempotency_key"]
+    matched = False
+
+    try:
+        stream = f"{len(idem_key)}:{idem_key}\n"
+        key_hash = hashlib.sha256(stream.encode("utf-8")).hexdigest()
+        rec = vault_path / ".obsidian" / "keeper-idempotency" / key_hash
+        if rec.is_file():
+            lines = rec.read_text(encoding="utf-8").splitlines()
+            if len(lines) >= 2 and lines[1].strip() == "committed":
+                matched = True
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError, KeyError):
+        pass
+
+    if matched:
+        state["session_in_flight"] = False
+        state["session_recovery"] = False
+        state["session_outcome"] = {
+            "status": "saved",
+            "path": plan["path"],
+            "idempotency_key": plan["idempotency_key"],
+            "recovery": {"required": False},
+        }
+        state["disposition"] = "saved"
+        return True
+    return False
+
+
 def user_hook_failure(event, code):
     name = event.get("hook_event_name")
     message = (
@@ -2010,12 +2098,17 @@ def provision_child(home, profile, project, mode):
 
 
 def initial_session_state(profile, session, turn, transcript=None, *, date=None):
+    disposition = (
+        "open"
+        if attached_profile(profile) and profile.get("host") == "codex"
+        else "pending"
+    )
     state = dict(
         schemaVersion=1,
         python=profile["python"],
         session=session,
         turn=turn,
-        disposition="pending",
+        disposition=disposition,
         session_save=session_plan(profile, session, turn, date=date),
         snapshots={},
         commits={},
@@ -2234,7 +2327,7 @@ def retained_capture_event(home, profile, event):
         if tool == "mcp__obsidian_write__obsidian_keeper_save":
             if (
                 name == "PreToolUse"
-                and state["disposition"] == "pending"
+                and state["disposition"] in ("open", "pending")
                 and "session_request" not in state
                 and not state.get("session_recovery")
                 and not state.get("session_in_flight")
@@ -2334,6 +2427,13 @@ def user_hook(home, profile, event):
                 bound_child(home, profile, record)
                 atomic_write(path, encode(record))
             child, descriptor = bound_child(home, profile, record)
+            with state_lock(child, session) as (child_state, child_state_path):
+                if child_state is not None and child_state.get("session_in_flight"):
+                    if reconcile_in_flight_session(child_state, descriptor):
+                        atomic_write(child_state_path, encode(child_state))
+                        if record["paused"] and not drain_reasons(child_state):
+                            record["paused"] = False
+                            atomic_write(path, encode(record))
             if any(
                 p.name.startswith(".capture-")
                 for p in streamed_entries(checked_state_directory(child))
@@ -2344,6 +2444,11 @@ def user_hook(home, profile, event):
                 and event.get("hook_event_name") != "UserPromptSubmit"
                 and not retained_capture_event(child, descriptor, event)
             ):
+                if (
+                    event.get("hook_event_name") == "PreToolUse"
+                    and not capture_pretool_needs_validation(event)
+                ):
+                    return {}
                 return user_hook_failure(
                     event, "PREVIOUS_CAPTURE_UNRESOLVED; inspect child " + str(child)
                 )
@@ -2556,12 +2661,17 @@ def user_drain_status(home, profile):
         for entry in streamed_entries(home / "bindings"):
             if entry.suffix != ".json" or HEX.fullmatch(entry.stem) is None:
                 raise NativeError("SESSION_BINDING_INVALID")
-            record, _ = read_binding(home, entry.stem, restore=False)
+            record, binding_path = read_binding(home, entry.stem, restore=False)
             if record is None:
                 raise NativeError("SESSION_BINDING_INVALID")
             try:
-                child, _ = bound_child(home, profile, record, inspect=True)
-                with state_lock(child, entry.stem) as (state, _):
+                child, descriptor = bound_child(home, profile, record, inspect=True)
+                with state_lock(child, entry.stem) as (state, child_path):
+                    if state is not None and reconcile_in_flight_session(state, descriptor):
+                        atomic_write(child_path, encode(state))
+                        if record["paused"] and not drain_reasons(state):
+                            record["paused"] = False
+                            atomic_write(binding_path, encode(record))
                     reasons = drain_reasons(state) if state is not None else []
                     if record["enrolled"] != (state is not None):
                         raise NativeError("SESSION_BINDING_INVALID")
@@ -2800,10 +2910,11 @@ def active_request(home):
 
 
 def drain_reasons(state):
+    reconcile_in_flight_session(state)
     if (
         not isinstance(state.get("turn"), str)
         or not state["turn"]
-        or state.get("disposition") not in ("pending", "saved", "skipped_by_policy")
+        or state.get("disposition") not in ("open", "pending", "saved", "skipped_by_policy")
         or not isinstance(state.get("snapshots"), dict)
         or not isinstance(state.get("commits"), dict)
         or not isinstance(state.get("session_save"), dict)
@@ -2887,10 +2998,12 @@ def drain_status(home):
         sessions = []
         present = set()
         for key in sorted(keys):
-            state, _path = locks.enter_context(state_lock(home, key))
+            state, state_path = locks.enter_context(state_lock(home, key))
             if state is None:
                 continue
             present.add(key)
+            if reconcile_in_flight_session(state):
+                atomic_write(state_path, encode(state))
             sessions.append(dict(session=key, unresolved=drain_reasons(state)))
         if owner and owner["session"] not in present:
             raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
@@ -3435,6 +3548,7 @@ def keeper_arguments_valid(arguments):
 
 
 def observe_session(state, event):
+    reconcile_in_flight_session(state)
     plan = state["session_save"]
     arguments = event.get("tool_input", {})
     if arguments.get("idempotency_key") != plan["idempotency_key"]:
@@ -3579,7 +3693,7 @@ def retry_guidance(home, state, payload_digest, *, commit=None):
     )
 
 
-def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
+def capture_guidance(home, state, host="codex", routes=None, *, retained=False, include_session=True):
     key = state["session"]
     plan = state["session_save"]
     commands = []
@@ -3637,7 +3751,7 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
             commands.append(
                 f'Prepare the pending capture: pipe JSON {{"context":[3-8 concise factual context bullets]}} to {command}, then call mcp__obsidian_write__obsidian_daily_append with the returned exact arguments. Further Git work may continue without capture wrapping. Inspect its result; do not claim capture on failure.'
             )
-    if state["disposition"] == "pending" and "session_request" in state:
+    if include_session and state["disposition"] == "pending" and "session_request" in state:
         if state.get("session_in_flight") or state.get("session_recovery"):
             commands.append(
                 f"Recover the session through {tool_prefix}obsidian_keeper_save. "
@@ -3661,7 +3775,7 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False):
                 + f"; call {tool_prefix}obsidian_keeper_save with those exact arguments. "
                 "Do not add later work to a frozen body."
             )
-    if state["disposition"] == "pending" and "session_request" not in state:
+    if include_session and state["disposition"] in ("open", "pending") and "session_request" not in state:
         commands.append(
             f"Save meaningful session work through {tool_prefix}obsidian_keeper_save using "
             + json.dumps(
@@ -3988,6 +4102,9 @@ def engine_hook(home, profile, event):
     elif Path(cwd).resolve() != Path(profile["project"]):
         raise NativeError("PROJECT_MISMATCH")
     with state_lock(home, session) as (state, path):
+        if state is not None:
+            if reconcile_in_flight_session(state, profile):
+                atomic_write(path, encode(state))
         if attached_profile(profile):
             if name == "SessionStart" and state is None:
                 if profile["host"] == "claude-plugin":
@@ -4018,7 +4135,16 @@ def engine_hook(home, profile, event):
                 # every other unresolved condition still holds the gate.
                 outage_repair = bool(state and has_outage_resolution(state))
                 if state and (
-                    (state["disposition"] == "pending" and not outage_repair)
+                    (
+                        (
+                            state["disposition"] == "pending"
+                            or (
+                                state.get("continuation_requested")
+                                and state.get("disposition") not in ("saved", "skipped_by_policy")
+                            )
+                        )
+                        and not outage_repair
+                    )
                     or state.get("session_recovery")
                     or state.get("snapshots")
                     or any(
@@ -4079,6 +4205,11 @@ def engine_hook(home, profile, event):
             raise NativeError("PROMPT_EVENT_REQUIRED")
         if name == "Stop":
             watch_failed = False
+            reconcile_in_flight_session(state, profile)
+            if state.get("session_in_flight"):
+                state["session_in_flight"] = False
+                state["session_recovery"] = True
+                atomic_write(path, encode(state))
             if mode == "git":
                 try:
                     watch_git_history(home, session, state, path, profile, routes)
@@ -4103,6 +4234,14 @@ def engine_hook(home, profile, event):
             if event.get("stop_hook_active") is not False or state.get(
                 "continuation_requested"
             ):
+                if (
+                    attached_profile(profile)
+                    and state["disposition"] == "open"
+                    and not has_pending_capture(state)
+                    and not state.get("snapshots")
+                    and not state.get("session_recovery")
+                ):
+                    return {"systemMessage": "Obsidian capture reminder:\n" + guidance}
                 return {
                     "systemMessage": "Obsidian capture unresolved; no successful receipt or policy skip. "
                     + guidance
@@ -4221,7 +4360,7 @@ def engine_hook(home, profile, event):
             note = persist_with_gate(home, session, state, path)
             return context(
                 name,
-                capture_guidance(home, state, profile["host"], routes) + note,
+                capture_guidance(home, state, profile["host"], routes, include_session=False) + note,
             )
         try:
             root = shell_commit(
@@ -4268,7 +4407,7 @@ def engine_hook(home, profile, event):
         if name == "PostToolUse" and watched is not None:
             return context(
                 name,
-                capture_guidance(home, state, profile["host"], routes) + watched,
+                capture_guidance(home, state, profile["host"], routes, include_session=False) + watched,
             )
         if root is None:
             if name == "PostToolUse" and watch_failed:
@@ -4301,7 +4440,7 @@ def engine_hook(home, profile, event):
                         "hookEventName": name,
                         "permissionDecision": "deny",
                         "permissionDecisionReason": "A pending commit prevents capture wrapping.\n"
-                        + capture_guidance(home, state, profile["host"], routes),
+                        + capture_guidance(home, state, profile["host"], routes, include_session=False),
                     }
                 }
             other = active_request(home)
