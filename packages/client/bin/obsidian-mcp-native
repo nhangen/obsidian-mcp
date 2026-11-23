@@ -4185,7 +4185,7 @@ def engine_hook(home, profile, event):
                     try:
                         state["git_watch"] = git_position(Path(profile["project"]))
                     except WATCH_ERRORS:
-                        pass
+                        reconcile_note = WATCH_UNAVAILABLE + "\n"
             atomic_write(path, encode(state))
             return context(
                 name,

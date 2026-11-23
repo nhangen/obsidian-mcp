@@ -9537,6 +9537,55 @@ class CaptureShellParserTest(NativeCaptureFixture):
             output["hookSpecificOutput"]["additionalContext"],
         )
 
+    def test_failed_git_position_at_new_turn_reports_advisory(self):
+        self.configure()
+        self.empty_commit("base")
+        self.hook("UserPromptSubmit", prompt="work")
+        path = next(iter(self.state_paths()))
+        state = self.watched_state()
+        state["disposition"] = "skipped_by_policy"
+        state["skip_reason"] = "no_meaningful_work"
+        path.write_text(json.dumps(state))
+        self.hook("Stop", stop_hook_active=False)
+        self.assertTrue(self.watched_state().get("stop_watched"))
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        output = json.loads(self.next_turn().stdout)
+        self.assertIn(
+            "history check unavailable",
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("git_watch", self.watched_state())
+
+    def test_failed_git_position_at_first_turn_reports_advisory(self):
+        self.configure()
+        self.empty_commit("base")
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        output = self.hook("UserPromptSubmit", prompt="work")
+        self.assertIn(
+            "history check unavailable",
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("git_watch", self.watched_state())
+
+    def test_agent_commit_after_failed_git_position_is_captured(self):
+        self.configure()
+        self.empty_commit("base")
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assertNotIn("git_watch", self.watched_state())
+        (self.project / ".git/logs/HEAD").rmdir()
+        self.watched_bash('eval "$X"', self.empty_commit)
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+        self.assertEqual(
+            [p["status"] for p in state["commits"].values()], ["pending"]
+        )
+
     def test_bash_after_stop_rearms_reconciliation(self):
         self.configure()
         self.empty_commit("base")
