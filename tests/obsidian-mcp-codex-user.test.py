@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 from pathlib import Path
 import runpy
@@ -178,7 +179,7 @@ runpy.run_path(script, run_name='__main__')
                 self.hook("UserPromptSubmit", turn_id="turn-next", prompt="Next work")
                 self.assertEqual(json.loads(path.read_bytes())["turn"], "turn-next")
                 self.assertEqual(
-                    json.loads(path.read_bytes())["disposition"], "pending"
+                    json.loads(path.read_bytes())["disposition"], "open"
                 )
 
     def test_pending_new_prompt_retains_payload_and_allows_original_receipt(self):
@@ -246,6 +247,71 @@ runpy.run_path(script, run_name='__main__')
             self.assertEqual(state["disposition"], "pending")
             self.assertTrue(state["session_recovery"])
         self.assertFalse(self.drain()["quiescent"])
+
+    def test_reconcile_in_flight_session_strictly_checks_vault(self):
+        path = self.start()
+        plan = json.loads(path.read_bytes())["session_save"]
+        event = dict(
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="write-reconcile",
+            tool_input=self.session_arguments(path),
+        )
+        self.hook("PreToolUse", **event)
+        state = json.loads(path.read_bytes())
+        self.assertEqual(state["session_in_flight"], "write-reconcile")
+        self.assertEqual(state["disposition"], "pending")
+
+        # An unrelated file in project or cwd does NOT reconcile the session
+        (self.project / plan["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (self.project / plan["path"]).write_text("Fixture facts")
+        drain = self.drain()
+        self.assertFalse(drain["quiescent"])
+        state = json.loads(path.read_bytes())
+        self.assertEqual(state["disposition"], "pending")
+
+        # Set vault path
+        vault = self.directory / "test-vault"
+        vault.mkdir()
+        self.environment["OBSIDIAN_VAULT_PATH"] = str(vault)
+
+        # Still not reconciled until idempotency record or note in vault
+        drain = self.drain()
+        self.assertFalse(drain["quiescent"])
+
+        # Create committed keeper idempotency record in vault
+        idem_key = plan["idempotency_key"]
+        stream = f"{len(idem_key)}:{idem_key}\n"
+        kh = hashlib.sha256(stream.encode("utf-8")).hexdigest()
+        rec_dir = vault / ".obsidian" / "keeper-idempotency"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / kh).write_text("payload_hash\ncommitted\n")
+
+        # Drain status or next hook reconciles the in-flight session
+        drain = self.drain()
+        self.assertTrue(drain["quiescent"])
+        state = json.loads(path.read_bytes())
+        self.assertEqual(state["disposition"], "saved")
+        self.assertFalse(state.get("session_in_flight"))
+
+        # And when note exists directly in vault containing idempotency_key
+        self.hook("UserPromptSubmit", turn_id="turn-id-2", prompt="Second turn")
+        path2 = self.state_paths()[0]
+        plan2 = json.loads(path2.read_bytes())["session_save"]
+        event2 = dict(
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="write-reconcile-2",
+            tool_input=self.session_arguments(path2),
+        )
+        self.hook("PreToolUse", **event2)
+        state2 = json.loads(path2.read_bytes())
+        self.assertEqual(state2["session_in_flight"], "write-reconcile-2")
+        (vault / plan2["path"]).parent.mkdir(parents=True, exist_ok=True)
+        (vault / plan2["path"]).write_text(f"# Note\n{plan2['idempotency_key']}\n")
+        drain = self.drain()
+        self.assertTrue(drain["quiescent"])
+        state2 = json.loads(path2.read_bytes())
+        self.assertEqual(state2["disposition"], "saved")
+        self.assertFalse(state2.get("session_in_flight"))
 
     def test_workspace_binding_git_subdirectories_and_directory_session_only(self):
         nested = self.project / "nested"
@@ -351,6 +417,12 @@ runpy.run_path(script, run_name='__main__')
 
     def continuation_fixture(self):
         path = self.start()
+        event = dict(
+            tool_name="mcp__obsidian_write__obsidian_keeper_save",
+            tool_use_id="inflight",
+            tool_input=self.session_arguments(path),
+        )
+        self.hook("PreToolUse", **event)
         stopped = self.hook("Stop", stop_hook_active=False)
         self.assertEqual(stopped["decision"], "block")
         frozen = path.read_bytes()
