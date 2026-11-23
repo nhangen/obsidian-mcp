@@ -9559,7 +9559,8 @@ class CaptureShellParserTest(NativeCaptureFixture):
 
     def test_failed_git_position_at_first_turn_reports_advisory(self):
         self.configure()
-        (self.project / ".git/logs/HEAD").parent.mkdir(parents=True, exist_ok=True)
+        self.empty_commit("base")
+        (self.project / ".git/logs/HEAD").unlink()
         (self.project / ".git/logs/HEAD").mkdir()
         output = self.hook("UserPromptSubmit", prompt="work")
         self.assertIn(
@@ -9567,6 +9568,23 @@ class CaptureShellParserTest(NativeCaptureFixture):
             output["hookSpecificOutput"]["additionalContext"],
         )
         self.assertNotIn("git_watch", self.watched_state())
+
+    def test_agent_commit_after_failed_git_position_is_captured(self):
+        self.configure()
+        self.empty_commit("base")
+        (self.project / ".git/logs/HEAD").unlink()
+        (self.project / ".git/logs/HEAD").mkdir()
+        self.hook("UserPromptSubmit", prompt="work")
+        self.assertNotIn("git_watch", self.watched_state())
+        (self.project / ".git/logs/HEAD").rmdir()
+        self.watched_bash('eval "$X"', self.empty_commit)
+        state = self.watched_state()
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [self.head()]
+        )
+        self.assertEqual(
+            [p["status"] for p in state["commits"].values()], ["pending"]
+        )
 
     def test_bash_after_stop_rearms_reconciliation(self):
         self.configure()
