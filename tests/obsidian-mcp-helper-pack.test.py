@@ -410,6 +410,25 @@ class PackerHelperValidationTest(unittest.TestCase):
         ):
             packer.server_reference(catalog, contract)
 
+    def test_server_reference_reports_missing_pin_fields(self):
+        packer = self.load_packer()
+        contract = b"{}"
+        catalog = self.server_reference_inputs(contract)
+        del catalog["contract"]["contractVersion"]
+        with self.assertRaisesRegex(
+            ValueError, "catalog contract version is missing"
+        ):
+            packer.server_reference(catalog, contract)
+
+        catalog = self.server_reference_inputs(contract)
+        catalog["contract"]["contractVersion"] = None
+        del catalog["contract"]["commit"]
+        del catalog["release"]["sourceCommit"]
+        with self.assertRaisesRegex(
+            ValueError, "catalog contract commit is missing"
+        ):
+            packer.server_reference(catalog, contract)
+
     def test_read_json_object_rejects_non_utf8_bytes(self):
         packer = self.load_packer()
         with self.assertRaisesRegex(ValueError, "test is not valid JSON"):

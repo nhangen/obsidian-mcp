@@ -125,16 +125,16 @@ def server_reference(catalog: dict, contract_bytes: bytes) -> dict[str, str]:
     actual_sha256 = hashlib.sha256(contract_bytes).hexdigest()
     if contract_pin.get("sha256") != actual_sha256:
         fail("catalog contract hash does not match contract bytes")
+    if "contractVersion" not in contract_pin:
+        fail("catalog contract version is missing")
+    if "commit" not in contract_pin:
+        fail("catalog contract commit is missing")
     if contract_pin.get("contractVersion") != contract.get("contractVersion"):
         fail("catalog contract version does not match contract")
     if release.get("sourceCommit") != contract_pin.get("commit"):
         fail("catalog release source commit does not match contract pin")
     if not isinstance(release.get("tag"), str) or not release["tag"]:
         fail("catalog release tag is missing")
-    if "contractVersion" not in contract_pin:
-        fail("catalog contract version does not match contract")
-    if "commit" not in contract_pin:
-        fail("catalog release source commit does not match contract pin")
     return {
         "release": release["tag"],
         "contractVersion": contract_pin["contractVersion"],
