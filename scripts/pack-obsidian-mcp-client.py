@@ -104,6 +104,18 @@ def regular_file_bytes(path: Path, label: str) -> bytes:
     return path.read_bytes()
 
 
+SERVER_HELPERS = (
+    "keeper",
+    "commit-meta.sh",
+    "lib/allowlist-validate.sh",
+    "lib/commit-capture-parse.sh",
+    "lib/dedup-scan.sh",
+    "lib/note-hash.sh",
+    "lib/resolve-config.sh",
+    "lib/vault-index.sh",
+)
+
+
 UNBUNDLED_IMPORT = re.compile(
     rb"""^\s*(?:import|export)\b[^;]*?\bfrom\s*["'](?!node:)|^\s*import\s*["'](?!node:)""",
     re.MULTILINE,
@@ -303,16 +315,9 @@ def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     files["contract.json"] = contract_bytes
     files["LICENSE"] = regular_file_bytes(ROOT / "LICENSE", "project license input")
     files["server/stdio.mjs"] = bundled_server_bytes(ROOT / "dist/stdio.mjs")
-    files["server/helpers/keeper"] = regular_file_bytes(
-        ROOT / "helpers/keeper", "server helper keeper"
-    )
-    files["server/helpers/commit-meta.sh"] = regular_file_bytes(
-        ROOT / "helpers/commit-meta.sh", "server helper commit-meta.sh"
-    )
-    lib_dir = ROOT / "helpers/lib"
-    for lib_file in sorted(lib_dir.glob("*.sh")):
-        files[f"server/helpers/lib/{lib_file.name}"] = regular_file_bytes(
-            lib_file, f"server helper lib {lib_file.name}"
+    for relative in SERVER_HELPERS:
+        files[f"server/helpers/{relative}"] = regular_file_bytes(
+            ROOT / "helpers" / relative, f"server helper {relative}"
         )
     validate_helper_vendor(files)
     return files

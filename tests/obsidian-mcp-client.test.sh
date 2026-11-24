@@ -33,6 +33,20 @@ else:
 assert pack.bundled_server_bytes(pathlib.Path(sys.argv[3]))
 PY
 
+python3 - "$ROOT/scripts/build.mjs" "$bundle/server/helpers" <<'PY'
+import pathlib
+import re
+import sys
+
+build = pathlib.Path(sys.argv[1]).read_text()
+listed = set(re.findall(r'"([^"]+)"', build[build.index("const helpers = ["):build.index("];")]))
+packed = {
+    str(path.relative_to(sys.argv[2]))
+    for path in pathlib.Path(sys.argv[2]).rglob("*") if path.is_file()
+}
+assert packed == listed, f"packed server helpers drifted from build.mjs: {sorted(packed ^ listed)}"
+PY
+
 test -x "$bundle/bin/obsidian-mcp-read" || fail "read launcher missing"
 test -x "$bundle/bin/obsidian-mcp-write" || fail "write launcher missing"
 test -x "$bundle/bin/obsidian-mcp-server" || fail "server launcher missing"
