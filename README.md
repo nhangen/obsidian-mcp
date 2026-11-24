@@ -164,6 +164,27 @@ configuration and repository authorization remain explicit environment values.
 Installed packages authorize no repository roots when `MCP_REPOSITORY_ROOTS`
 is omitted. Multiple roots use the platform path delimiter.
 
+Alternatively, the stdio server accepts `--vault <path>` (alias `-v <path>`) directly as a command-line argument for zero-install and config-free local setups:
+
+```json
+{
+  "mcpServers": {
+    "obsidian": {
+      "command": "claude-obsidian-mcp",
+      "args": [
+        "--vault", "/absolute/path/to/vault"
+      ]
+    }
+  }
+}
+```
+
+CLI options supported by `claude-obsidian-mcp`:
+- `-v, --vault <path>`: Absolute path to the Obsidian vault directory.
+- `--daily-path <path>`: Relative path within the vault for daily notes (default: `Daily/`).
+- `--repo-root <path>`: Allowed repository root for commit metadata (can be repeated or platform-delimited).
+- `-h, --help`: Show usage and exit.
+
 The stdio server defaults to the read profile, exposing only vault and
 repository read tools. Set `MCP_STDIO_PROFILE=write` explicitly as the
 host-level policy authorization for trusted routine Obsidian writes. The write
