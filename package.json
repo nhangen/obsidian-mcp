@@ -1,6 +1,6 @@
 {
   "name": "@nhangen/obsidian-mcp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "license": "MIT",
   "description": "Obsidian MCP server over stdio and authenticated Streamable HTTP.",
   "type": "module",
