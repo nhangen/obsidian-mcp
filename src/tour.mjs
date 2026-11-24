@@ -288,7 +288,7 @@ export function getClaudeCodeConfigPath() {
   return join(homedir(), ".claude.json");
 }
 
-export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/") {
+export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/", { spawn = spawnSync } = {}) {
   const launcher = resolveServerLauncher();
   const args = [
     "mcp",
@@ -306,7 +306,7 @@ export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/")
   ];
   let res;
   try {
-    res = spawnSync("claude", args, {
+    res = spawn("claude", args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
@@ -317,8 +317,8 @@ export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/")
   if (res.status === 0) {
     return { success: true, method: "cli" };
   }
-  const errorMsg = (res.stderr || res.stdout || `exit code ${res.status}`).trim();
-  return { success: false, method: "cli", error: errorMsg, spawnFailure: res.error !== undefined };
+  const errorMsg = (res.stderr || res.stdout || res.error?.message || `exit code ${res.status}`).trim();
+  return { success: false, method: "cli", error: errorMsg, spawnFailure: res.error?.code === "ENOENT" };
 }
 
 export async function configureClaudeCodeViaFile(vaultPath, dailyPath = "Daily/", configPath = getClaudeCodeConfigPath(), options = {}) {

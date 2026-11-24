@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import {
+  configureClaudeCodeViaCli,
   configureClaudeCodeViaFile,
   configureClaudeDesktop,
   countVaultNotes,
@@ -330,4 +331,19 @@ test("detectClaudeCode spawns claude without a shell on POSIX", () => {
   assert.equal(detectClaudeCode({ platform: "darwin", spawn: spawnStub }), true);
   assert.equal(seen.cmd, "claude");
   assert.notEqual(seen.opts.shell, true);
+});
+
+test("configureClaudeCodeViaCli treats only a missing binary as a spawn failure", async () => {
+  const missing = await configureClaudeCodeViaCli("/vault", "Daily/", {
+    spawn: () => ({ status: null, error: Object.assign(new Error("spawnSync claude ENOENT"), { code: "ENOENT" }) }),
+  });
+  assert.equal(missing.success, false);
+  assert.equal(missing.spawnFailure, true);
+
+  const timedOut = await configureClaudeCodeViaCli("/vault", "Daily/", {
+    spawn: () => ({ status: null, error: Object.assign(new Error("spawnSync claude ETIMEDOUT"), { code: "ETIMEDOUT" }) }),
+  });
+  assert.equal(timedOut.success, false);
+  assert.equal(timedOut.spawnFailure, false);
+  assert.match(timedOut.error, /ETIMEDOUT/);
 });
