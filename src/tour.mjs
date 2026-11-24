@@ -543,20 +543,26 @@ export async function runTour(options = {}) {
     }
     print();
 
-    if (results.length > 0 && results.every((r) => !r.success)) {
-      print("❌ Setup incomplete: all requested host configurations failed.");
+    const failed = results.filter((r) => !r.success);
+    if (failed.length > 0) {
+      for (const r of results) {
+        print(`  ${r.success ? "✓" : "❌"} ${r.host}${r.success ? "" : `: ${r.error}`}`);
+      }
+      print(`❌ Setup incomplete: ${failed.length} of ${results.length} requested host configuration(s) failed.`);
       print();
-      const err = new Error("all requested host configurations failed");
+      const err = new Error(`${failed.length} of ${results.length} requested host configuration(s) failed`);
       err.results = results;
       throw err;
     }
 
     print("Setup complete!");
     print();
-    print("To test with Claude Code, launch `claude` and ask:");
-    print('  "Search my Obsidian notes for project roadmap"');
-    print('  "What did I write in my daily note today?"');
-    print();
+    if (results.some((r) => r.host === "Claude Code")) {
+      print("To test with Claude Code, launch `claude` and ask:");
+      print('  "Search my Obsidian notes for project roadmap"');
+      print('  "What did I write in my daily note today?"');
+      print();
+    }
     const runLauncher = resolveServerLauncher();
     const runCommand = [runLauncher.command, ...runLauncher.argsPrefix, "--vault", selectedVault, "--daily-path", selectedDaily]
       .map((part) => (/\s/.test(part) ? `"${part}"` : part))

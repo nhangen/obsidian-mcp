@@ -421,3 +421,50 @@ test("runTour rejects when input closes before the tour finishes", async (t) => 
   );
   assert.equal(existsSync(claudeCodeConfigPath), false);
 });
+
+function scriptedTour(answers) {
+  const input = new PassThrough();
+  let text = "";
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      const piece = chunk.toString();
+      text += piece;
+      for (const [prompt, reply] of answers) {
+        if (piece.includes(prompt)) {
+          const next = Array.isArray(reply) ? reply.shift() : reply;
+          if (next !== undefined) setImmediate(() => input.write(`${next}\n`));
+          break;
+        }
+      }
+      callback();
+    },
+  });
+  return { input, output, text: () => text };
+}
+
+test("runTour reports a partial host failure as incomplete", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-partial-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+  const claudeCodeConfigPath = join(fixture, "claude.json");
+  const claudeDesktopConfigPath = join(fixture, "desktop.json");
+  await writeFile(claudeCodeConfigPath, "{ truncated", "utf8");
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "3"]]);
+  await assert.rejects(
+    runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      claudeDesktopConfigPath,
+      detectClaudeCode: () => false,
+    }),
+    (err) => err.results?.length === 2 && err.results.some((r) => r.success) && err.results.some((r) => !r.success),
+  );
+  assert.doesNotMatch(io.text(), /Setup complete!/);
+  assert.match(io.text(), /Setup incomplete: 1 of 2/);
+  assert.ok(JSON.parse(await readFile(claudeDesktopConfigPath, "utf8")).mcpServers.obsidian);
+  assert.equal(await readFile(claudeCodeConfigPath, "utf8"), "{ truncated");
+});
