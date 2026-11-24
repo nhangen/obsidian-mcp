@@ -16,7 +16,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = Path(os.environ["OBSIDIAN_MCP_CAPTURE_TEST_ROOT"])
 DEFAULT_BUNDLE = TEST_ROOT / "default-client"
-PINNED_VERSION = json.loads((DEFAULT_BUNDLE / "manifest.json").read_text())["pinnedServer"]["release"][5:]
+PINNED_RELEASE = json.loads((DEFAULT_BUNDLE / "manifest.json").read_text())["pinnedServer"]["release"]
+assert PINNED_RELEASE.startswith("mcp-v"), PINNED_RELEASE
+PINNED_VERSION = PINNED_RELEASE.removeprefix("mcp-v")
 IDENTITY = {
     "GIT_AUTHOR_NAME": "Test Author",
     "GIT_AUTHOR_EMAIL": "author@example.invalid",
