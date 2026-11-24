@@ -130,36 +130,20 @@ export async function countVaultNotes(vaultPath, maxCount = 500) {
   return { count, hasMore };
 }
 
-export function resolveServerLauncher() {
-  try {
-    const currentFile = fileURLToPath(import.meta.url);
-    if (currentFile.includes(".npm") || currentFile.includes("_npx")) {
-      return {
-        command: "npx",
-        argsPrefix: ["-y", "@nhangen/obsidian-mcp"],
-      };
-    }
-    const packageDir = resolve(dirname(currentFile), "..");
-    const distStdio = join(packageDir, "dist", "stdio.mjs");
-    if (existsSync(distStdio)) {
-      return {
-        command: process.execPath,
-        argsPrefix: [realpathSync(distStdio)],
-      };
-    }
-    const srcStdio = join(packageDir, "src", "stdio.mjs");
-    if (existsSync(srcStdio)) {
-      return {
-        command: process.execPath,
-        argsPrefix: [realpathSync(srcStdio)],
-      };
-    }
-  } catch {}
-
-  return {
-    command: "npx",
-    argsPrefix: ["-y", "@nhangen/obsidian-mcp"],
-  };
+export function resolveServerLauncher(currentFile = fileURLToPath(import.meta.url)) {
+  const npx = { command: "npx", argsPrefix: ["-y", `@nhangen/obsidian-mcp@${packageVersion}`] };
+  // An npx cache directory can be pruned at any time, so a config that points
+  // into it would break later; re-resolve through npx at the same version.
+  if (currentFile.split(/[\\/]/).includes("_npx")) return npx;
+  const packageDir = resolve(dirname(currentFile), "..");
+  for (const candidate of [join(packageDir, "dist", "stdio.mjs"), join(packageDir, "src", "stdio.mjs")]) {
+    try {
+      if (existsSync(candidate)) {
+        return { command: process.execPath, argsPrefix: [realpathSync(candidate)] };
+      }
+    } catch {}
+  }
+  return npx;
 }
 
 export async function upsertJsonMcpServerConfig(configPath, serverEntry, options = {}) {
@@ -538,8 +522,12 @@ export async function runTour(options = {}) {
     print('  "Search my Obsidian notes for project roadmap"');
     print('  "What did I write in my daily note today?"');
     print();
+    const runLauncher = resolveServerLauncher();
+    const runCommand = [runLauncher.command, ...runLauncher.argsPrefix, "--vault", selectedVault, "--daily-path", selectedDaily]
+      .map((part) => (/\s/.test(part) ? `"${part}"` : part))
+      .join(" ");
     print("To run the MCP server directly in stdio mode:");
-    print(`  npx @nhangen/obsidian-mcp --vault "${selectedVault}" --daily-path "${selectedDaily}"`);
+    print(`  ${runCommand}`);
     print();
 
     return {

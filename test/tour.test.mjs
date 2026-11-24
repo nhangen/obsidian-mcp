@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
+import { packageVersion } from "../src/version.mjs";
 import {
   configureClaudeCodeViaCli,
   configureClaudeCodeViaFile,
@@ -13,6 +14,7 @@ import {
   detectClaudeCode,
   detectDailyNotesPath,
   findKnownVaults,
+  resolveServerLauncher,
   runTour,
   upsertJsonMcpServerConfig,
 } from "../src/tour.mjs";
@@ -346,4 +348,27 @@ test("configureClaudeCodeViaCli treats only a missing binary as a spawn failure"
   assert.equal(timedOut.success, false);
   assert.equal(timedOut.spawnFailure, false);
   assert.match(timedOut.error, /ETIMEDOUT/);
+});
+
+test("resolveServerLauncher runs an installed copy directly, including under .npm-global", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-launcher-")));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const pkg = join(fixture, ".npm-global", "lib", "node_modules", "@nhangen", "obsidian-mcp");
+  await mkdir(join(pkg, "dist"), { recursive: true });
+  await writeFile(join(pkg, "dist", "stdio.mjs"), "");
+
+  const launcher = resolveServerLauncher(join(pkg, "dist", "stdio.mjs"));
+  assert.equal(launcher.command, process.execPath);
+  assert.deepEqual(launcher.argsPrefix, [join(pkg, "dist", "stdio.mjs")]);
+});
+
+test("resolveServerLauncher pins the running version for npx caches and the fallback", () => {
+  const pinned = ["-y", `@nhangen/obsidian-mcp@${packageVersion}`];
+  const npxCache = resolveServerLauncher("/home/u/.npm/_npx/abc123/node_modules/@nhangen/obsidian-mcp/dist/stdio.mjs");
+  assert.equal(npxCache.command, "npx");
+  assert.deepEqual(npxCache.argsPrefix, pinned);
+
+  const nowhere = resolveServerLauncher("/nonexistent/pkg/dist/stdio.mjs");
+  assert.equal(nowhere.command, "npx");
+  assert.deepEqual(nowhere.argsPrefix, pinned);
 });
