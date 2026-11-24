@@ -589,7 +589,7 @@ export async function runTour(options = {}) {
     return {
       vault: selectedVault,
       dailyPath: selectedDaily,
-      configuredHosts: hostChoice,
+      hostChoice,
       results,
     };
   } finally {

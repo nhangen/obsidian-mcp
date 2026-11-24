@@ -298,7 +298,7 @@ test("runTour completes interactive walkthrough with isolated config overrides",
 
   assert.equal(outcome.vault, vaultPath);
   assert.equal(outcome.dailyPath, "Daily/");
-  assert.equal(outcome.configuredHosts, 3);
+  assert.equal(outcome.hostChoice, 3);
   assert.equal(outcome.results.length, 2);
   assert.equal(outcome.results[0].success, true);
   assert.equal(outcome.results[1].success, true);
