@@ -49,7 +49,7 @@ for line in sys.stdin:
         handle.write(request.get("method", "") + "\n")
     if request.get("method") == "initialize":
         Path(os.environ["FAKE_INITIALIZE_PROTOCOL"]).write_text(request["params"]["protocolVersion"])
-        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ.get("FAKE_VERSION", "0.2.4")}}
+        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ["FAKE_VERSION"]}}
         if scenario == "protocol-mismatch":
             result["protocolVersion"] = "2026-07-28"
         elif scenario == "protocol-missing":
