@@ -672,7 +672,12 @@ test("server launches tour banner when started with --tour", async (t) => {
   });
 
   let stdout = "";
+  let stderr = "";
   child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
     if (stdout.includes("Select a vault") || stdout.includes("Enter the absolute path")) {
@@ -680,7 +685,7 @@ test("server launches tour banner when started with --tour", async (t) => {
     }
   });
 
-  await Promise.race([
+  const [code] = await Promise.race([
     once(child, "close"),
     new Promise((_, reject) => setTimeout(() => {
       child.kill();
@@ -689,5 +694,7 @@ test("server launches tour banner when started with --tour", async (t) => {
   ]);
 
   assert.match(stdout, /Obsidian MCP Server Setup/);
+  assert.notEqual(code, 0, "closing stdin mid-tour must not exit 0");
+  assert.match(stderr, /cancelled/);
 });
 

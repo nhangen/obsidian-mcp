@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -396,4 +396,28 @@ test("upsertJsonMcpServerConfig backs up a hand-tuned obsidian entry before repl
   assert.equal(again.updated, false);
   const backups = (await readdir(fixture)).filter((name) => name.includes(".replaced-"));
   assert.equal(backups.length, 1, "an unchanged entry is not rewritten or re-backed-up");
+});
+
+test("runTour rejects when input closes before the tour finishes", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-eof-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+  const claudeCodeConfigPath = join(fixture, "claude.json");
+
+  const input = new PassThrough();
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      const text = chunk.toString();
+      if (text.includes("Select a vault")) setImmediate(() => input.write("\n"));
+      if (text.includes("Daily notes directory")) setImmediate(() => input.end());
+      callback();
+    },
+  });
+
+  await assert.rejects(
+    runTour({ input, output, knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }], claudeCodeConfigPath, detectClaudeCode: () => false }),
+    /cancelled/,
+  );
+  assert.equal(existsSync(claudeCodeConfigPath), false);
 });

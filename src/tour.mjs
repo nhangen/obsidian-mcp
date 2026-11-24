@@ -337,11 +337,28 @@ export async function configureClaudeCodeViaFile(vaultPath, dailyPath = "Daily/"
   return { ...result, method: "file" };
 }
 
+function cancelledError() {
+  return new Error("setup cancelled: input closed before the tour finished");
+}
+
 export async function runTour(options = {}) {
   const input = options.input || process.stdin;
   const output = options.output || process.stdout;
   const version = options.version || packageVersion;
   const rl = readline.createInterface({ input, output });
+  // readline/promises leaves a pending question unsettled when input closes,
+  // so without this the process drains its event loop and exits 0.
+  const closed = new AbortController();
+  rl.once("close", () => closed.abort());
+  const ask = async (query) => {
+    if (closed.signal.aborted) throw cancelledError();
+    try {
+      return await rl.question(query, { signal: closed.signal });
+    } catch (err) {
+      if (closed.signal.aborted) throw cancelledError();
+      throw err;
+    }
+  };
 
   const print = (msg = "") => output.write(`${msg}\n`);
 
@@ -375,7 +392,7 @@ export async function runTour(options = {}) {
         print();
 
         while (!selectedVault) {
-          const answer = (await rl.question(`Select a vault [1-${knownVaults.length + 1}] (default: 1): `)).trim();
+          const answer = (await ask(`Select a vault [1-${knownVaults.length + 1}] (default: 1): `)).trim();
           const choice = answer === "" ? 1 : parseInt(answer, 10);
           if (!isNaN(choice) && choice >= 1 && choice <= knownVaults.length) {
             selectedVault = knownVaults[choice - 1].path;
@@ -389,7 +406,7 @@ export async function runTour(options = {}) {
     }
 
     while (!selectedVault) {
-      const customPath = (await rl.question("Enter the absolute path to your Obsidian vault directory: ")).trim();
+      const customPath = (await ask("Enter the absolute path to your Obsidian vault directory: ")).trim();
       if (!customPath) continue;
       const resolved = resolve(customPath);
       if (!isAbsolute(resolved) || !existsSync(resolved)) {
@@ -416,7 +433,7 @@ export async function runTour(options = {}) {
       : detectDailyNotesPath(selectedVault);
 
     while (!selectedDaily) {
-      const dailyPrompt = (await rl.question(`Daily notes directory (default: ${detectedDaily || "Daily/"}): `)).trim();
+      const dailyPrompt = (await ask(`Daily notes directory (default: ${detectedDaily || "Daily/"}): `)).trim();
       const candidate = dailyPrompt || detectedDaily || "Daily/";
       try {
         selectedDaily = validateDailyPath(candidate, selectedVault);
@@ -437,7 +454,7 @@ export async function runTour(options = {}) {
 
     let hostChoice = 0;
     while (!hostChoice) {
-      const choiceStr = (await rl.question("Select an option [1-4] (default: 1): ")).trim();
+      const choiceStr = (await ask("Select an option [1-4] (default: 1): ")).trim();
       const choice = choiceStr === "" ? 1 : parseInt(choiceStr, 10);
       if (choice >= 1 && choice <= 4) {
         hostChoice = choice;
