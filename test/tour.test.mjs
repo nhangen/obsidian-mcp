@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -571,4 +571,38 @@ test("runTour uses a preselected vault without prompting for one", async (t) => 
   });
   assert.equal(outcome.vault, vaultPath);
   assert.doesNotMatch(io.text(), /Select a vault/);
+});
+
+test("runTour expands ~ and rejects relative custom vault paths", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-custom-")));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  await mkdir(join(fixture, "Vault"), { recursive: true });
+
+  const io = scriptedTour([["Enter the absolute path", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const outcome = await runTour({
+    input: io.input,
+    output: io.output,
+    knownVaults: [],
+    homeDir: fixture,
+    detectClaudeCode: () => false,
+  });
+  assert.equal(outcome.vault, join(fixture, "Vault"));
+  assert.match(io.text(), /must be absolute/);
+});
+
+test("runTour resolves a symlinked preselected vault to its real path", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-initial-link-")));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  await mkdir(join(fixture, "Real"), { recursive: true });
+  await symlink(join(fixture, "Real"), join(fixture, "Link"));
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const outcome = await runTour({
+    input: io.input,
+    output: io.output,
+    initialVault: join(fixture, "Link"),
+    knownVaults: [],
+    detectClaudeCode: () => false,
+  });
+  assert.equal(outcome.vault, join(fixture, "Real"));
 });

@@ -374,10 +374,14 @@ export async function runTour(options = {}) {
     print("Connect your Obsidian vault to Claude Code, Claude Desktop, and AI agents.");
     print();
 
-    let selectedVault = options.initialVault ? resolve(options.initialVault) : "";
-    if (selectedVault && (!existsSync(selectedVault) || !statSync(selectedVault).isDirectory())) {
-      print(`Provided initial vault is invalid: ${options.initialVault}`);
-      selectedVault = "";
+    const home = options.homeDir || homedir();
+    let selectedVault = "";
+    if (options.initialVault) {
+      try {
+        const initial = resolve(options.initialVault);
+        if (statSync(initial).isDirectory()) selectedVault = realpathSync(initial);
+      } catch {}
+      if (!selectedVault) print(`Provided initial vault is invalid: ${options.initialVault}`);
     }
 
     if (!selectedVault) {
@@ -408,8 +412,13 @@ export async function runTour(options = {}) {
     while (!selectedVault) {
       const customPath = (await ask("Enter the absolute path to your Obsidian vault directory: ")).trim();
       if (!customPath) continue;
-      const resolved = resolve(customPath);
-      if (!isAbsolute(resolved) || !existsSync(resolved)) {
+      const expanded = customPath === "~" || customPath.startsWith("~/") ? join(home, customPath.slice(1)) : customPath;
+      if (!isAbsolute(expanded)) {
+        print(`Vault path must be absolute (or start with ~/): ${customPath}`);
+        continue;
+      }
+      const resolved = resolve(expanded);
+      if (!existsSync(resolved)) {
         print(`Directory does not exist: ${customPath}`);
         continue;
       }
