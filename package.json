@@ -1,7 +1,6 @@
 {
-  "name": "@claude-obsidian/mcp-server",
+  "name": "@nhangen/obsidian-mcp",
   "version": "0.2.3",
-  "private": true,
   "license": "MIT",
   "description": "Obsidian MCP server over stdio and authenticated Streamable HTTP.",
   "type": "module",
@@ -14,8 +13,12 @@
     "LICENSE"
   ],
   "bin": {
+    "obsidian-mcp": "dist/stdio.mjs",
     "claude-obsidian-mcp": "dist/stdio.mjs",
     "claude-obsidian-mcp-http": "dist/http.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "node scripts/build.mjs",

@@ -247,6 +247,7 @@ test("packed tarball installs its locked runtime dependencies with npm ci", { ti
 test("packed package exposes a built stdio launcher that works outside the install directory", async (t) => {
   const packageManifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   assert.deepEqual(packageManifest.bin, {
+    "obsidian-mcp": "dist/stdio.mjs",
     "claude-obsidian-mcp": "dist/stdio.mjs",
     "claude-obsidian-mcp-http": "dist/http.mjs",
   });
@@ -268,11 +269,13 @@ test("packed package exposes a built stdio launcher that works outside the insta
   const tarball = join(fixture, (await readdir(fixture)).find((name) => name.endsWith(".tgz")));
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, tarball], { cwd: externalCwd });
 
-  const installedPackage = join(installRoot, "node_modules", "@claude-obsidian", "mcp-server");
+  const installedPackage = join(installRoot, "node_modules", "@nhangen", "obsidian-mcp");
   const launcher = join(installRoot, "node_modules", ".bin", "claude-obsidian-mcp");
+  const binLauncher = join(installRoot, "node_modules", ".bin", "obsidian-mcp");
   const httpLauncher = join(installRoot, "node_modules", ".bin", "claude-obsidian-mcp-http");
   const launcherStats = await stat(launcher);
   assert.ok((launcherStats.mode & 0o111) !== 0);
+  assert.ok(((await stat(binLauncher)).mode & 0o111) !== 0);
   assert.ok(((await stat(httpLauncher)).mode & 0o111) !== 0);
   await stat(join(installedPackage, "dist", "stdio.mjs"));
   await stat(join(installedPackage, "dist", "helpers", "lib", "resolve-config.sh"));
@@ -414,7 +417,7 @@ test("packed stdio and HTTP entrypoints serialize contended keeper writes", asyn
   const tarball = join(fixture, (await readdir(fixture)).find((name) => name.endsWith(".tgz")));
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", installRoot, tarball], { cwd: externalCwd });
 
-  const installedPackage = join(installRoot, "node_modules", "@claude-obsidian", "mcp-server");
+  const installedPackage = join(installRoot, "node_modules", "@nhangen", "obsidian-mcp");
   const launcher = join(installRoot, "node_modules", ".bin", "claude-obsidian-mcp");
   const httpLauncher = join(installRoot, "node_modules", ".bin", "claude-obsidian-mcp-http");
   const installedKeeper = join(installedPackage, "dist", "helpers", "keeper");

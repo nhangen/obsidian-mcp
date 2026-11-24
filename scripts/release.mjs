@@ -97,7 +97,7 @@ try {
     sourceCommit,
     releaseTag: releaseTagForRevision(revision, sourceManifest.version),
   });
-  const metadataName = `claude-obsidian-mcp-server-${packedManifest.version}.release.json`;
+  const metadataName = packItems[0].filename.replace(/\.tgz$/, ".release.json");
   await writeFile(join(outputRoot, metadataName), serializeReleaseMetadata(metadata));
 
   const files = (await readdir(outputRoot)).sort();
