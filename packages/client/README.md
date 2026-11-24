@@ -2,7 +2,7 @@
 
 Imported from the tracked public client at
 `nhangen/claude-obsidian-plugin@76df3151104e37f409589fcda7ff3da65cc8c0d8`.
-This copy pins the independently published server `mcp-v0.2.2`; it does not
+This copy pins the independently published server `mcp-v0.2.4`; it does not
 activate or replace any existing host integration. The upstream source and
 auth/session patch are retained; Express and Undici dependencies are patched,
 rebuilt and repinned with regenerated notices and provenance. The rebuild gate
@@ -75,7 +75,7 @@ requirement. Set `MCP_REPOSITORY_ROOTS` to the checkouts that
 `obsidian_commit_meta` may read.
 
 The bundle includes a commit-capture consumer. The default pinned release
-`mcp-v0.2.2` provides exact-target append and the exact/prefix hash guard, so an
+`mcp-v0.2.4` provides exact-target append and the exact/prefix hash guard, so an
 explicit invocation can pass the local capability gate. The consumer still requires
 the live server version and discovered schema to match before writing; the released
 contract alone does not change writer ownership.
@@ -222,7 +222,7 @@ The consumer remains default-unactivated. On an upgraded server, exact full hash
 skip and a strict short/full prefix relation blocks with `CONFLICT`; no arbitrary
 historical alias is treated as equivalent and the bundle performs no historical
 backfill. Old server releases and rollback to a pre-upgrade writer are unsupported
-for this migration. The default pin is `mcp-v0.2.2`, but
+for this migration. The default pin is `mcp-v0.2.4`, but
 `legacyHashInteroperability` remains `unproven` and capture remains disabled by
 default until the live canary and writer-ownership migration complete.
 

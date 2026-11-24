@@ -603,8 +603,9 @@ with tempfile.TemporaryDirectory() as directory:
 PY
 
 grep -Fq 'plugin-free' "$bundle/README.md" || fail "README does not state client boundary"
-grep -Fq "The default pin is \`mcp-v0.2.2\`" "$bundle/README.md" || fail "README does not name the pinned release"
-grep -Fq "\`mcp-v0.2.2\` provides exact-target append" "$bundle/README.md" || fail "README capability wording does not match the pinned release"
+pinned_release=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["pinnedServer"]["release"])' "$bundle/manifest.json")
+grep -Fq "The default pin is \`$pinned_release\`" "$bundle/README.md" || fail "README does not name the pinned release"
+grep -Fq "\`$pinned_release\` provides exact-target append" "$bundle/README.md" || fail "README capability wording does not match the pinned release"
 grep -Fq 'live server version and discovered schema to match' "$bundle/README.md" || fail "README does not preserve the live capability gate"
 ! grep -R -E '/Users/|100\.[0-9]+\.|obsidian-mcp-read-token' "$bundle" >/dev/null || fail "packed bundle contains a personal path, endpoint, or credential service"
 
