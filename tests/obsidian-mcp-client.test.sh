@@ -16,6 +16,23 @@ bundle="$tmp/packed-client"
 python3 "$PACK" --output "$bundle"
 python3 "$PACK" --output "$bundle"
 
+python3 - "$PACK" "$ROOT/src/stdio.mjs" "$ROOT/dist/stdio.mjs" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+spec = importlib.util.spec_from_file_location("pack", sys.argv[1])
+pack = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pack)
+try:
+    pack.bundled_server_bytes(pathlib.Path(sys.argv[2]))
+except ValueError as error:
+    assert "not a self-contained bundle" in str(error), error
+else:
+    raise AssertionError("pack accepted an unbundled server script")
+assert pack.bundled_server_bytes(pathlib.Path(sys.argv[3]))
+PY
+
 test -x "$bundle/bin/obsidian-mcp-read" || fail "read launcher missing"
 test -x "$bundle/bin/obsidian-mcp-write" || fail "write launcher missing"
 test -x "$bundle/bin/obsidian-mcp-server" || fail "server launcher missing"
