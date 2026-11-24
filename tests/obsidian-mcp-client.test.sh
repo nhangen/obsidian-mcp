@@ -778,6 +778,19 @@ with tempfile.TemporaryDirectory() as td:
     vault.mkdir()
     (vault / "note.md").write_text("# Test Note\ncontent\n")
 
+    repo = tpath / "repo"
+    repo.mkdir()
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+        "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=git_env)
+    (repo / "file.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fixture"], check=True, env=git_env)
+
     prefix = tpath / "client-install"
     install_proc = subprocess.run([
         sys.executable, str(bundle / "bin/obsidian-mcp-client-install"),
@@ -797,6 +810,7 @@ with tempfile.TemporaryDirectory() as td:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env={**os.environ, "MCP_REPOSITORY_ROOTS": str(tpath)},
     )
     try:
         init_req = json.dumps({
@@ -828,6 +842,25 @@ with tempfile.TemporaryDirectory() as td:
         tools = [t["name"] for t in tools_res["result"]["tools"]]
         assert "obsidian_find_notes" in tools, tools
         assert "obsidian_commit_meta" in tools, tools
+
+        meta_req = json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "obsidian_commit_meta", "arguments": {"repository": str(repo)}}}) + "\n"
+        proc.stdin.write(meta_req)
+        proc.stdin.flush()
+        meta_res = json.loads(proc.stdout.readline())
+        assert meta_res.get("id") == 3, meta_res
+        assert "error" not in meta_res, f"bundled commit-meta helper failed: {meta_res}"
+        assert meta_res["result"].get("isError") is False, meta_res
+
+        find_req = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "obsidian_find_notes", "arguments": {"query": "Test Note"}}}) + "\n"
+        proc.stdin.write(find_req)
+        proc.stdin.flush()
+        find_res = json.loads(proc.stdout.readline())
+        assert find_res.get("id") == 4, find_res
+        assert "error" not in find_res, f"bundled find_notes failed: {find_res}"
+        assert find_res["result"].get("isError") is False, find_res
+        assert "note.md" in json.dumps(find_res["result"]["structuredContent"]), find_res
 
         proc.stdin.close()
         proc.wait(timeout=5)
