@@ -8,8 +8,8 @@ needs filesystem access to the vault; remote clients do not.
 This initial extraction imports only the tracked `packages/mcp-server` tree from
 [`nhangen/claude-obsidian-plugin` at `76df3151104e37f409589fcda7ff3da65cc8c0d8`](https://github.com/nhangen/claude-obsidian-plugin/tree/76df3151104e37f409589fcda7ff3da65cc8c0d8/packages/mcp-server),
 with fresh repository history and the original MIT notice. It preserves the
-legacy package identity, launcher names, and protocol contract. Version `0.2.2`
-prunes build/VCS directories and non-markdown entries from vault scans (#59).
+legacy package identity, launcher names, and protocol contract. Version `0.2.3`
+adds `--vault`, `--daily-path`, and `--repo-root` arguments to the stdio server (#92).
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
