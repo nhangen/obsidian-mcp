@@ -39,7 +39,8 @@ import re
 import sys
 
 build = pathlib.Path(sys.argv[1]).read_text()
-listed = set(re.findall(r'"([^"]+)"', build[build.index("const helpers = ["):build.index("];")]))
+start = build.index("const helpers = [")
+listed = set(re.findall(r'"([^"]+)"', build[start:build.index("];", start)]))
 packed = {
     str(path.relative_to(sys.argv[2]))
     for path in pathlib.Path(sys.argv[2]).rglob("*") if path.is_file()
