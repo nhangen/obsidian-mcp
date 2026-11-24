@@ -9,6 +9,7 @@ import {
   configureClaudeCodeViaFile,
   configureClaudeDesktop,
   countVaultNotes,
+  detectClaudeCode,
   detectDailyNotesPath,
   findKnownVaults,
   runTour,
@@ -308,4 +309,25 @@ test("runTour completes interactive walkthrough with isolated config overrides",
   assert.ok(codeCfg.mcpServers.obsidian);
   const desktopCfg = JSON.parse(await readFile(claudeDesktopConfig, "utf8"));
   assert.ok(desktopCfg.mcpServers.obsidian);
+});
+
+test("detectClaudeCode skips the CLI on Windows so args never pass through cmd.exe", () => {
+  let spawned = false;
+  const spawnStub = () => {
+    spawned = true;
+    return { status: 0 };
+  };
+  assert.equal(detectClaudeCode({ platform: "win32", spawn: spawnStub }), false);
+  assert.equal(spawned, false);
+});
+
+test("detectClaudeCode spawns claude without a shell on POSIX", () => {
+  let seen;
+  const spawnStub = (cmd, args, opts) => {
+    seen = { cmd, args, opts };
+    return { status: 0 };
+  };
+  assert.equal(detectClaudeCode({ platform: "darwin", spawn: spawnStub }), true);
+  assert.equal(seen.cmd, "claude");
+  assert.notEqual(seen.opts.shell, true);
 });

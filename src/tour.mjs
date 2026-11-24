@@ -267,13 +267,16 @@ export async function configureClaudeDesktop(vaultPath, dailyPath = "Daily/", co
   return upsertJsonMcpServerConfig(configPath, serverEntry, options);
 }
 
-export function detectClaudeCode() {
+export function detectClaudeCode({ platform = process.platform, spawn = spawnSync } = {}) {
+  // npm installs claude.cmd on Windows, which spawnSync can only reach through
+  // cmd.exe, and cmd.exe re-splits unquoted paths such as C:\Program Files.
+  // The file writer is the safe path there.
+  if (platform === "win32") return false;
   try {
-    const res = spawnSync("claude", ["--version"], {
+    const res = spawn("claude", ["--version"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 2000,
-      shell: process.platform === "win32",
     });
     return res.status === 0;
   } catch {
@@ -307,7 +310,6 @@ export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/")
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
-      shell: process.platform === "win32",
     });
   } catch (err) {
     return { success: false, method: "cli", error: err.message, spawnFailure: true };
