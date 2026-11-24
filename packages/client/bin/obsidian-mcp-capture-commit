@@ -51,6 +51,22 @@ class CaptureError(Exception):
         self.envelope = envelope
 
 
+def version_at_least(actual, minimum):
+    """Return True if `actual` is semantically >= `minimum` (dotted numeric)."""
+    def parts(v):
+        nums = []
+        for seg in str(v).split(".")[:3]:
+            m = re.match(r"(\d+)", seg)
+            nums.append(int(m.group(1)) if m else 0)
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)
+    try:
+        return parts(str(actual)) >= parts(str(minimum))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def bounded_utf8(value, maximum, allow_empty=True):
     if not isinstance(value, str) or (not allow_empty and not value):
         return False
@@ -852,7 +868,7 @@ def invoke(bundle, expected_version, protocol, allowed_errors, arguments, target
         server_info = initialized.get("serverInfo")
         if (
             not isinstance(server_info, dict)
-            or server_info.get("version") != expected_version
+            or not version_at_least(server_info.get("version", ""), expected_version)
         ):
             raise CaptureError("SERVER_VERSION_MISMATCH")
         bridge.send({"jsonrpc": "2.0", "method": "notifications/initialized"})

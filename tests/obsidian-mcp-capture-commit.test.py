@@ -445,6 +445,10 @@ class CaptureCommitTest(unittest.TestCase):
         version = self.run_capture(self.event(), version="0.1.15")
         self.assert_error(version, "SERVER_VERSION_MISMATCH")
         self.assertEqual(self.call_records(), [])
+        self.started.unlink()
+        newer = self.run_capture(self.event(), version="0.3.0")
+        self.assertEqual(newer.returncode, 0, newer.stderr)
+        self.assertEqual(len(self.call_records()), 1)
 
     def test_mismatched_initialize_protocol_stops_before_initialized_notification(self):
         result = self.run_capture(self.event(), scenario="protocol-mismatch")
