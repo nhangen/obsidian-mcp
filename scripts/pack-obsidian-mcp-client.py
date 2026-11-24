@@ -22,6 +22,7 @@ FILES = (
     "manifest.json",
     "bin/obsidian-mcp-read",
     "bin/obsidian-mcp-write",
+    "bin/obsidian-mcp-server",
     "bin/obsidian-mcp-commit-event",
     "bin/obsidian-mcp-capture-commit",
     "bin/obsidian-mcp-client-install",
@@ -42,6 +43,7 @@ FILES = (
 EXECUTABLES = {
     "bin/obsidian-mcp-read",
     "bin/obsidian-mcp-write",
+    "bin/obsidian-mcp-server",
     "bin/obsidian-mcp-commit-event",
     "bin/obsidian-mcp-capture-commit",
     "bin/obsidian-mcp-client-install",
@@ -54,6 +56,9 @@ EXECUTABLES = {
     "vendor/shell-capture-parser/shell-capture-parser-darwin-arm64",
     "vendor/shell-capture-parser/shell-capture-parser-linux-amd64",
     "vendor/shell-capture-parser/shell-capture-parser-linux-arm64",
+    "server/stdio.mjs",
+    "server/helpers/keeper",
+    "server/helpers/commit-meta.sh",
 }
 HELPER_VENDOR = "vendor/shell-capture-parser"
 HELPER_SOURCE = ROOT / "helpers/shell-capture-parser"
@@ -283,6 +288,19 @@ def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     files["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     files["contract.json"] = contract_bytes
     files["LICENSE"] = regular_file_bytes(ROOT / "LICENSE", "project license input")
+    server_dist = ROOT / "dist/stdio.mjs"
+    files["server/stdio.mjs"] = regular_file_bytes(server_dist, "bundled server")
+    files["server/helpers/keeper"] = regular_file_bytes(
+        ROOT / "helpers/keeper", "server helper keeper"
+    )
+    files["server/helpers/commit-meta.sh"] = regular_file_bytes(
+        ROOT / "helpers/commit-meta.sh", "server helper commit-meta.sh"
+    )
+    lib_dir = ROOT / "helpers/lib"
+    for lib_file in sorted(lib_dir.glob("*.sh")):
+        files[f"server/helpers/lib/{lib_file.name}"] = regular_file_bytes(
+            lib_file, f"server helper lib {lib_file.name}"
+        )
     validate_helper_vendor(files)
     return files
 

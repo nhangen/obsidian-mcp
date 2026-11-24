@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+server_script="$script_dir/../server/stdio.mjs"
+
+if [[ ! -f "$server_script" ]]; then
+  if [[ -f "$script_dir/../../dist/stdio.mjs" ]]; then
+    server_script="$script_dir/../../dist/stdio.mjs"
+  else
+    echo "obsidian-mcp-server: server script not found: $server_script" >&2
+    exit 1
+  fi
+fi
+
+exec node "$server_script" "$@"

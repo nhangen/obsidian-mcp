@@ -31,10 +31,12 @@ function detectSourceCheckout() {
 }
 
 const isSourceCheckout = detectSourceCheckout();
+const adjacentHelperRoot = join(dirname(fileURLToPath(import.meta.url)), "helpers");
 const localHelperRoot = join(packageRoot, "helpers");
 const packagedHelperRoot = join(packageRoot, "dist", "helpers");
 
 function helperPath(...segments) {
+  if (existsSync(join(adjacentHelperRoot, "keeper"))) return join(adjacentHelperRoot, ...segments);
   if (existsSync(join(localHelperRoot, "keeper"))) return join(localHelperRoot, ...segments);
   if (isSourceCheckout) return join(sourceRepositoryRoot, "scripts", ...segments);
   return join(packagedHelperRoot, ...segments);

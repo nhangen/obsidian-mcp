@@ -18,9 +18,14 @@ python3 "$PACK" --output "$bundle"
 
 test -x "$bundle/bin/obsidian-mcp-read" || fail "read launcher missing"
 test -x "$bundle/bin/obsidian-mcp-write" || fail "write launcher missing"
+test -x "$bundle/bin/obsidian-mcp-server" || fail "server launcher missing"
 test -x "$bundle/bin/obsidian-mcp-commit-event" || fail "commit-event producer missing"
 test -x "$bundle/bin/obsidian-mcp-capture-commit" || fail "commit capture consumer missing"
 test -x "$bundle/bin/obsidian-mcp-client-install" || fail "client lifecycle installer missing"
+test -x "$bundle/server/stdio.mjs" || fail "bundled server script missing"
+test -x "$bundle/server/helpers/keeper" || fail "server helper keeper missing"
+test -x "$bundle/server/helpers/commit-meta.sh" || fail "server helper commit-meta.sh missing"
+test -f "$bundle/server/helpers/lib/resolve-config.sh" || fail "server helper resolve-config.sh missing"
 test -f "$bundle/manifest.json" || fail "manifest missing"
 test -f "$bundle/contract.json" || fail "pinned contract missing"
 test -f "$bundle/release.json" || fail "release metadata missing"
@@ -752,6 +757,84 @@ with tempfile.TemporaryDirectory() as td:
     assert diag_proc.returncode == 0, f"diag request failed: {diag_proc.stderr}"
     diag_data = json.loads(diag_proc.stdout)
     assert diag_data.get("status") == "request_unavailable"
+PY
+
+# 4. Install bundle and verify bundled stdio server runs and discovers tools
+python3 - "$bundle" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+bundle = pathlib.Path(sys.argv[1]).resolve()
+digest = hashlib.sha256((bundle / "release.json").read_bytes()).hexdigest()
+
+with tempfile.TemporaryDirectory() as td:
+    tpath = pathlib.Path(td).resolve()
+    vault = tpath / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Test Note\ncontent\n")
+
+    prefix = tpath / "client-install"
+    install_proc = subprocess.run([
+        sys.executable, str(bundle / "bin/obsidian-mcp-client-install"),
+        "--prefix", str(prefix),
+        "--bundle", str(bundle),
+        "--release-sha256", digest
+    ], capture_output=True, text=True)
+    assert install_proc.returncode == 0, f"install failed: {install_proc.stderr}"
+
+    server_bin = prefix / "current/bin/obsidian-mcp-server"
+    assert server_bin.is_file(), f"missing server launcher: {server_bin}"
+    assert os.access(server_bin, os.X_OK), f"server launcher not executable: {server_bin}"
+
+    proc = subprocess.Popen(
+        [str(server_bin), "--vault", str(vault)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        init_req = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0"},
+            },
+        }) + "\n"
+        proc.stdin.write(init_req)
+        proc.stdin.flush()
+        init_res = json.loads(proc.stdout.readline())
+        assert init_res.get("id") == 1, init_res
+        assert init_res["result"]["protocolVersion"] == "2025-11-25"
+        assert init_res["result"]["serverInfo"]["name"] == "claude-obsidian-mcp"
+
+        notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        proc.stdin.write(notif)
+        proc.stdin.flush()
+
+        tools_req = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n"
+        proc.stdin.write(tools_req)
+        proc.stdin.flush()
+        tools_res = json.loads(proc.stdout.readline())
+        assert tools_res.get("id") == 2, tools_res
+        tools = [t["name"] for t in tools_res["result"]["tools"]]
+        assert "obsidian_find_notes" in tools, tools
+        assert "obsidian_commit_meta" in tools, tools
+
+        proc.stdin.close()
+        proc.wait(timeout=5)
+        assert proc.returncode == 0, f"server exited with {proc.returncode}"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
 PY
 
 printf 'PASS obsidian MCP client bundle\n'
