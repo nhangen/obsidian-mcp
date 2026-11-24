@@ -605,6 +605,7 @@ PY
 grep -Fq 'plugin-free' "$bundle/README.md" || fail "README does not state client boundary"
 pinned_release=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["pinnedServer"]["release"])' "$bundle/manifest.json")
 grep -Fq "The default pin is \`$pinned_release\`" "$bundle/README.md" || fail "README does not name the pinned release"
+grep -Fq "pins the independently published server \`$pinned_release\`" "$bundle/README.md" || fail "README introduction does not name the pinned release"
 grep -Fq "\`$pinned_release\` provides exact-target append" "$bundle/README.md" || fail "README capability wording does not match the pinned release"
 grep -Fq 'live server version and discovered schema to match' "$bundle/README.md" || fail "README does not preserve the live capability gate"
 ! grep -R -E '/Users/|100\.[0-9]+\.|obsidian-mcp-read-token' "$bundle" >/dev/null || fail "packed bundle contains a personal path, endpoint, or credential service"
