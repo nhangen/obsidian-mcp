@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = Path(os.environ["OBSIDIAN_MCP_CAPTURE_TEST_ROOT"])
 DEFAULT_BUNDLE = TEST_ROOT / "default-client"
+PINNED_VERSION = json.loads((DEFAULT_BUNDLE / "manifest.json").read_text())["pinnedServer"]["release"][5:]
 IDENTITY = {
     "GIT_AUTHOR_NAME": "Test Author",
     "GIT_AUTHOR_EMAIL": "author@example.invalid",
@@ -46,7 +47,7 @@ for line in sys.stdin:
         handle.write(request.get("method", "") + "\n")
     if request.get("method") == "initialize":
         Path(os.environ["FAKE_INITIALIZE_PROTOCOL"]).write_text(request["params"]["protocolVersion"])
-        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ.get("FAKE_VERSION", "0.2.2")}}
+        result = {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"claude-obsidian-mcp","version":os.environ.get("FAKE_VERSION", "0.2.4")}}
         if scenario == "protocol-mismatch":
             result["protocolVersion"] = "2026-07-28"
         elif scenario == "protocol-missing":
@@ -239,8 +240,7 @@ class CaptureCommitTest(unittest.TestCase):
             FAKE_BRIDGE_PID=str(self.bridge_pid),
             FAKE_SECRET=secret,
         )
-        if version is not None:
-            env["FAKE_VERSION"] = version
+        env["FAKE_VERSION"] = version if version is not None else PINNED_VERSION
         if bridge_timeout is not None:
             env["OBSIDIAN_MCP_CAPTURE_BRIDGE_TIMEOUT_SECONDS"] = bridge_timeout
         input_text = (
