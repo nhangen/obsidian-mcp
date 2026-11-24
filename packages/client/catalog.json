@@ -5,7 +5,7 @@
     "commit": "1da2ce1441c6603b15261f80254ded24f67a4df6",
     "path": "contract.json",
     "contractVersion": "0.1.3",
-    "sha256": "bc2000589e90ac8306fdc8516ab3a5bfb7e1657eb3d9197548103ab74d6fe324"
+    "sha256": "fd8fb25009dc830587ba6843dbbe5f6b68224d4d0c5430c7c9326e0cc77dcfa9"
   },
   "release": {
     "tag": "mcp-v0.2.2",
