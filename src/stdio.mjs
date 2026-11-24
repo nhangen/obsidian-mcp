@@ -1464,6 +1464,7 @@ export function shouldLaunchTour({ cli = {}, env = process.env, isTTY = false } 
   if (cli.tour) return true;
   if (cli.serve) return false;
   if (cli.vault) return false;
+  if (cli.dailyPath || cli.repoRoots?.length) return false;
   if (env.MCP_SERVE_STDIO) return false;
   if (env.OBSIDIAN_LOCAL_MD) return false;
   return Boolean(isTTY);

@@ -624,6 +624,10 @@ test("shouldLaunchTour evaluates interactive seam conditions correctly", () => {
   // Passing --serve or --stdio suppresses tour
   assert.equal(shouldLaunchTour({ cli: { serve: true }, env: {}, isTTY: true }), false);
 
+  assert.equal(shouldLaunchTour({ cli: { repoRoots: ["/repo"] }, env: {}, isTTY: true }), false);
+  assert.equal(shouldLaunchTour({ cli: { dailyPath: "Journal/", repoRoots: [] }, env: {}, isTTY: true }), false);
+  assert.equal(shouldLaunchTour({ cli: { repoRoots: [] }, env: {}, isTTY: true }), true);
+
   // Setting MCP_SERVE_STDIO suppresses tour
   assert.equal(shouldLaunchTour({ cli: {}, env: { MCP_SERVE_STDIO: "1" }, isTTY: true }), false);
 
