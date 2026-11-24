@@ -76,8 +76,12 @@ test("pins tool surface including write tools", () => {
     idempotentHint: false,
     openWorldHint: false,
   });
-  assert.deepEqual(contract.tools.obsidian_keeper_save.inputSchema.required, ["title", "body", "resolved", "folder_hint"]);
+  assert.deepEqual(contract.tools.obsidian_keeper_save.inputSchema.required, ["title", "body", "resolved"]);
   assert.deepEqual(contract.tools.obsidian_keeper_save.inputSchema.properties.resolved, { type: "boolean", const: true });
+  assert.deepEqual(
+    contract.tools.obsidian_keeper_save.inputSchema.properties.target,
+    { ...contract.tools.obsidian_keeper_save.inputSchema.properties.folder_hint, description: "Alias for folder_hint: the caller-resolved vault-relative target folder." },
+  );
   assert.ok(!contract.tools.obsidian_keeper_save.inputSchema.required.includes("idempotency_key"));
   assert.ok(!contract.tools.obsidian_daily_append.inputSchema.required.includes("idempotency_key"));
   assert.match(contract.tools.obsidian_keeper_save.idempotency, /required for Streamable HTTP writes/);

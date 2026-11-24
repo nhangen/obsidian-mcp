@@ -285,9 +285,9 @@ error contract instead of leaking SDK validation text.
 ## Write contract
 
 `obsidian_keeper_save` accepts `title`, `body`, required `resolved: true` and
-`folder_hint`, plus optional `type`,
-`links`, and `session_link_date` (links the note from that day's daily note; needs a valid `daily_path`), plus optional `idempotency_key` and `request_id`. `folder_hint` is
-the caller-resolved vault-relative target folder; this MCP adapter does not run
+`folder_hint` (the caller-resolved vault-relative target folder; `target` is
+accepted as an alias for it), plus optional `type`,
+`links`, and `session_link_date` (links the note from that day's daily note; needs a valid `daily_path`), plus optional `idempotency_key` and `request_id`. This MCP adapter does not run
 librarian routing or deduplication. Streamable HTTP
 writes require `idempotency_key`; local stdio calls retain keyless compatibility.
 `obsidian_daily_append` accepts `content`, optional `section`, `date` or

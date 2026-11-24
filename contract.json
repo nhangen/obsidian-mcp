@@ -154,12 +154,13 @@
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "body", "resolved", "folder_hint"],
+        "required": ["title", "body", "resolved"],
         "properties": {
           "title": { "type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^\\/\\\\\\u0000-\\u001F\\u007F]*$" },
           "body": { "type": "string", "minLength": 1, "maxLength": 65536 },
           "resolved": { "type": "boolean", "const": true },
           "folder_hint": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:\\/(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+)*$" },
+          "target": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:\\/(?!\\.{1,2}(?:\\/|$))[^\\\\/\\u0000-\\u001F\\u007F]+)*$", "description": "Alias for folder_hint: the caller-resolved vault-relative target folder." },
           "type": { "type": "string", "maxLength": 100, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
           "links": { "type": "array", "items": { "type": "string", "maxLength": 2048, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" }, "maxItems": 20 },
           "session_link_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
