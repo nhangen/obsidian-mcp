@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -605,4 +605,19 @@ test("runTour resolves a symlinked preselected vault to its real path", async (t
     detectClaudeCode: () => false,
   });
   assert.equal(outcome.vault, join(fixture, "Real"));
+});
+
+test("upsertJsonMcpServerConfig writes through a symlinked config instead of replacing the link", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-symlink-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const target = join(fixture, "dotfiles-claude.json");
+  const link = join(fixture, ".claude.json");
+  await writeFile(target, JSON.stringify({ keep: true }), { mode: 0o600 });
+  await symlink(target, link);
+
+  await upsertJsonMcpServerConfig(link, { command: "node", args: ["/x"] }, { overwrite: true });
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  const written = JSON.parse(await readFile(target, "utf8"));
+  assert.equal(written.keep, true);
+  assert.deepEqual(written.mcpServers.obsidian, { command: "node", args: ["/x"] });
 });

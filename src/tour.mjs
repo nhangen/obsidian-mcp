@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import * as readline from "node:readline/promises";
@@ -146,7 +146,13 @@ export function resolveServerLauncher(currentFile = fileURLToPath(import.meta.ur
   return npx;
 }
 
-export async function upsertJsonMcpServerConfig(configPath, serverEntry, options = {}) {
+export async function upsertJsonMcpServerConfig(requestedPath, serverEntry, options = {}) {
+  // rename() would replace a symlink (e.g. into a dotfiles repo) with a plain
+  // file, so write to the file the link points at.
+  let configPath = requestedPath;
+  try {
+    configPath = await realpath(requestedPath);
+  } catch {}
   let config = {};
   let content;
   let originalMode = 0o600;
@@ -193,7 +199,7 @@ export async function upsertJsonMcpServerConfig(configPath, serverEntry, options
   if (existed && (!options.overwrite || JSON.stringify(previous) === JSON.stringify(serverEntry))) {
     return {
       success: true,
-      configPath,
+      configPath: requestedPath,
       existed: true,
       updated: false,
     };
@@ -231,7 +237,7 @@ export async function upsertJsonMcpServerConfig(configPath, serverEntry, options
 
   return {
     success: true,
-    configPath,
+    configPath: requestedPath,
     existed,
     updated: true,
     replacedBackupPath,
