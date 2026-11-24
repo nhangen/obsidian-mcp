@@ -8,8 +8,8 @@ needs filesystem access to the vault; remote clients do not.
 This initial extraction imports only the tracked `packages/mcp-server` tree from
 [`nhangen/claude-obsidian-plugin` at `76df3151104e37f409589fcda7ff3da65cc8c0d8`](https://github.com/nhangen/claude-obsidian-plugin/tree/76df3151104e37f409589fcda7ff3da65cc8c0d8/packages/mcp-server),
 with fresh repository history and the original MIT notice. It preserves the
-legacy package identity, launcher names, and protocol contract. Version `0.2.2`
-prunes build/VCS directories and non-markdown entries from vault scans (#59).
+legacy package identity, launcher names, and protocol contract. Version `0.2.3`
+adds `--vault`, `--daily-path`, and `--repo-root` arguments to the stdio server (#92).
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
@@ -51,7 +51,7 @@ it is not a required extra installation for the intended plugin experience.
 
 ## Shared runtime for integrations
 
-The standalone server release is [mcp-v0.2.2](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.2).
+The standalone server release is [mcp-v0.2.3](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.3).
 The public portable client source is in [`packages/client`](packages/client/README.md),
 including the pinned bridge, lifecycle installer, optional isolated Codex capture,
 attached user-wide Codex capture state, and an explicit Claude plugin attachment
