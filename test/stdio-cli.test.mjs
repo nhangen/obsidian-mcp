@@ -631,6 +631,30 @@ test("shouldLaunchTour evaluates interactive seam conditions correctly", () => {
   assert.equal(shouldLaunchTour({ cli: {}, env: { OBSIDIAN_LOCAL_MD: "/path" }, isTTY: true }), false);
 });
 
+test("a piped spawn with no arguments never writes the tour banner to stdout", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-cli-noargs-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const env = { ...process.env, HOME: fixture, XDG_CONFIG_HOME: fixture, APPDATA: fixture };
+  delete env.OBSIDIAN_LOCAL_MD;
+  delete env.MCP_SERVE_STDIO;
+  const child = spawn(process.execPath, [entrypoint], { cwd: fixture, env, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.resume();
+  setTimeout(() => child.stdin.end(), 500);
+  await Promise.race([
+    once(child, "close"),
+    new Promise((_, reject) => setTimeout(() => {
+      child.kill();
+      reject(new Error("timed out waiting for no-argument server to close"));
+    }, 5000)),
+  ]);
+  assert.doesNotMatch(stdout, /Obsidian MCP Server Setup|Select a vault|Enter the absolute path/);
+});
+
 test("server starts up and serves tools when started with --serve", async (t) => {
   const vault = await mkdtemp(join(tmpdir(), "mcp-cli-serve-"));
 

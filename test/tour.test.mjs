@@ -292,6 +292,7 @@ test("runTour completes interactive walkthrough with isolated config overrides",
     claudeCodeConfigPath: claudeCodeConfig,
     claudeDesktopConfigPath: claudeDesktopConfig,
     forceFileConfig: true,
+    detectClaudeCode: () => false,
     version: "0.2.3",
   });
 
@@ -308,10 +309,10 @@ test("runTour completes interactive walkthrough with isolated config overrides",
   assert.match(outputText, /Setup complete!/);
 
   // Both isolated config files were created
-  const codeCfg = JSON.parse(await readFile(claudeCodeConfig, "utf8"));
-  assert.ok(codeCfg.mcpServers.obsidian);
-  const desktopCfg = JSON.parse(await readFile(claudeDesktopConfig, "utf8"));
-  assert.ok(desktopCfg.mcpServers.obsidian);
+  for (const configPath of [claudeCodeConfig, claudeDesktopConfig]) {
+    const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
+    assert.deepEqual(args.slice(-4), ["--vault", vaultPath, "--daily-path", "Daily/"]);
+  }
 });
 
 test("detectClaudeCode skips the CLI on Windows so args never pass through cmd.exe", () => {
@@ -467,4 +468,107 @@ test("runTour reports a partial host failure as incomplete", async (t) => {
   assert.match(io.text(), /Setup incomplete: 1 of 2/);
   assert.ok(JSON.parse(await readFile(claudeDesktopConfigPath, "utf8")).mcpServers.obsidian);
   assert.equal(await readFile(claudeCodeConfigPath, "utf8"), "{ truncated");
+});
+
+test("runTour does not write the config file when claude mcp add rejects", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-cli-reject-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+  const claudeCodeConfigPath = join(fixture, "claude.json");
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "1"]]);
+  await assert.rejects(
+    runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      detectClaudeCode: () => true,
+      configureClaudeCodeViaCli: async () => ({ success: false, method: "cli", error: "server obsidian already exists", spawnFailure: false }),
+    }),
+    /1 of 1/,
+  );
+  assert.equal(existsSync(claudeCodeConfigPath), false);
+  assert.match(io.text(), /already exists/);
+});
+
+test("runTour falls back to the config file when the claude CLI cannot be spawned", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-cli-missing-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+  const claudeCodeConfigPath = join(fixture, "claude.json");
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "1"]]);
+  const outcome = await runTour({
+    input: io.input,
+    output: io.output,
+    knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+    claudeCodeConfigPath,
+    detectClaudeCode: () => true,
+    configureClaudeCodeViaCli: async () => ({ success: false, method: "cli", error: "ENOENT", spawnFailure: true }),
+  });
+  assert.deepEqual(outcome.results, [{ host: "Claude Code", success: true, method: "file" }]);
+  assert.ok(JSON.parse(await readFile(claudeCodeConfigPath, "utf8")).mcpServers.obsidian);
+});
+
+test("runTour re-prompts until the daily notes path stays inside the vault", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-daily-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ["/Journal", "../outside", "Journal"]], ["Select an option", "4"]]);
+  const outcome = await runTour({
+    input: io.input,
+    output: io.output,
+    knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+    detectClaudeCode: () => false,
+  });
+  assert.equal(outcome.dailyPath, "Journal/");
+  assert.equal(io.text().match(/Invalid daily notes path/g).length, 2);
+});
+
+test("detectDailyNotesPath ignores a daily-notes folder that escapes the vault", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-daily-escape-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  await mkdir(join(fixture, ".obsidian"), { recursive: true });
+  await writeFile(join(fixture, ".obsidian", "daily-notes.json"), JSON.stringify({ folder: "../outside" }));
+  assert.equal(detectDailyNotesPath(fixture), "Daily/");
+});
+
+test("upsertJsonMcpServerConfig rejects non-object configs and mcpServers without touching the file", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-shape-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const cases = [
+    ["null", /must contain a JSON object/],
+    ["[]", /must contain a JSON object/],
+    [JSON.stringify({ mcpServers: "x" }), /mcpServers in .* must be an object/],
+    [JSON.stringify({ mcpServers: null }), /mcpServers in .* must be an object/],
+  ];
+  for (const [index, [content, expected]] of cases.entries()) {
+    const configPath = join(fixture, `config-${index}.json`);
+    await writeFile(configPath, content, "utf8");
+    await assert.rejects(upsertJsonMcpServerConfig(configPath, { command: "node", args: [] }, { overwrite: true }), expected);
+    assert.equal(await readFile(configPath, "utf8"), content);
+  }
+});
+
+test("runTour uses a preselected vault without prompting for one", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-initial-")));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const outcome = await runTour({
+    input: io.input,
+    output: io.output,
+    initialVault: vaultPath,
+    knownVaults: [{ id: "1", path: join(fixture, "Other"), open: true, ts: 0 }],
+    detectClaudeCode: () => false,
+  });
+  assert.equal(outcome.vault, vaultPath);
+  assert.doesNotMatch(io.text(), /Select a vault/);
 });
