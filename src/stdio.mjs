@@ -155,15 +155,18 @@ function isContained(root, candidate) {
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
+let activeVaultPath = null;
+let activeDailyPath = null;
+
 function loadConfiguration() {
   const configPath = resolveConfigPath();
   const config = readFileSync(configPath, "utf8");
-  const vaultPath = frontmatterValue(config, "vault_path");
+  const vaultPath = activeVaultPath || frontmatterValue(config, "vault_path");
   if (!vaultPath) throw new Error("vault_path is missing from the Obsidian configuration");
   if (!isAbsolute(vaultPath)) throw new Error("vault_path must be an absolute path");
   const resolvedVault = realpathSync(resolve(vaultPath));
   if (!statSync(resolvedVault).isDirectory()) throw new Error("configured vault_path is not a directory");
-  const configuredDailyPath = frontmatterValue(config, "daily_path");
+  const configuredDailyPath = activeDailyPath || frontmatterValue(config, "daily_path");
   let dailyPath = "";
   let dailyPathError = "";
   if (!configuredDailyPath) {
@@ -1376,7 +1379,193 @@ function stdioScopes() {
   return scopes;
 }
 
-export function startStdio() {
+export const EX_USAGE = 64;
+
+export function parseCliArgs(argv = process.argv.slice(2)) {
+  for (const arg of argv) {
+    if (arg === "-h" || arg === "--help") {
+      return { help: true };
+    }
+  }
+
+  let vault;
+  let dailyPath;
+  const repoRoots = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-v" || arg === "--vault") {
+      i++;
+      if (i >= argv.length || argv[i].startsWith("-")) {
+        throw new Error("missing required argument for --vault");
+      }
+      vault = argv[i];
+    } else if (arg.startsWith("--vault=") || arg.startsWith("-v=")) {
+      const eq = arg.indexOf("=");
+      vault = arg.slice(eq + 1);
+      if (!vault) throw new Error("missing required argument for --vault");
+    } else if (arg === "--daily-path") {
+      i++;
+      if (i >= argv.length || argv[i].startsWith("-")) {
+        throw new Error("missing required argument for --daily-path");
+      }
+      dailyPath = argv[i];
+    } else if (arg.startsWith("--daily-path=")) {
+      dailyPath = arg.slice("--daily-path=".length);
+      if (!dailyPath) throw new Error("missing required argument for --daily-path");
+    } else if (arg === "--repo-root") {
+      i++;
+      if (i >= argv.length || argv[i].startsWith("-")) {
+        throw new Error("missing required argument for --repo-root");
+      }
+      repoRoots.push(argv[i]);
+    } else if (arg.startsWith("--repo-root=")) {
+      const val = arg.slice("--repo-root=".length);
+      if (!val) throw new Error("missing required argument for --repo-root");
+      repoRoots.push(val);
+    } else {
+      throw new Error(`unrecognized argument: ${arg}`);
+    }
+  }
+
+  return { help: false, vault, dailyPath, repoRoots };
+}
+
+let syntheticConfigDir = null;
+let createdSyntheticConfig = false;
+
+export function cleanupSyntheticConfig() {
+  if (syntheticConfigDir) {
+    const dir = syntheticConfigDir;
+    syntheticConfigDir = null;
+    spawnSync("bash", ["-c", 'find "$1" -depth -delete 2>/dev/null || true', "_", dir], { timeout: 2_000 });
+  }
+  if (createdSyntheticConfig) {
+    delete process.env.OBSIDIAN_LOCAL_MD;
+    createdSyntheticConfig = false;
+  }
+  activeVaultPath = null;
+  activeDailyPath = null;
+}
+
+function setupSyntheticConfig(vault, dailyPath) {
+  if (syntheticConfigDir) return;
+  const script = `
+    set -euo pipefail
+    v="$1"
+    d="$2"
+    dir=$(mktemp -d "\${TMPDIR:-/tmp}/obsidian-mcp-XXXXXX")
+    chmod 700 "$dir"
+    cfg="$dir/obsidian.local.md"
+    printf -- '---\\nvault_path: %s\\ndaily_path: %s\\n---\\n' "$v" "$d" > "$cfg"
+    chmod 600 "$cfg"
+    printf '%s' "$dir"
+  `;
+  const result = spawnSync("bash", ["-c", script, "_", vault, dailyPath], {
+    encoding: "utf8",
+    timeout: 2_000,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error("Failed to create synthetic configuration");
+  syntheticConfigDir = result.stdout.trim();
+  process.env.OBSIDIAN_LOCAL_MD = join(syntheticConfigDir, "obsidian.local.md");
+  createdSyntheticConfig = true;
+}
+
+export function startStdio(argv = process.argv.slice(2)) {
+  let cli;
+  try {
+    cli = parseCliArgs(argv);
+  } catch (error) {
+    stderr(error.message);
+    process.exit(EX_USAGE);
+  }
+
+  if (cli.help) {
+    process.stdout.write(
+      "Usage: claude-obsidian-mcp [options]\n\n" +
+      "Obsidian MCP server over stdio.\n\n" +
+      "Options:\n" +
+      "  -v, --vault <path>       Absolute path to the Obsidian vault directory\n" +
+      "      --daily-path <path>  Vault-relative path for daily notes (default: Daily/)\n" +
+      "      --repo-root <path>   Allowed repository root for commit metadata (repeatable)\n" +
+      "  -h, --help               Show this help message\n"
+    );
+    process.exit(0);
+  }
+
+  let resolvedVault;
+  if (cli.vault !== undefined) {
+    if (!isAbsolute(cli.vault)) {
+      stderr(`--vault must be an absolute path: ${cli.vault}`);
+      process.exit(EX_USAGE);
+    }
+    try {
+      resolvedVault = realpathSync(resolve(cli.vault));
+    } catch {
+      stderr(`--vault path does not exist: ${cli.vault}`);
+      process.exit(EX_USAGE);
+    }
+    if (!statSync(resolvedVault).isDirectory()) {
+      stderr(`--vault path is not a directory: ${cli.vault}`);
+      process.exit(EX_USAGE);
+    }
+    activeVaultPath = resolvedVault;
+  }
+
+  let effectiveDailyPath = "Daily/";
+  if (cli.dailyPath !== undefined) {
+    if (isAbsolute(cli.dailyPath)
+      || cli.dailyPath.split(/[\\/]/).includes("..")
+      || (resolvedVault && !isContained(resolvedVault, resolve(resolvedVault, cli.dailyPath)))) {
+      stderr(`--daily-path must remain within the configured vault: ${cli.dailyPath}`);
+      process.exit(EX_USAGE);
+    }
+    if (/[\r\n\t]/.test(cli.dailyPath)) {
+      stderr(`--daily-path contains invalid characters: ${cli.dailyPath}`);
+      process.exit(EX_USAGE);
+    }
+    const normalizedDaily = cli.dailyPath.replace(/^\/+|\/+$/g, "");
+    if (!normalizedDaily) {
+      stderr(`--daily-path must identify a directory within the configured vault: ${cli.dailyPath}`);
+      process.exit(EX_USAGE);
+    }
+    effectiveDailyPath = `${normalizedDaily}/`;
+    activeDailyPath = effectiveDailyPath;
+  }
+
+  if (cli.repoRoots.length > 0) {
+    const canonicalRepoRoots = [];
+    for (const entry of cli.repoRoots) {
+      const parts = entry.split(delimiter).filter(Boolean);
+      for (const part of parts) {
+        if (!isAbsolute(part)) {
+          stderr(`--repo-root must be an absolute path: ${part}`);
+          process.exit(EX_USAGE);
+        }
+        let canonical;
+        try {
+          canonical = realpathSync(resolve(part));
+        } catch {
+          stderr(`--repo-root path does not exist: ${part}`);
+          process.exit(EX_USAGE);
+        }
+        if (!statSync(canonical).isDirectory()) {
+          stderr(`--repo-root path is not a directory: ${part}`);
+          process.exit(EX_USAGE);
+        }
+        canonicalRepoRoots.push(canonical);
+      }
+    }
+    if (canonicalRepoRoots.length > 0) {
+      process.env.MCP_REPOSITORY_ROOTS = canonicalRepoRoots.join(delimiter);
+    }
+  }
+
+  if (resolvedVault && (!process.env.OBSIDIAN_LOCAL_MD || !process.env.OBSIDIAN_LOCAL_MD.trim())) {
+    setupSyntheticConfig(resolvedVault, effectiveDailyPath);
+  }
+
   const handle = serveStdio(() => createServer({ scopes: stdioScopes() }), { onerror: (error) => stderr(error instanceof Error ? error.message : String(error)) });
   let shuttingDown = false;
   async function shutdown(exit = false) {
@@ -1384,6 +1573,7 @@ export function startStdio() {
     shuttingDown = true;
     await closeActiveChildren();
     await handle.close();
+    cleanupSyntheticConfig();
     if (exit) process.exit(0);
   }
 
@@ -1391,6 +1581,7 @@ export function startStdio() {
     process.once(signal, () => void shutdown(true));
   }
   process.stdin.once("end", () => void shutdown(false));
+  process.on("exit", () => cleanupSyntheticConfig());
 }
 
 if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) startStdio();
