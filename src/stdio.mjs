@@ -1521,7 +1521,7 @@ export function startStdio(argv = process.argv.slice(2)) {
 
   if (cli.help) {
     process.stdout.write(
-      "Usage: claude-obsidian-mcp [options]\n\n" +
+      "Usage: obsidian-mcp [options]\n\n" +
       "Obsidian MCP server over stdio and interactive setup guide.\n\n" +
       "Options:\n" +
       "  -v, --vault <path>       Absolute path to the Obsidian vault directory\n" +

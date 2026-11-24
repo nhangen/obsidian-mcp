@@ -148,14 +148,14 @@ test("parseCliArgs unit tests", () => {
 test("shows usage and exits 0 on --help and -h", async () => {
   const helpLong = await runCliProcess(["--help"]);
   assert.equal(helpLong.code, 0);
-  assert.match(helpLong.stdout, /Usage: claude-obsidian-mcp/);
+  assert.match(helpLong.stdout, /Usage: obsidian-mcp \[options\]/);
   assert.match(helpLong.stdout, /--vault <path>/);
   assert.match(helpLong.stdout, /--daily-path <path>/);
   assert.match(helpLong.stdout, /--repo-root <path>/);
 
   const helpShort = await runCliProcess(["-h"]);
   assert.equal(helpShort.code, 0);
-  assert.match(helpShort.stdout, /Usage: claude-obsidian-mcp/);
+  assert.match(helpShort.stdout, /Usage: obsidian-mcp \[options\]/);
 });
 
 test("validates rejection of non-existent, relative, or file --vault paths with EX_USAGE (64)", async () => {
