@@ -51,7 +51,7 @@ it is not a required extra installation for the intended plugin experience.
 
 ## Shared runtime for integrations
 
-The standalone server release is [mcp-v0.2.2](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.2).
+The standalone server release is [mcp-v0.2.4](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.4).
 The public portable client source is in [`packages/client`](packages/client/README.md),
 including the pinned bridge, lifecycle installer, optional isolated Codex capture,
 attached user-wide Codex capture state, and an explicit Claude plugin attachment
