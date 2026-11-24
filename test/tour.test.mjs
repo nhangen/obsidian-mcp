@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -371,4 +371,29 @@ test("resolveServerLauncher pins the running version for npx caches and the fall
   const nowhere = resolveServerLauncher("/nonexistent/pkg/dist/stdio.mjs");
   assert.equal(nowhere.command, "npx");
   assert.deepEqual(nowhere.argsPrefix, pinned);
+});
+
+test("upsertJsonMcpServerConfig backs up a hand-tuned obsidian entry before replacing it", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-replace-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const configPath = join(fixture, "config.json");
+  const tuned = { command: "node", args: ["/old/stdio.mjs"], env: { TOKEN: "keep-me" } };
+  await writeFile(configPath, JSON.stringify({ mcpServers: { obsidian: tuned } }), { mode: 0o600 });
+  await writeFile(`${configPath}.bak`, "{}", { mode: 0o600 });
+
+  const entry = { command: "node", args: ["/new/stdio.mjs"] };
+  const res = await upsertJsonMcpServerConfig(configPath, entry, { overwrite: true });
+  assert.equal(res.existed, true);
+  assert.equal(res.updated, true);
+  assert.ok(res.replacedBackupPath, "a replaced entry needs its own backup");
+  const saved = JSON.parse(await readFile(res.replacedBackupPath, "utf8"));
+  assert.deepEqual(saved.mcpServers.obsidian, tuned);
+  assert.equal((await stat(res.replacedBackupPath)).mode & 0o777, 0o600);
+  assert.equal(await readFile(`${configPath}.bak`, "utf8"), "{}");
+
+  const again = await upsertJsonMcpServerConfig(configPath, entry, { overwrite: true });
+  assert.equal(again.existed, true);
+  assert.equal(again.updated, false);
+  const backups = (await readdir(fixture)).filter((name) => name.includes(".replaced-"));
+  assert.equal(backups.length, 1, "an unchanged entry is not rewritten or re-backed-up");
 });

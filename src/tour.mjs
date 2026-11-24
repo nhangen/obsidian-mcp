@@ -148,6 +148,7 @@ export function resolveServerLauncher(currentFile = fileURLToPath(import.meta.ur
 
 export async function upsertJsonMcpServerConfig(configPath, serverEntry, options = {}) {
   let config = {};
+  let content;
   let originalMode = 0o600;
 
   if (existsSync(configPath)) {
@@ -156,7 +157,6 @@ export async function upsertJsonMcpServerConfig(configPath, serverEntry, options
       originalMode = stats.mode & 0o777;
     } catch {}
 
-    let content;
     try {
       content = await readFile(configPath, "utf8");
     } catch (err) {
@@ -188,13 +188,28 @@ export async function upsertJsonMcpServerConfig(configPath, serverEntry, options
   }
 
   config.mcpServers = config.mcpServers || {};
-  if (config.mcpServers.obsidian && !options.overwrite) {
+  const previous = config.mcpServers.obsidian;
+  const existed = previous !== undefined;
+  if (existed && (!options.overwrite || JSON.stringify(previous) === JSON.stringify(serverEntry))) {
     return {
       success: true,
       configPath,
       existed: true,
       updated: false,
     };
+  }
+
+  // The .bak keeps the pre-tour original, so a later replacement of an entry
+  // the user edited since then needs a copy of its own.
+  let replacedBackupPath;
+  if (existed) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    replacedBackupPath = `${configPath}.replaced-${stamp}.bak`;
+    try {
+      await writeFile(replacedBackupPath, content, { encoding: "utf8", mode: originalMode, flag: "wx" });
+    } catch (err) {
+      throw new Error(`Failed to back up the existing obsidian entry at ${replacedBackupPath}: ${err.message}`);
+    }
   }
 
   config.mcpServers.obsidian = serverEntry;
@@ -217,8 +232,9 @@ export async function upsertJsonMcpServerConfig(configPath, serverEntry, options
   return {
     success: true,
     configPath,
-    existed: false,
+    existed,
     updated: true,
+    replacedBackupPath,
   };
 }
 
@@ -460,7 +476,8 @@ export async function runTour(options = {}) {
         try {
           print(`Configuring Claude Code in ${claudeCodeConfigPath}...`);
           const fileRes = await configureClaudeCodeViaFile(selectedVault, selectedDaily, claudeCodeConfigPath, { overwrite: true });
-          print(`✓ Updated ${fileRes.configPath}`);
+          print(fileRes.updated ? `✓ Updated ${fileRes.configPath}` : `✓ Already configured in ${fileRes.configPath}`);
+          if (fileRes.replacedBackupPath) print(`  Replaced an existing "obsidian" entry; the previous config is saved at ${fileRes.replacedBackupPath}`);
           results.push({ host: "Claude Code", success: true, method: "file" });
         } catch (err) {
           print(`❌ Failed to configure Claude Code: ${err.message}`);
@@ -473,7 +490,8 @@ export async function runTour(options = {}) {
       try {
         print(`Configuring Claude Desktop in ${claudeDesktopConfigPath}...`);
         const desktopRes = await configureClaudeDesktop(selectedVault, selectedDaily, claudeDesktopConfigPath, { overwrite: true });
-        print(`✓ Updated ${desktopRes.configPath}`);
+        print(desktopRes.updated ? `✓ Updated ${desktopRes.configPath}` : `✓ Already configured in ${desktopRes.configPath}`);
+        if (desktopRes.replacedBackupPath) print(`  Replaced an existing "obsidian" entry; the previous config is saved at ${desktopRes.replacedBackupPath}`);
         results.push({ host: "Claude Desktop", success: true });
       } catch (err) {
         print(`❌ Failed to configure Claude Desktop: ${err.message}`);
