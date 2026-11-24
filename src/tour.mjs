@@ -136,7 +136,10 @@ export function resolveServerLauncher(currentFile = fileURLToPath(import.meta.ur
   // into it would break later; re-resolve through npx at the same version.
   if (currentFile.split(/[\\/]/).includes("_npx")) return npx;
   const packageDir = resolve(dirname(currentFile), "..");
-  for (const candidate of [join(packageDir, "dist", "stdio.mjs"), join(packageDir, "src", "stdio.mjs")]) {
+  const candidates = [join(packageDir, "dist", "stdio.mjs"), join(packageDir, "src", "stdio.mjs")];
+  // The portable client ships the bundle as server/stdio.mjs, outside any dist/.
+  if (basename(currentFile) === "stdio.mjs") candidates.unshift(currentFile);
+  for (const candidate of candidates) {
     try {
       if (existsSync(candidate)) {
         return { command: process.execPath, argsPrefix: [realpathSync(candidate)] };

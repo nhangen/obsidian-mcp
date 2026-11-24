@@ -611,3 +611,15 @@ test("upsertJsonMcpServerConfig writes through a symlinked config instead of rep
   assert.equal(written.keep, true);
   assert.deepEqual(written.mcpServers.obsidian, { command: "node", args: ["/x"] });
 });
+
+test("resolveServerLauncher runs the bundle in place for the portable client layout", async (t) => {
+  const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-portable-")));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const bundle = join(fixture, "client", "server", "stdio.mjs");
+  await mkdir(join(fixture, "client", "server"), { recursive: true });
+  await writeFile(bundle, "");
+
+  const launcher = resolveServerLauncher(bundle);
+  assert.equal(launcher.command, process.execPath);
+  assert.deepEqual(launcher.argsPrefix, [bundle]);
+});
