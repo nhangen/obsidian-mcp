@@ -1123,15 +1123,23 @@ const safeFolder = z.string().trim().min(1).max(1024).regex(/^(?!\.{1,2}(?:\/|$)
 const keeperSaveInput = z.strictObject({
   title: safeText(240).trim().min(1).refine((value) => Boolean(normalizedKeeperSaveTarget(value, "Inbox")), "title must be a note name without path separators"),
   body: z.string().min(1).max(65536),
-  resolved: z.literal(true),
-  folder_hint: safeText(1024).trim().min(1),
+  resolved: z.boolean(),
+  folder_hint: safeText(1024).trim().min(1).optional(),
+  target: safeText(1024).trim().min(1).optional(),
   type: safeText(100).optional(),
   links: z.array(safeText(2048)).max(20).optional(),
   session_link_date: calendarDate("session_link_date").optional(),
   idempotency_key: z.string().min(1).max(240).regex(/^[A-Za-z0-9._:-]+$/).optional(),
   request_id: z.string().min(1).max(240).regex(/^[A-Za-z0-9._:-]+$/).optional(),
+})
+  .refine((value) => value.resolved === true, { path: ["resolved"], message: "resolved must be exactly true" })
+  .refine((value) => Boolean(value.folder_hint || value.target), { path: ["folder_hint"], message: "folder_hint is required; it (or its alias target) must be the vault-relative folder" });
+const keeperSaveAdvertisedInput = keeperSaveInput.safeExtend({
+  title: noteTitle,
+  resolved: z.boolean().meta({ const: true }),
+  folder_hint: safeFolder.optional(),
+  target: safeFolder.optional().describe("Alias for folder_hint: the caller-resolved vault-relative target folder."),
 });
-const keeperSaveAdvertisedInput = keeperSaveInput.extend({ title: noteTitle, folder_hint: safeFolder });
 
 const dailyAppendInput = z.strictObject({
   content: z.string().min(1).max(65536),
@@ -1226,7 +1234,7 @@ export function createServer({ supportedProtocolVersions = protocolVersions, sco
     "obsidian_keeper_save",
     {
       title: "Save Obsidian note",
-      description: "Save a structured note to the Obsidian vault.",
+      description: "Save a structured note under `folder_hint` (vault-relative folder; `target` is an accepted alias). Required: `title`, `body`, `folder_hint`, `resolved=true` (exactly the boolean true), `idempotency_key` for remote writes.",
       inputSchema: advertisedInputSchema(keeperSaveAdvertisedInput),
       outputSchema: writeOutput,
       annotations: keeperSaveAnnotations,
@@ -1235,9 +1243,10 @@ export function createServer({ supportedProtocolVersions = protocolVersions, sco
       const fallback = writeRequestFallback("obsidian_keeper_save", args, configuration);
       try {
         const input = parseToolInput(keeperSaveInput, args);
+        const folderHint = input.folder_hint || input.target;
         if (requireWriteIdempotency && !input.idempotency_key) throw codedError("INVALID_INPUT", "idempotency_key is required for remote writes");
         if (input.session_link_date) requireDailyWriteConfiguration(configuration);
-        return successResult(await keeperSave({ ...input, request_id: input.request_id || fallback.request_id }, configuration.vaultPath, ctx.mcpReq.signal, configuration.dailyPath));
+        return successResult(await keeperSave({ ...input, folder_hint: folderHint, request_id: input.request_id || fallback.request_id }, configuration.vaultPath, ctx.mcpReq.signal, configuration.dailyPath));
       } catch (error) {
         return writeErrorResult(error, fallback);
       }

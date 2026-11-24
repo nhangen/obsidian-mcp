@@ -1166,6 +1166,59 @@ test("stdio server rejects path traversal escape attempts", async (t) => {
   assert.equal(error.idempotency_key, "traversal-1");
 });
 
+test("stdio keeper save exposes the folder field in its advertised surface and accepts a target alias", async (t) => {
+  const { root, vaultPath, configPath } = await createFixtureVault();
+  const server = startStdioServer(configPath);
+
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await once(server.child, "close").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await server.request({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+  }, 1);
+  server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const tools = await server.request({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, 2);
+  const keeperTool = tools.result.tools.find((tool) => tool.name === "obsidian_keeper_save");
+  assert.match(keeperTool.description, /folder_hint/);
+  assert.match(keeperTool.description, /`target` is an accepted alias/);
+  assert.match(keeperTool.description, /`title`, `body`, `folder_hint`, `resolved=true`/);
+  assert.ok(keeperTool.inputSchema.properties.folder_hint, "folder_hint must stay in the advertised schema");
+  assert.ok(keeperTool.inputSchema.properties.target, "target alias must be in the advertised schema");
+
+  const aliasSave = await server.request({
+    jsonrpc: "2.0", id: 3, method: "tools/call",
+    params: { name: "obsidian_keeper_save", arguments: { title: "Alias Save", body: "via target", resolved: true, target: "Inbox", idempotency_key: "target-alias" } },
+  }, 3);
+  assert.equal(aliasSave.result.isError, false);
+  assert.equal(aliasSave.result.structuredContent.status, "committed");
+  assert.match(await readFile(join(vaultPath, "Inbox", "Alias Save.md"), "utf8"), /via target/);
+
+  const explicitFalse = await server.request({
+    jsonrpc: "2.0", id: 4, method: "tools/call",
+    params: { name: "obsidian_keeper_save", arguments: { title: "Explicit False", body: "must be rejected", resolved: false, folder_hint: "Inbox" } },
+  }, 4);
+  const explicitFalseOutcome = JSON.parse(explicitFalse.result.content[0].text);
+  assert.equal(explicitFalse.result.isError, true);
+  assert.equal(explicitFalseOutcome.code, "INVALID_INPUT");
+  assert.match(explicitFalseOutcome.detail, /resolved.*must be exactly true/);
+  await assert.rejects(access(join(vaultPath, "Inbox", "Explicit False.md")));
+
+  const missingFolder = await server.request({
+    jsonrpc: "2.0", id: 5, method: "tools/call",
+    params: { name: "obsidian_keeper_save", arguments: { title: "Missing Folder Field", body: "must be rejected", resolved: true, idempotency_key: "missing-folder-field" } },
+  }, 5);
+  const missingFolderOutcome = JSON.parse(missingFolder.result.content[0].text);
+  assert.equal(missingFolder.result.isError, true);
+  assert.equal(missingFolderOutcome.code, "INVALID_INPUT");
+  assert.match(missingFolderOutcome.detail, /folder_hint/);
+  await assert.rejects(access(join(vaultPath, "Inbox", "Missing Folder Field.md")));
+});
+
 test("stdio preserves recoverable partial keeper outcomes", async (t) => {
   const { root, vaultPath, configPath } = await createFixtureVault();
   await mkdir(join(vaultPath, "Blocked", "INDEX.md"), { recursive: true });
