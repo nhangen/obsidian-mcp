@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import stat
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ FILES = (
     "manifest.json",
     "bin/obsidian-mcp-read",
     "bin/obsidian-mcp-write",
+    "bin/obsidian-mcp-server",
     "bin/obsidian-mcp-commit-event",
     "bin/obsidian-mcp-capture-commit",
     "bin/obsidian-mcp-client-install",
@@ -42,6 +44,7 @@ FILES = (
 EXECUTABLES = {
     "bin/obsidian-mcp-read",
     "bin/obsidian-mcp-write",
+    "bin/obsidian-mcp-server",
     "bin/obsidian-mcp-commit-event",
     "bin/obsidian-mcp-capture-commit",
     "bin/obsidian-mcp-client-install",
@@ -54,6 +57,9 @@ EXECUTABLES = {
     "vendor/shell-capture-parser/shell-capture-parser-darwin-arm64",
     "vendor/shell-capture-parser/shell-capture-parser-linux-amd64",
     "vendor/shell-capture-parser/shell-capture-parser-linux-arm64",
+    "server/stdio.mjs",
+    "server/helpers/keeper",
+    "server/helpers/commit-meta.sh",
 }
 HELPER_VENDOR = "vendor/shell-capture-parser"
 HELPER_SOURCE = ROOT / "helpers/shell-capture-parser"
@@ -96,6 +102,31 @@ def regular_file_bytes(path: Path, label: str) -> bytes:
     if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
         fail(f"{label} is not a private regular file")
     return path.read_bytes()
+
+
+SERVER_HELPERS = (
+    "keeper",
+    "commit-meta.sh",
+    "lib/allowlist-validate.sh",
+    "lib/commit-capture-parse.sh",
+    "lib/dedup-scan.sh",
+    "lib/note-hash.sh",
+    "lib/resolve-config.sh",
+    "lib/vault-index.sh",
+)
+
+
+UNBUNDLED_IMPORT = re.compile(
+    rb"""^\s*(?:import|export)\b[^;]*?\bfrom\s*["'](?!node:)|^\s*import\s*["'](?!node:)""",
+    re.MULTILINE,
+)
+
+
+def bundled_server_bytes(path: Path) -> bytes:
+    contents = regular_file_bytes(path, "bundled server")
+    if UNBUNDLED_IMPORT.search(contents):
+        fail(f"{path} is not a self-contained bundle; run npm run build")
+    return contents
 
 
 def read_json_object(data: bytes, label: str) -> dict:
@@ -283,6 +314,11 @@ def source_files(catalog_path: Path, contract_path: Path) -> dict[str, bytes]:
     files["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     files["contract.json"] = contract_bytes
     files["LICENSE"] = regular_file_bytes(ROOT / "LICENSE", "project license input")
+    files["server/stdio.mjs"] = bundled_server_bytes(ROOT / "dist/stdio.mjs")
+    for relative in SERVER_HELPERS:
+        files[f"server/helpers/{relative}"] = regular_file_bytes(
+            ROOT / "helpers" / relative, f"server helper {relative}"
+        )
     validate_helper_vendor(files)
     return files
 

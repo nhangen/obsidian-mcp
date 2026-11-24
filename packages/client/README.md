@@ -62,6 +62,18 @@ and `obsidian-mcp-write`, as shown in the public `integrations/` guides. No home
 wrapper, private harness or plugin is needed. Installing this bundle never changes
 an existing host's routing or writer ownership.
 
+To run against a local vault without cloning or installing `obsidian-mcp`, launch
+the bundled stdio server directly:
+
+```sh
+<prefix>/current/bin/obsidian-mcp-server --vault /path/to/vault
+```
+
+It runs `server/stdio.mjs`, a self-contained build of the server with its keeper
+helpers alongside, and forwards every argument. Node.js is the only runtime
+requirement. Set `MCP_REPOSITORY_ROOTS` to the checkouts that
+`obsidian_commit_meta` may read.
+
 The bundle includes a commit-capture consumer. The default pinned release
 `mcp-v0.2.2` provides exact-target append and the exact/prefix hash guard, so an
 explicit invocation can pass the local capability gate. The consumer still requires

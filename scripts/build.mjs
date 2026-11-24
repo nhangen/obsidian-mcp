@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = join(packageRoot, "dist");
@@ -32,7 +33,18 @@ for (const relativePath of helpers) {
   await chmod(destination, (relativePath.endsWith("commit-meta.sh") || relativePath.endsWith("keeper")) ? 0o755 : 0o644);
 }
 
-await chmod(join(outputRoot, "stdio.mjs"), 0o755);
-await chmod(join(outputRoot, "http.mjs"), 0o755);
 await copyFile(join(packageRoot, "package-lock.json"), join(outputRoot, "runtime-lock.json"));
 await writeFile(join(outputRoot, "version.mjs"), `export const packageVersion = ${JSON.stringify(packageManifest.version)};\n`);
+
+await build({
+  entryPoints: [join(outputRoot, "stdio.mjs")],
+  outfile: join(outputRoot, "stdio.mjs"),
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  allowOverwrite: true,
+});
+
+await chmod(join(outputRoot, "stdio.mjs"), 0o755);
+await chmod(join(outputRoot, "http.mjs"), 0o755);

@@ -9,6 +9,11 @@ on:
       - 'helpers/**'
       - 'scripts/build-shell-capture-parser.py'
       - 'scripts/pack-obsidian-mcp-client.py'
+      - 'scripts/build.mjs'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
       - 'tests/obsidian-mcp-*'
       - 'integrations/**'
       - 'contract.json'
@@ -58,6 +63,10 @@ jobs:
           node-version: 24.9.0
       - name: Verify Python prerequisite
         run: python3 -c 'import sys; assert sys.version_info >= (3, 11)'
+      - name: Build the bundled stdio server
+        run: |
+          npm ci
+          npm run build
       - name: Audit bridge dependency lock
         run: |
           mkdir "$RUNNER_TEMP/bridge-dependency-audit"
