@@ -607,31 +607,24 @@ test("synthetic configuration is cleaned up on server exit", async () => {
 });
 
 test("shouldLaunchTour evaluates interactive seam conditions correctly", () => {
-  // Piped non-TTY stdio (default MCP host spawn) never launches tour
   assert.equal(shouldLaunchTour({ isTTY: false }), false);
   assert.equal(shouldLaunchTour({ cli: {}, env: {}, isTTY: false }), false);
 
-  // Pure interactive terminal without args launches tour
   assert.equal(shouldLaunchTour({ cli: {}, env: {}, isTTY: true }), true);
 
-  // Passing --tour forces tour even on non-TTY
   assert.equal(shouldLaunchTour({ cli: { tour: true }, env: {}, isTTY: false }), true);
   assert.equal(shouldLaunchTour({ cli: { tour: true }, env: {}, isTTY: true }), true);
 
-  // Passing --vault suppresses tour
   assert.equal(shouldLaunchTour({ cli: { vault: "/path" }, env: {}, isTTY: true }), false);
 
-  // Passing --serve or --stdio suppresses tour
   assert.equal(shouldLaunchTour({ cli: { serve: true }, env: {}, isTTY: true }), false);
 
   assert.equal(shouldLaunchTour({ cli: { repoRoots: ["/repo"] }, env: {}, isTTY: true }), false);
   assert.equal(shouldLaunchTour({ cli: { dailyPath: "Journal/", repoRoots: [] }, env: {}, isTTY: true }), false);
   assert.equal(shouldLaunchTour({ cli: { repoRoots: [] }, env: {}, isTTY: true }), true);
 
-  // Setting MCP_SERVE_STDIO suppresses tour
   assert.equal(shouldLaunchTour({ cli: {}, env: { MCP_SERVE_STDIO: "1" }, isTTY: true }), false);
 
-  // Setting OBSIDIAN_LOCAL_MD suppresses tour
   assert.equal(shouldLaunchTour({ cli: {}, env: { OBSIDIAN_LOCAL_MD: "/path" }, isTTY: true }), false);
 });
 

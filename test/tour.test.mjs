@@ -67,7 +67,6 @@ test("detectDailyNotesPath detects custom folder, candidate folders, and default
   const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-daily-"));
   t.after(() => rm(fixture, { recursive: true, force: true }));
 
-  // 1. With daily-notes.json
   const vaultWithConfig = join(fixture, "vault-config");
   await mkdir(join(vaultWithConfig, ".obsidian"), { recursive: true });
   await writeFile(
@@ -87,12 +86,10 @@ test("detectDailyNotesPath detects custom folder, candidate folders, and default
   );
   assert.equal(detectDailyNotesPath(vaultWithRoot), "Daily/");
 
-  // 3. With candidate directory Journal
   const vaultWithJournal = join(fixture, "vault-journal");
   await mkdir(join(vaultWithJournal, "Journal"), { recursive: true });
   assert.equal(detectDailyNotesPath(vaultWithJournal), "Journal/");
 
-  // 4. Fallback default
   const emptyVault = join(fixture, "vault-empty");
   await mkdir(emptyVault, { recursive: true });
   assert.equal(detectDailyNotesPath(emptyVault), "Daily/");
@@ -147,7 +144,6 @@ test("upsertJsonMcpServerConfig creates absent file with 0600 mode and no backup
   const data = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(data.mcpServers.obsidian, serverEntry);
 
-  // No .bak was created because file didn't exist prior to upsert
   await assert.rejects(() => stat(`${configPath}.bak`));
 });
 
@@ -165,7 +161,6 @@ test("upsertJsonMcpServerConfig preserves original .bak across multiple runs and
   const backup1 = JSON.parse(await readFile(`${configPath}.bak`, "utf8"));
   assert.deepEqual(backup1, original);
 
-  // Second run with different entry
   const entry2 = { command: "node", args: ["v2.js"] };
   await upsertJsonMcpServerConfig(configPath, entry2, { overwrite: true });
 
@@ -173,12 +168,10 @@ test("upsertJsonMcpServerConfig preserves original .bak across multiple runs and
   const backup2 = JSON.parse(await readFile(`${configPath}.bak`, "utf8"));
   assert.deepEqual(backup2, original);
 
-  // Updated file has entry2
   const updated = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(updated.mcpServers.obsidian, entry2);
   assert.deepEqual(updated.mcpServers.initial, original.mcpServers.initial);
 
-  // File mode must still be 0600
   const fileStats = await stat(configPath);
   assert.equal(fileStats.mode & 0o777, 0o600);
 });
@@ -196,9 +189,7 @@ test("upsertJsonMcpServerConfig rejects malformed JSON without modifying or wipi
     /Configuration file contains invalid JSON.*malformed\.json/,
   );
 
-  // File content is preserved exactly
   assert.equal(await readFile(configPath, "utf8"), corruptContent);
-  // No backup was written
   await assert.rejects(() => stat(`${configPath}.bak`));
 });
 
@@ -308,7 +299,6 @@ test("runTour completes interactive walkthrough with isolated config overrides",
   assert.match(outputText, /Found 1 Markdown note\(s\) in vault/);
   assert.match(outputText, /Setup complete!/);
 
-  // Both isolated config files were created
   for (const configPath of [claudeCodeConfig, claudeDesktopConfig]) {
     const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
     assert.deepEqual(args.slice(-4), ["--vault", vaultPath, "--daily-path", "Daily/"]);
