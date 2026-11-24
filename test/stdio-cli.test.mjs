@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
-import { EX_USAGE, parseCliArgs } from "../src/stdio.mjs";
+import { EX_USAGE, parseCliArgs, shouldLaunchTour } from "../src/stdio.mjs";
 
 const packageRoot = resolve(dirname(new URL(import.meta.url).pathname), "..");
 const entrypoint = join(packageRoot, "src", "stdio.mjs");
@@ -117,17 +117,22 @@ function runCliProcess(args = [], extraEnv = {}) {
 }
 
 test("parseCliArgs unit tests", () => {
-  assert.deepEqual(parseCliArgs([]), { help: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs([]), { help: false, tour: false, serve: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
   assert.deepEqual(parseCliArgs(["-h"]), { help: true });
   assert.deepEqual(parseCliArgs(["--help"]), { help: true });
-  assert.deepEqual(parseCliArgs(["--vault", "/path/to/vault"]), { help: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["-v", "/path/to/vault"]), { help: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault=/path/to/vault"]), { help: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["-v=/path/to/vault"]), { help: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path", "Custom/"]), { help: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path=Custom/"]), { help: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--tour"]), { help: false, tour: true, serve: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--serve"]), { help: false, tour: false, serve: true, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--stdio"]), { help: false, tour: false, serve: true, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/path/to/vault"]), { help: false, tour: false, serve: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["-v", "/path/to/vault"]), { help: false, tour: false, serve: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault=/path/to/vault"]), { help: false, tour: false, serve: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["-v=/path/to/vault"]), { help: false, tour: false, serve: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path", "Custom/"]), { help: false, tour: false, serve: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path=Custom/"]), { help: false, tour: false, serve: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
   assert.deepEqual(parseCliArgs(["--vault", "/v", "--repo-root", "/r1", "--repo-root", "/r2"]), {
     help: false,
+    tour: false,
+    serve: false,
     vault: "/v",
     dailyPath: undefined,
     repoRoots: ["/r1", "/r2"],
@@ -599,5 +604,90 @@ test("synthetic configuration is cleaned up on server exit", async () => {
     await rm(staging, { recursive: true, force: true });
     await rm(vault, { recursive: true, force: true });
   }
+});
+
+test("shouldLaunchTour evaluates interactive seam conditions correctly", () => {
+  // Piped non-TTY stdio (default MCP host spawn) never launches tour
+  assert.equal(shouldLaunchTour({ isTTY: false }), false);
+  assert.equal(shouldLaunchTour({ cli: {}, env: {}, isTTY: false }), false);
+
+  // Pure interactive terminal without args launches tour
+  assert.equal(shouldLaunchTour({ cli: {}, env: {}, isTTY: true }), true);
+
+  // Passing --tour forces tour even on non-TTY
+  assert.equal(shouldLaunchTour({ cli: { tour: true }, env: {}, isTTY: false }), true);
+  assert.equal(shouldLaunchTour({ cli: { tour: true }, env: {}, isTTY: true }), true);
+
+  // Passing --vault suppresses tour
+  assert.equal(shouldLaunchTour({ cli: { vault: "/path" }, env: {}, isTTY: true }), false);
+
+  // Passing --serve or --stdio suppresses tour
+  assert.equal(shouldLaunchTour({ cli: { serve: true }, env: {}, isTTY: true }), false);
+
+  // Setting MCP_SERVE_STDIO suppresses tour
+  assert.equal(shouldLaunchTour({ cli: {}, env: { MCP_SERVE_STDIO: "1" }, isTTY: true }), false);
+
+  // Setting OBSIDIAN_LOCAL_MD suppresses tour
+  assert.equal(shouldLaunchTour({ cli: {}, env: { OBSIDIAN_LOCAL_MD: "/path" }, isTTY: true }), false);
+});
+
+test("server starts up and serves tools when started with --serve", async (t) => {
+  const vault = await mkdtemp(join(tmpdir(), "mcp-cli-serve-"));
+
+  const server = startCliServer(["--serve", "--vault", vault]);
+  t.after(async () => {
+    if (!server.child.killed) server.child.stdin.end();
+    await Promise.race([
+      once(server.child, "close").catch(() => {}),
+      new Promise((resolveWait) => setTimeout(resolveWait, 200)),
+    ]);
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  const initResponse = await server.request(
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    },
+    1,
+  );
+  assert.equal(initResponse.result.protocolVersion, "2025-11-25");
+});
+
+test("server launches tour banner when started with --tour", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-cli-tour-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+
+  const child = spawn(process.execPath, [entrypoint, "--tour"], {
+    cwd: fixture,
+    env: {
+      ...process.env,
+      HOME: fixture,
+      XDG_CONFIG_HOME: fixture,
+      APPDATA: fixture,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (stdout.includes("Select a vault") || stdout.includes("Enter the absolute path")) {
+      child.stdin.end();
+    }
+  });
+
+  await Promise.race([
+    once(child, "close"),
+    new Promise((_, reject) => setTimeout(() => {
+      child.kill();
+      reject(new Error("timed out waiting for tour CLI process to close"));
+    }, 5000)),
+  ]);
+
+  assert.match(stdout, /Obsidian MCP Server Setup/);
 });
 

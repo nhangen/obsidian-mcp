@@ -179,11 +179,29 @@ Alternatively, the stdio server accepts `--vault <path>` (alias `-v <path>`) dir
 }
 ```
 
-CLI options supported by `claude-obsidian-mcp`:
+### Guided tour and interactive setup
+
+Running the package binary directly in an interactive terminal (with TTY stdin/stdout and no server arguments):
+
+```bash
+npx @nhangen/obsidian-mcp
+```
+
+launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, and safely configures Claude Code or Claude Desktop.
+
+When spawned by an AI host (piped stdin/stdout) or invoked with `--vault` or `--serve`, the binary immediately runs the headless stdio MCP server without human prompts.
+
+CLI options supported by `obsidian-mcp` (and `claude-obsidian-mcp`):
 - `-v, --vault <path>`: Absolute path to the Obsidian vault directory.
 - `--daily-path <path>`: Relative path within the vault for daily notes (default: `Daily/`).
 - `--repo-root <path>`: Allowed repository root for commit metadata (can be repeated or platform-delimited).
+- `--tour`: Explicitly launch the interactive guided setup tour.
+- `--serve, --stdio`: Force headless stdio JSON-RPC server execution even in an interactive terminal.
 - `-h, --help`: Show usage and exit.
+
+Environment variables:
+- `MCP_SERVE_STDIO=1`: Force headless stdio JSON-RPC execution, bypassing the interactive tour in PTY/terminal environments.
+- `MCP_STDIO_PROFILE`: Stdio authorization profile (`read` or `write`, default: `read`).
 
 The stdio server defaults to the read profile, exposing only vault and
 repository read tools. Set `MCP_STDIO_PROFILE=write` explicitly as the

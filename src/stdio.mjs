@@ -11,6 +11,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { integerSetting } from "./settings.mjs";
+import { runTour } from "./tour.mjs";
 import { packageVersion } from "./version.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1392,11 +1393,17 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 
   let vault;
   let dailyPath;
+  let tour = false;
+  let serve = false;
   const repoRoots = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "-v" || arg === "--vault") {
+    if (arg === "--tour") {
+      tour = true;
+    } else if (arg === "--serve" || arg === "--stdio") {
+      serve = true;
+    } else if (arg === "-v" || arg === "--vault") {
       i++;
       if (i >= argv.length || argv[i].startsWith("-")) {
         throw new Error("missing required argument for --vault");
@@ -1430,7 +1437,36 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     }
   }
 
-  return { help: false, vault, dailyPath, repoRoots };
+  return { help: false, tour, serve, vault, dailyPath, repoRoots };
+}
+
+export function validateDailyPath(dailyPath, vaultPath) {
+  if (typeof dailyPath !== "string") {
+    throw new Error("daily-path must be a string");
+  }
+  if (isAbsolute(dailyPath) || dailyPath.split(/[\\/]/).includes("..")) {
+    throw new Error(`--daily-path must remain within the configured vault: ${dailyPath}`);
+  }
+  if (vaultPath && !isContained(vaultPath, resolve(vaultPath, dailyPath))) {
+    throw new Error(`--daily-path must remain within the configured vault: ${dailyPath}`);
+  }
+  if (/[\r\n\t]/.test(dailyPath)) {
+    throw new Error(`--daily-path contains invalid characters: ${dailyPath}`);
+  }
+  const normalized = dailyPath.replace(/^\/+|\/+$/g, "");
+  if (!normalized) {
+    throw new Error(`--daily-path must identify a directory within the configured vault: ${dailyPath}`);
+  }
+  return `${normalized}/`;
+}
+
+export function shouldLaunchTour({ cli = {}, env = process.env, isTTY = false } = {}) {
+  if (cli.tour) return true;
+  if (cli.serve) return false;
+  if (cli.vault) return false;
+  if (env.MCP_SERVE_STDIO) return false;
+  if (env.OBSIDIAN_LOCAL_MD) return false;
+  return Boolean(isTTY);
 }
 
 let syntheticConfigDir = null;
@@ -1486,14 +1522,25 @@ export function startStdio(argv = process.argv.slice(2)) {
   if (cli.help) {
     process.stdout.write(
       "Usage: claude-obsidian-mcp [options]\n\n" +
-      "Obsidian MCP server over stdio.\n\n" +
+      "Obsidian MCP server over stdio and interactive setup guide.\n\n" +
       "Options:\n" +
       "  -v, --vault <path>       Absolute path to the Obsidian vault directory\n" +
       "      --daily-path <path>  Vault-relative path for daily notes (default: Daily/)\n" +
       "      --repo-root <path>   Allowed repository root for commit metadata (repeatable)\n" +
+      "      --tour               Launch the interactive guided setup tour\n" +
+      "      --serve, --stdio     Run stdio JSON-RPC server directly (even in a terminal)\n" +
       "  -h, --help               Show this help message\n"
     );
     process.exit(0);
+  }
+
+  const isInteractiveTerminal = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (shouldLaunchTour({ cli, env: process.env, isTTY: isInteractiveTerminal })) {
+    runTour({ initialVault: cli.vault, initialDailyPath: cli.dailyPath }).catch((error) => {
+      stderr(`Setup tour error: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    });
+    return;
   }
 
   let resolvedVault;
@@ -1517,23 +1564,13 @@ export function startStdio(argv = process.argv.slice(2)) {
 
   let effectiveDailyPath = "Daily/";
   if (cli.dailyPath !== undefined) {
-    if (isAbsolute(cli.dailyPath)
-      || cli.dailyPath.split(/[\\/]/).includes("..")
-      || (resolvedVault && !isContained(resolvedVault, resolve(resolvedVault, cli.dailyPath)))) {
-      stderr(`--daily-path must remain within the configured vault: ${cli.dailyPath}`);
+    try {
+      effectiveDailyPath = validateDailyPath(cli.dailyPath, resolvedVault);
+      activeDailyPath = effectiveDailyPath;
+    } catch (err) {
+      stderr(err.message);
       process.exit(EX_USAGE);
     }
-    if (/[\r\n\t]/.test(cli.dailyPath)) {
-      stderr(`--daily-path contains invalid characters: ${cli.dailyPath}`);
-      process.exit(EX_USAGE);
-    }
-    const normalizedDaily = cli.dailyPath.replace(/^\/+|\/+$/g, "");
-    if (!normalizedDaily) {
-      stderr(`--daily-path must identify a directory within the configured vault: ${cli.dailyPath}`);
-      process.exit(EX_USAGE);
-    }
-    effectiveDailyPath = `${normalizedDaily}/`;
-    activeDailyPath = effectiveDailyPath;
   }
 
   if (cli.repoRoots.length > 0) {
