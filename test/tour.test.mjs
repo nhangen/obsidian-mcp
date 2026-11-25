@@ -900,6 +900,26 @@ test("runTour still accepts Enter after a mistyped vault path", { timeout: 15_00
   assert.equal(existsSync(join(home, "Missing")), false);
 });
 
+for (const hasCli of [true, false]) {
+  test(`runTour suggests adding the claude command line after a Desktop-only setup only when it exists: ${hasCli}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-hint-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "2"]]);
+    await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath: join(fixture, "claude.json"),
+      claudeDesktopConfigPath: join(fixture, "DesktopApp", "claude_desktop_config.json"),
+      detectClaudeCode: () => hasCli,
+    });
+
+    assert.equal(/`claude` command line is set up separately/.test(io.text()), hasCli, io.text());
+  });
+}
+
 for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, true], ["3", true, true], ["4", false, false]]) {
   test(`runTour ends with next steps and no server command for host choice ${choice}`, { timeout: 15_000 }, async (t) => {
     const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-next-")));
@@ -920,7 +940,6 @@ for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, tr
     assert.equal(/stdio|--vault/.test(ending), false, ending);
     assert.equal(/start `claude` and ask/.test(ending), hasCode);
     assert.equal(/Quit Claude Desktop and open it again/.test(ending), hasDesktop);
-    assert.equal(/`claude` command line is set up separately/.test(ending), choice === "2");
     assert.equal(/nothing to start yourself/.test(ending), hasCode || hasDesktop);
     assert.equal(/Add the snippet above to your app's settings, then restart the app/.test(ending), choice === "4");
   });

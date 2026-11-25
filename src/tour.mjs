@@ -685,7 +685,7 @@ export async function runTour(options = {}) {
     const configured = (host) => results.some((r) => r.host === host);
     if (configured("Claude Desktop")) {
       print("Next: Quit Claude Desktop and open it again.");
-      if (!configured("Claude Code")) {
+      if (!configured("Claude Code") && hasClaudeCli) {
         print("The `claude` command line is set up separately. To add it, run this setup again and choose 1.");
       }
       print();
