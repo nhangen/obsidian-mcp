@@ -66,6 +66,21 @@ export function findKnownVaults(configPath = getObsidianConfigPath(), logger = (
   }
 }
 
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export function suggestVaultPath(home, cwd) {
+  if (isDirectory(join(cwd, ".obsidian"))) return { path: resolve(cwd), exists: true };
+  const candidates = [join(home, "Documents", "Obsidian"), join(home, "Obsidian")];
+  const found = candidates.find(isDirectory);
+  return found ? { path: found, exists: true } : { path: candidates[0], exists: false };
+}
+
 export function detectDailyNotesPath(vaultPath) {
   try {
     const dailyNotesConfig = join(vaultPath, ".obsidian", "daily-notes.json");
@@ -452,8 +467,19 @@ export async function runTour(options = {}) {
     }
 
     while (!selectedVault) {
-      const customPath = (await ask("Enter the absolute path to your Obsidian vault directory: ")).trim();
-      if (!customPath) continue;
+      const suggestion = suggestVaultPath(home, options.cwd || process.cwd());
+      const note = suggestion.exists ? "" : ", will be created";
+      const typed = (await ask(`Vault directory (default: ${suggestion.path}${note}): `)).trim();
+      if (!typed && !suggestion.exists) {
+        try {
+          await mkdir(suggestion.path, { recursive: true });
+          print(`Created ${suggestion.path}. To see it in Obsidian, choose "Open folder as vault".`);
+        } catch (err) {
+          print(`Could not create ${suggestion.path}: ${err.message}`);
+          continue;
+        }
+      }
+      const customPath = typed || suggestion.path;
       const expanded = customPath === "~" || customPath.startsWith("~/") ? join(home, customPath.slice(1)) : customPath;
       if (!isAbsolute(expanded)) {
         print(`Vault path must be absolute (or start with ~/): ${customPath}`);
@@ -513,10 +539,20 @@ export async function runTour(options = {}) {
     print("  [4] Skip automatic configuration (display snippet only)");
     print();
 
+    const hasClaudeCli = options.detectClaudeCode ? options.detectClaudeCode() : detectClaudeCode();
+    const claudeCodeConfigPath = options.claudeCodeConfigPath || getClaudeCodeConfigPath();
+    const claudeDesktopConfigPath = options.claudeDesktopConfigPath || getClaudeDesktopConfigPath();
+    // The desktop app creates its config directory the first time it runs.
+    const hasClaudeDesktop = existsSync(dirname(claudeDesktopConfigPath));
+    const detected = [hasClaudeCli && "Claude Code", hasClaudeDesktop && "Claude Desktop"].filter(Boolean);
+    const defaultChoice = hasClaudeCli ? (hasClaudeDesktop ? 3 : 1) : (hasClaudeDesktop ? 2 : 4);
+    print(detected.length > 0 ? `Found: ${detected.join(", ")}` : "Found no Claude app.");
+    print();
+
     let hostChoice = 0;
     while (!hostChoice) {
-      const choiceStr = (await ask("Select an option [1-4] (default: 1): ")).trim();
-      const choice = choiceStr === "" ? 1 : parseInt(choiceStr, 10);
+      const choiceStr = (await ask(`Select an option [1-4] (default: ${defaultChoice}): `)).trim();
+      const choice = choiceStr === "" ? defaultChoice : parseInt(choiceStr, 10);
       if (choice >= 1 && choice <= 4) {
         hostChoice = choice;
       } else {
@@ -525,9 +561,6 @@ export async function runTour(options = {}) {
     }
 
     print();
-    const hasClaudeCli = options.detectClaudeCode ? options.detectClaudeCode() : detectClaudeCode();
-    const claudeCodeConfigPath = options.claudeCodeConfigPath || getClaudeCodeConfigPath();
-    const claudeDesktopConfigPath = options.claudeDesktopConfigPath || getClaudeDesktopConfigPath();
     const results = [];
 
     if (hostChoice === 1 || hostChoice === 3) {
@@ -649,19 +682,24 @@ export async function runTour(options = {}) {
 
     print("Setup complete!");
     print();
-    if (results.some((r) => r.host === "Claude Code")) {
-      print("To test with Claude Code, launch `claude` and ask:");
+    const configured = (host) => results.some((r) => r.host === host);
+    if (configured("Claude Desktop")) {
+      print("Next: Quit Claude Desktop and open it again.");
+      if (!configured("Claude Code") && hasClaudeCli) {
+        print("The `claude` command line is set up separately. To add it, run this setup again and choose 1.");
+      }
+      print();
+    }
+    if (configured("Claude Code")) {
+      print("Next: start `claude` and ask:");
       print('  "Search my Obsidian notes for project roadmap"');
       print('  "What did I write in my daily note today?"');
       if (write) print('  "Add a line to my daily note saying setup works"');
       print();
     }
-    const runLauncher = resolveServerLauncher();
-    const runCommand = [runLauncher.command, ...serverArgs(runLauncher, selectedVault, selectedDaily, write)]
-      .map((part) => (/\s/.test(part) ? `"${part}"` : part))
-      .join(" ");
-    print("To run the MCP server directly in stdio mode:");
-    print(`  ${runCommand}`);
+    print(results.length > 0
+      ? "There is nothing to start yourself. Your AI app runs the server when it needs it."
+      : "Next: Add the snippet above to your app's settings, then restart the app.");
     print();
 
     return {

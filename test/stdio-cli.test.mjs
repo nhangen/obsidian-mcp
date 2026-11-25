@@ -653,7 +653,7 @@ test("a piped spawn with no arguments never writes the tour banner to stdout", a
       reject(new Error("timed out waiting for no-argument server to close"));
     }, 5000)),
   ]);
-  assert.doesNotMatch(stdout, /Obsidian MCP Server Setup|Select a vault|Enter the absolute path/);
+  assert.doesNotMatch(stdout, /Obsidian MCP Server Setup|Select a vault|Vault directory \(default:/);
 });
 
 test("server starts up and serves tools when started with --serve", async (t) => {
@@ -705,7 +705,7 @@ test("server launches tour banner when started with --tour", async (t) => {
   });
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
-    if (stdout.includes("Select a vault") || stdout.includes("Enter the absolute path")) {
+    if (stdout.includes("Select a vault") || stdout.includes("Vault directory (default:")) {
       child.stdin.end();
     }
   });

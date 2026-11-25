@@ -573,7 +573,7 @@ test("runTour expands ~ and rejects relative custom vault paths", async (t) => {
   t.after(() => rm(fixture, { recursive: true, force: true }));
   await mkdir(join(fixture, "Vault"), { recursive: true });
 
-  const io = scriptedTour([["Enter the absolute path", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const io = scriptedTour([["Vault directory", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -660,8 +660,6 @@ for (const [label, replies, writable] of [
       const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
       assert.equal(args.at(-1), writable ? "--write" : "--read", configPath);
     }
-    const runLine = io.text().split("\n").find((line, index, lines) => lines[index - 1] === "To run the MCP server directly in stdio mode:");
-    assert.ok(runLine.endsWith(writable ? "--write" : "--read"), runLine);
     assert.equal(/Writing is off/.test(io.text()), !writable);
   });
 }
@@ -839,3 +837,145 @@ test("getClaudeCodeConfigPath follows CLAUDE_CONFIG_DIR", (t) => {
   delete process.env.CLAUDE_CONFIG_DIR;
   assert.equal(getClaudeCodeConfigPath(), join(homedir(), ".claude.json"));
 });
+
+for (const { label, existing, cwdIsVault, expected, willCreate } of [
+  { label: "the current folder when it is a vault", existing: ["Documents/Obsidian"], cwdIsVault: true, expected: "work", willCreate: false },
+  { label: "~/Documents/Obsidian when it exists", existing: ["Documents/Obsidian", "Obsidian"], expected: "Documents/Obsidian", willCreate: false },
+  { label: "~/Obsidian when that is the one that exists", existing: ["Obsidian"], expected: "Obsidian", willCreate: false },
+  { label: "a new ~/Documents/Obsidian when nothing exists", existing: [], expected: "Documents/Obsidian", willCreate: true },
+]) {
+  test(`runTour accepts Enter at the vault path prompt: ${label}`, { timeout: 15_000 }, async (t) => {
+    const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-default-")));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    const cwd = join(home, "work");
+    await mkdir(cwd, { recursive: true });
+    if (cwdIsVault) await mkdir(join(cwd, ".obsidian"));
+    for (const dir of existing) await mkdir(join(home, dir), { recursive: true });
+
+    const io = scriptedTour([["Vault directory", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+    const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd });
+
+    assert.equal(result.vault, join(home, expected));
+    assert.equal(lstatSync(join(home, expected)).isDirectory(), true);
+    assert.equal(/Open folder as vault/.test(io.text()), willCreate, io.text());
+    assert.equal(io.text().includes(`Vault directory (default: ${join(home, expected)}${willCreate ? ", will be created" : ""}): `), true);
+  });
+}
+
+test("runTour creates no folder when a vault path is typed instead of accepted", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-typed-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await mkdir(join(home, "Mine"));
+
+  const io = scriptedTour([["Vault directory", "~/Mine"], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Mine"));
+  assert.equal(existsSync(join(home, "Documents")), false);
+});
+
+test("runTour asks again when the default vault folder cannot be created", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-blocked-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await mkdir(join(home, "Documents"));
+  await writeFile(join(home, "Documents", "Obsidian"), "a file, not a folder");
+  await mkdir(join(home, "Mine"));
+
+  const io = scriptedTour([["Vault directory", ["", "~/Mine"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Mine"));
+  assert.match(io.text(), /Could not create .*Documents\/Obsidian: .*EEXIST/);
+});
+
+test("runTour still accepts Enter after a mistyped vault path", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-mistyped-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const io = scriptedTour([["Vault directory", ["~/Missing", ""]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Documents", "Obsidian"));
+  assert.match(io.text(), /Directory does not exist: ~\/Missing/);
+  assert.equal(existsSync(join(home, "Missing")), false);
+});
+
+for (const hasCli of [true, false]) {
+  test(`runTour suggests adding the claude command line after a Desktop-only setup only when it exists: ${hasCli}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-hint-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "2"]]);
+    await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath: join(fixture, "claude.json"),
+      claudeDesktopConfigPath: join(fixture, "DesktopApp", "claude_desktop_config.json"),
+      detectClaudeCode: () => hasCli,
+    });
+
+    assert.equal(/`claude` command line is set up separately/.test(io.text()), hasCli, io.text());
+  });
+}
+
+for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, true], ["3", true, true], ["4", false, false]]) {
+  test(`runTour ends with next steps and no server command for host choice ${choice}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-next-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", choice]]);
+    await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath: join(fixture, "claude.json"),
+      claudeDesktopConfigPath: join(fixture, "DesktopApp", "claude_desktop_config.json"),
+      detectClaudeCode: () => false,
+    });
+
+    const ending = io.text().slice(io.text().indexOf("Setup complete!"));
+    assert.equal(/stdio|--vault/.test(ending), false, ending);
+    assert.equal(/start `claude` and ask/.test(ending), hasCode);
+    assert.equal(/Quit Claude Desktop and open it again/.test(ending), hasDesktop);
+    assert.equal(/nothing to start yourself/.test(ending), hasCode || hasDesktop);
+    assert.equal(/Add the snippet above to your app's settings, then restart the app/.test(ending), choice === "4");
+  });
+}
+
+for (const { code, desktop, expected, found } of [
+  { code: true, desktop: true, expected: 3, found: "Found: Claude Code, Claude Desktop" },
+  { code: true, desktop: false, expected: 1, found: "Found: Claude Code" },
+  { code: false, desktop: true, expected: 2, found: "Found: Claude Desktop" },
+  { code: false, desktop: false, expected: 4, found: "Found no Claude app" },
+]) {
+  test(`runTour Enter connects what it detects: code=${code} desktop=${desktop}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-detect-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+    const claudeCodeConfigPath = join(fixture, "claude.json");
+    const claudeDesktopConfigPath = join(fixture, "DesktopApp", "claude_desktop_config.json");
+    if (desktop) await mkdir(join(fixture, "DesktopApp"));
+    let cliAdds = 0;
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", ""]]);
+    const outcome = await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      claudeDesktopConfigPath,
+      detectClaudeCode: () => code,
+      configureClaudeCodeViaCli: async () => { cliAdds += 1; return { success: true, method: "cli" }; },
+    });
+
+    assert.equal(outcome.hostChoice, expected);
+    assert.equal(io.text().includes(`${found}\n`) || io.text().includes(`${found}.`), true, io.text());
+    assert.equal(io.text().includes(`Select an option [1-4] (default: ${expected}): `), true);
+    assert.equal(cliAdds, code ? 1 : 0);
+    assert.equal(existsSync(claudeDesktopConfigPath), desktop);
+    assert.equal(existsSync(claudeCodeConfigPath), false);
+  });
+}

@@ -10,12 +10,11 @@ This initial extraction imports only the tracked `packages/mcp-server` tree from
 with fresh repository history and the original MIT notice. It preserves the
 legacy package identity, launcher names, and protocol contract. Version `0.2.3`
 adds `--vault`, `--daily-path`, and `--repo-root` arguments to the stdio server (#92).
-It does not publish a new release, replace an existing deployment, or migrate
-the optional plugin/client integrations. That cutover remains separate work.
+The extraction did not replace an existing deployment or migrate the optional
+plugin/client integrations. That cutover remains separate work.
 
 ## Install from npm
 
-The package is not on npm yet. These commands work after the first publish.
 You need Node.js 20 or newer, Bash, Git, and standard Unix utilities. On
 Windows, use a Unix environment such as WSL.
 
@@ -26,6 +25,15 @@ npx -y @nhangen/obsidian-mcp
 Run it in a terminal. The setup tour finds your vaults, asks for the daily notes
 folder, asks whether to enable writing, and configures Claude Code, Claude
 Desktop, or both. Pressing Enter at the writing question enables it.
+
+The tour looks for the `claude` command line and for Claude Desktop, and its
+default connects the ones it finds. Choose another number to connect fewer.
+
+Pressing Enter accepts the default at every question. When the tour finds no
+vault, or you choose a custom directory, the default is the current folder if it
+is a vault, then an existing
+`~/Documents/Obsidian` or `~/Obsidian`. If none applies, Enter creates
+`~/Documents/Obsidian`.
 
 To configure Claude Code by hand, with writing enabled:
 
@@ -91,6 +99,7 @@ it is not a required extra installation for the intended plugin experience.
 ## Shared runtime for integrations
 
 The standalone server release is [mcp-v0.2.4](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.4).
+The portable client downloads that release, which is older than this package.
 The public portable client source is in [`packages/client`](packages/client/README.md),
 including the pinned bridge, lifecycle installer, optional isolated Codex capture,
 attached user-wide Codex capture state, and an explicit Claude plugin attachment
@@ -405,11 +414,11 @@ authenticated HTTP idempotency.
 ## Release and installation contract
 
 GitHub Actions is the release builder. A pushed `mcp-vVERSION` tag must match the
-private package version exactly. The workflow checks out that tag, installs the
-locked dependencies, runs the package test suite, runs `npm pack`, and retains
-the resulting tarball and release metadata as a CI artifact. Tag builds also
-publish both files as GitHub Release assets. The package remains private and is
-never published to the public npm registry.
+package version exactly. The workflow checks out that tag, installs the locked
+dependencies, runs the package test suite, runs `npm pack`, and retains the
+resulting tarball and release metadata as a CI artifact. Tag builds also publish
+both files as GitHub Release assets. The workflow does not publish to the npm
+registry. A maintainer publishes the release tarball with `npm publish`.
 
 The metadata is generated from the packed tarball. It records the source commit,
 package name and version, SHA-256 of the packaged `contract.json`, SHA-256 of the
