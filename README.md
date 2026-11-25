@@ -30,7 +30,8 @@ The tour looks for the `claude` command line and for Claude Desktop, and its
 default connects the ones it finds. Choose another number to connect fewer.
 
 Pressing Enter accepts the default at every question. When the tour finds no
-vault, the default is the current folder if it is a vault, then an existing
+vault, or you choose a custom directory, the default is the current folder if it
+is a vault, then an existing
 `~/Documents/Obsidian` or `~/Obsidian`. If none applies, Enter creates
 `~/Documents/Obsidian`.
 
@@ -99,7 +100,7 @@ it is not a required extra installation for the intended plugin experience.
 
 The standalone server release is [mcp-v0.2.5](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.5).
 The public portable client source is in [`packages/client`](packages/client/README.md),
-including the pinned bridge, lifecycle installer, optional isolated Codex capture,
+including the pinned bridge (still pinned to `mcp-v0.2.4`), lifecycle installer, optional isolated Codex capture,
 attached user-wide Codex capture state, and an explicit Claude plugin attachment
 API. The public runtime requires no
 private llm-tools harness. Attachment preserves existing host settings and does
