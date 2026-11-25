@@ -117,23 +117,24 @@ function runCliProcess(args = [], extraEnv = {}) {
 }
 
 test("parseCliArgs unit tests", () => {
-  assert.deepEqual(parseCliArgs([]), { help: false, tour: false, serve: false, write: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs([]), { help: false, tour: false, serve: false, write: false, read: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
   assert.deepEqual(parseCliArgs(["-h"]), { help: true });
   assert.deepEqual(parseCliArgs(["--help"]), { help: true });
-  assert.deepEqual(parseCliArgs(["--tour"]), { help: false, tour: true, serve: false, write: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--serve"]), { help: false, tour: false, serve: true, write: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--stdio"]), { help: false, tour: false, serve: true, write: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault", "/path/to/vault"]), { help: false, tour: false, serve: false, write: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["-v", "/path/to/vault"]), { help: false, tour: false, serve: false, write: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault=/path/to/vault"]), { help: false, tour: false, serve: false, write: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["-v=/path/to/vault"]), { help: false, tour: false, serve: false, write: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path", "Custom/"]), { help: false, tour: false, serve: false, write: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
-  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path=Custom/"]), { help: false, tour: false, serve: false, write: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--tour"]), { help: false, tour: true, serve: false, write: false, read: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--serve"]), { help: false, tour: false, serve: true, write: false, read: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--stdio"]), { help: false, tour: false, serve: true, write: false, read: false, vault: undefined, dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/path/to/vault"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["-v", "/path/to/vault"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault=/path/to/vault"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["-v=/path/to/vault"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/path/to/vault", dailyPath: undefined, repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path", "Custom/"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
+  assert.deepEqual(parseCliArgs(["--vault", "/v", "--daily-path=Custom/"]), { help: false, tour: false, serve: false, write: false, read: false, vault: "/v", dailyPath: "Custom/", repoRoots: [] });
   assert.deepEqual(parseCliArgs(["--vault", "/v", "--repo-root", "/r1", "--repo-root", "/r2"]), {
     help: false,
     tour: false,
     serve: false,
     write: false,
+    read: false,
     vault: "/v",
     dailyPath: undefined,
     repoRoots: ["/r1", "/r2"],
@@ -152,6 +153,7 @@ test("shows usage and exits 0 on --help and -h", async () => {
   assert.match(helpLong.stdout, /Usage: obsidian-mcp \[options\]/);
   assert.match(helpLong.stdout, /--vault <path>/);
   assert.match(helpLong.stdout, /--write/);
+  assert.match(helpLong.stdout, /--read /);
   assert.match(helpLong.stdout, /--daily-path <path>/);
   assert.match(helpLong.stdout, /--repo-root <path>/);
 
@@ -734,10 +736,11 @@ for (const [label, args, profile, writable] of [
   ["--write", ["--write"], "", true],
   ["--write over MCP_STDIO_PROFILE=read", ["--write"], "read", true],
   ["MCP_STDIO_PROFILE=write alone", [], "write", true],
+  ["--read over MCP_STDIO_PROFILE=write", ["--read"], "write", false],
 ]) {
   test(`stdio tool list with ${label}`, async (t) => {
     const vault = await mkdtemp(join(tmpdir(), "mcp-cli-write-"));
-    const server = startCliServer(["--vault", vault, ...args], { MCP_STDIO_PROFILE: profile });
+    const server = startCliServer(["--vault", vault, ...args], { MCP_STDIO_PROFILE: profile, HOME: vault });
     t.after(async () => {
       server.child.stdin.end();
       await once(server.child, "close").catch(() => {});
@@ -750,3 +753,33 @@ for (const [label, args, profile, writable] of [
     for (const tool of ["obsidian_keeper_save", "obsidian_daily_append"]) assert.equal(names.includes(tool), writable, tool);
   });
 }
+
+test("--read and --write cannot be combined", () => {
+  assert.throws(() => parseCliArgs(["--read", "--write"]), /cannot be combined/);
+  assert.equal(shouldLaunchTour({ cli: parseCliArgs(["--read"]), env: {}, isTTY: true }), false);
+});
+
+test("the built dist entry enables writing with --write", async (t) => {
+  const vault = await mkdtemp(join(tmpdir(), "mcp-cli-dist-"));
+  const child = spawn(process.execPath, [join(packageRoot, "dist", "stdio.mjs"), "--vault", vault, "--write"], {
+    cwd: tmpdir(), env: { PATH: process.env.PATH, HOME: vault }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(async () => {
+    child.stdin.end();
+    await once(child, "close").catch(() => {});
+    await rm(vault, { recursive: true, force: true });
+  });
+  const messages = [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+  ];
+  child.stdin.write(messages.map((message) => `${JSON.stringify(message)}\n`).join(""));
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  for await (const chunk of child.stdout) {
+    output += chunk;
+    if (output.split("\n").slice(0, -1).some((line) => JSON.parse(line).id === 2)) break;
+  }
+  assert.match(output, /obsidian_daily_append/);
+});

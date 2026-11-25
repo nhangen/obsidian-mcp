@@ -46,10 +46,11 @@ For Claude Desktop or another MCP client:
 }
 ```
 
-Leave out `--write` for a server that can only search notes and read commit
-details. With `--write`, the server also offers `obsidian_keeper_save` and
-`obsidian_daily_append`. To change an existing Claude Code entry, run
-`claude mcp remove obsidian -s user` first.
+For a server that can only search notes and read commit details, use `--read`
+instead of `--write`. With `--write`, the server also offers
+`obsidian_keeper_save` and `obsidian_daily_append`. To change an existing Claude
+Code entry, run the tour again and let it replace the entry, or run
+`claude mcp remove obsidian -s user` and add it again.
 
 ## Server and plugin client
 
@@ -227,13 +228,14 @@ obsidian-mcp
 
 (or `obsidian-mcp --tour` from anywhere) launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, asks whether to enable writing (Enter means yes), and configures Claude Code or Claude Desktop.
 
-When spawned by an AI host (piped stdin/stdout) or invoked with `--serve`, `--vault`, `--daily-path`, `--repo-root`, or `--write`, the binary immediately runs the headless stdio MCP server without human prompts.
+When spawned by an AI host (piped stdin/stdout) or invoked with `--serve`, `--vault`, `--daily-path`, `--repo-root`, `--write`, or `--read`, the binary immediately runs the headless stdio MCP server without human prompts.
 
 CLI options supported by `obsidian-mcp` (and `claude-obsidian-mcp`):
 - `-v, --vault <path>`: Absolute path to the Obsidian vault directory.
 - `--daily-path <path>`: Relative path within the vault for daily notes (default: `Daily/`).
 - `--repo-root <path>`: Allowed repository root for commit metadata (can be repeated or platform-delimited).
-- `--write`: Enable the write tools. Takes precedence over `MCP_STDIO_PROFILE`.
+- `--write`: Enable the write tools. Overrides `MCP_STDIO_PROFILE`.
+- `--read`: Disable the write tools. Overrides `MCP_STDIO_PROFILE`. You can't combine it with `--write`. With neither flag, `MCP_STDIO_PROFILE` applies.
 - `--tour`: Explicitly launch the interactive guided setup tour.
 - `--serve, --stdio`: Force headless stdio JSON-RPC server execution even in an interactive terminal.
 - `-h, --help`: Show usage and exit.
