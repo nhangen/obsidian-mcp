@@ -857,6 +857,7 @@ for (const { label, existing, cwdIsVault, expected, willCreate } of [
 
     assert.equal(result.vault, join(home, expected));
     assert.equal(lstatSync(join(home, expected)).isDirectory(), true);
+    assert.equal(/Open folder as vault/.test(io.text()), willCreate, io.text());
     assert.equal(io.text().includes(`Vault directory (default: ${join(home, expected)}${willCreate ? ", will be created" : ""}): `), true);
   });
 }

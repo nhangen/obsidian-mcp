@@ -473,6 +473,7 @@ export async function runTour(options = {}) {
       if (!typed && !suggestion.exists) {
         try {
           await mkdir(suggestion.path, { recursive: true });
+          print(`Created ${suggestion.path}. To see it in Obsidian, choose "Open folder as vault".`);
         } catch (err) {
           print(`Could not create ${suggestion.path}: ${err.message}`);
           continue;
