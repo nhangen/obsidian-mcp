@@ -873,6 +873,32 @@ test("runTour creates no folder when a vault path is typed instead of accepted",
   assert.equal(existsSync(join(home, "Documents")), false);
 });
 
+test("runTour asks again when the default vault folder cannot be created", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-blocked-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await mkdir(join(home, "Documents"));
+  await writeFile(join(home, "Documents", "Obsidian"), "a file, not a folder");
+  await mkdir(join(home, "Mine"));
+
+  const io = scriptedTour([["Vault directory", ["", "~/Mine"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Mine"));
+  assert.match(io.text(), /Could not create .*Documents\/Obsidian: .*EEXIST/);
+});
+
+test("runTour still accepts Enter after a mistyped vault path", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-mistyped-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const io = scriptedTour([["Vault directory", ["~/Missing", ""]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Documents", "Obsidian"));
+  assert.match(io.text(), /Directory does not exist: ~\/Missing/);
+  assert.equal(existsSync(join(home, "Missing")), false);
+});
+
 for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, true], ["3", true, true], ["4", false, false]]) {
   test(`runTour ends with next steps and no server command for host choice ${choice}`, { timeout: 15_000 }, async (t) => {
     const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-next-")));

@@ -474,7 +474,8 @@ export async function runTour(options = {}) {
         try {
           await mkdir(suggestion.path, { recursive: true });
         } catch (err) {
-          throw new Error(`Could not create ${suggestion.path}: ${err.message}`);
+          print(`Could not create ${suggestion.path}: ${err.message}`);
+          continue;
         }
       }
       const customPath = typed || suggestion.path;
