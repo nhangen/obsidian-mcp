@@ -1940,3 +1940,40 @@ test("Streamable HTTP transport enforces scope gating on write tools", async (t)
   assert.equal(writeResult.result.isError, false);
   assert.equal(JSON.parse(writeResult.result.content[0].text).status, "committed");
 });
+
+// UTC-12 and UTC+14: at any instant at least one is on a different date than UTC.
+for (const [zone, offsetHours] of [["Etc/GMT+12", -12], ["Pacific/Kiritimati", 14]]) {
+  test(`a dateless daily append uses the server's local date in ${zone}`, async (t) => {
+    const { root, vaultPath, configPath } = await createFixtureVault();
+    const servers = [
+      startStdioServer(configPath, { TZ: zone }),
+      // An unusable TMPDIR fails init_content staging, which reports the fallback path.
+      startStdioServer(configPath, { TZ: zone, TMPDIR: join(root, "missing-tmp") }),
+    ];
+    t.after(async () => {
+      for (const server of servers) {
+        if (!server.child.killed) server.child.stdin.end();
+        await once(server.child, "close").catch(() => {});
+      }
+      await rm(root, { recursive: true, force: true });
+    });
+    const localDate = () => new Date(Date.now() + offsetHours * 3_600_000).toISOString().slice(0, 10);
+    const append = async (server, args) => {
+      await server.request({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0" } } }, 1);
+      server.notification({ jsonrpc: "2.0", method: "notifications/initialized" });
+      const response = await server.request({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "obsidian_daily_append", arguments: args } }, 2);
+      return response.result.structuredContent;
+    };
+
+    const before = localDate();
+    const written = await append(servers[0], { content: "- local date", idempotency_key: "local-date-1" });
+    const failed = await append(servers[1], { content: "- local date", init_content: "# seed\n", idempotency_key: "local-date-2" });
+    const expected = [before, localDate()].map((date) => `Daily/${date}.md`);
+
+    assert.equal(written.status, "committed");
+    assert.ok(expected.includes(written.path), `${written.path} is not in ${expected}`);
+    assert.match(await readFile(join(vaultPath, written.path), "utf8"), /- local date/);
+    assert.equal(failed.status, "failed");
+    assert.ok(expected.includes(failed.path), `${failed.path} is not in ${expected}`);
+  });
+}

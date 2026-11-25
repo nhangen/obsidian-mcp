@@ -500,6 +500,11 @@ function normalizeKeeperOutcome(outcome) {
   return downgradeKeyless(outcome, "PARTIAL");
 }
 
+function localDate(now = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
 function writeRequestFallback(toolName, args, configuration) {
   const values = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const requestId = typeof values.request_id === "string" && /^[A-Za-z0-9._:-]{1,240}$/.test(values.request_id)
@@ -517,7 +522,7 @@ function writeRequestFallback(toolName, args, configuration) {
   }
   const date = typeof values.date === "string"
     ? (isCalendarDate(values.date) ? values.date : "")
-    : new Date().toISOString().slice(0, 10);
+    : localDate();
   const explicit = typeof values.target_path === "string" && targetPathPattern.test(values.target_path.trim()) ? values.target_path.trim() : "";
   const path = explicit || (typeof values.target_path === "string" || !date ? "" : configuration.dailyPath ? `${configuration.dailyPath}/${date}.md` : "");
   return emptyWriteOutcome(requestId, idempotencyKey, path, path ? [path] : []);
@@ -842,7 +847,7 @@ async function withStagedInitFile(initContent, run) {
 }
 
 async function dailyAppend({ content, section, date, target_path, skip_if_hash, init_content, idempotency_key, request_id }, vaultPath, dailyPath, signal) {
-  const targetDate = date || new Date().toISOString().slice(0, 10);
+  const targetDate = date || localDate();
   const targetPath = target_path || `${dailyPath.replace(/\/+$/, "")}/${targetDate}.md`;
   const requestId = request_id || randomUUID();
   const idempotencyKey = idempotency_key || "";
