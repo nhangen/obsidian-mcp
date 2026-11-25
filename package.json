@@ -9,6 +9,16 @@
   "homepage": "https://github.com/nhangen/obsidian-mcp#readme",
   "bugs": "https://github.com/nhangen/obsidian-mcp/issues",
   "description": "Obsidian MCP server over stdio and authenticated Streamable HTTP.",
+  "keywords": [
+    "obsidian",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "claude-desktop",
+    "vault",
+    "notes"
+  ],
   "type": "module",
   "main": "dist/stdio.mjs",
   "files": [

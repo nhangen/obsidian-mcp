@@ -40,6 +40,22 @@ Add the `obsidian` and `obsidian-write` MCP servers to your OpenCode configurati
 }
 ```
 
+### Local stdio server (npm package)
+
+When the vault is on the same machine as OpenCode, you can use the npm package as
+one local server instead of the two launchers. Use `--read` to allow search only:
+
+```json
+{
+  "mcp": {
+    "obsidian": {
+      "type": "local",
+      "command": ["npx", "-y", "@nhangen/obsidian-mcp", "--vault", "/absolute/path/to/vault", "--daily-path", "Daily/", "--write"]
+    }
+  }
+}
+```
+
 ## Scoped Host Authorization
 
 Routine writes (`obsidian_keeper_save`, `obsidian_daily_append`) require host-level write policy to avoid constant interactive approval prompts. In `opencode.jsonc`:
@@ -53,6 +69,8 @@ Routine writes (`obsidian_keeper_save`, `obsidian_daily_append`) require host-le
 ```
 
 This grants authorization specifically to the `obsidian-write` server's declared tools. The read server requires no special permissions beyond normal tool execution.
+
+With the single local `obsidian` entry, allow `"obsidian_obsidian_keeper_save": "allow"` and `"obsidian_obsidian_daily_append": "allow"` instead. These names follow OpenCode's `<server>_<tool>` pattern and haven't been tried on a live OpenCode install. An `obsidian-write` entry from an earlier setup can still write when `obsidian` uses `--read`; delete `mcp.obsidian-write` and its permission rule if you want writing off. To uninstall, delete `mcp.obsidian` from your OpenCode config, plus `mcp.obsidian-write` and its permission rule if you have them. For `obsidian_commit_meta`, add `"--repo-root", "<absolute path>"` to the command.
 
 ## Supported Workflows
 

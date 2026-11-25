@@ -5,13 +5,12 @@ packaged deterministic keeper performs every vault mutation. Neither a Claude
 plugin nor the private llm-tools harness is required. The host running the server
 needs filesystem access to the vault; remote clients do not.
 
-This initial extraction imports only the tracked `packages/mcp-server` tree from
+This server was extracted from `packages/mcp-server` in
 [`nhangen/claude-obsidian-plugin` at `76df3151104e37f409589fcda7ff3da65cc8c0d8`](https://github.com/nhangen/claude-obsidian-plugin/tree/76df3151104e37f409589fcda7ff3da65cc8c0d8/packages/mcp-server),
-with fresh repository history and the original MIT notice. It preserves the
-legacy package identity, launcher names, and protocol contract. Version `0.2.3`
-adds `--vault`, `--daily-path`, and `--repo-root` arguments to the stdio server (#92).
-The extraction did not replace an existing deployment or migrate the optional
-plugin/client integrations. That cutover remains separate work.
+with fresh repository history and the original MIT notice. The private
+`@claude-obsidian/mcp-server` package became `@nhangen/obsidian-mcp`. It keeps
+the `claude-obsidian-mcp` launchers and the protocol contract. Version `0.2.5`
+is the first npm release.
 
 ## Install from npm
 
@@ -35,6 +34,11 @@ is a vault, then an existing
 `~/Documents/Obsidian` or `~/Obsidian`. If none applies, Enter creates
 `~/Documents/Obsidian`.
 
+If Claude Desktop reports `spawn npx ENOENT` or can't find `node`, it isn't
+seeing your shell `PATH`. Run `npm install -g @nhangen/obsidian-mcp`, then run
+`obsidian-mcp --tour` and replace the entry. The new entry records the full path
+to Node.
+
 To configure Claude Code by hand, with writing enabled:
 
 ```bash
@@ -54,21 +58,65 @@ For Claude Desktop or another MCP client:
 }
 ```
 
-For a server that can only search notes and read commit details, use `--read`
-instead of `--write`. With `--write`, the server also offers
+For a server that can't write, use `--read` instead of `--write`. A separate
+`obsidian-write` entry from an earlier setup, or a project's own `obsidian`
+entry that uses `--write`, can still write. Remove or change those if you want
+writing off. `obsidian_commit_meta` answers only for repositories under a
+`--repo-root <absolute path>` (repeatable) or `MCP_REPOSITORY_ROOTS`. The tour
+doesn't set either.
+With `--write`, the server also offers
 `obsidian_keeper_save` and `obsidian_daily_append`. To change an existing Claude
 Code entry, run the tour again and let it replace the entry, or run
 `claude mcp remove obsidian -s user` and add it again.
 
+### Update
+
+When you run the tour through `npx`, it pins the version it ran. To update, run
+`npx -y @nhangen/obsidian-mcp@latest`, and restart the app. The tour replaces
+the Claude Desktop entry and keeps a backup. For Claude Code, if it asks to
+replace the existing `obsidian` entry, answer `Y`. If you installed with `npm install -g`,
+run `npm install -g @nhangen/obsidian-mcp@latest` and restart the app. A global
+install's entry records the path to Node, so run the tour again after you switch
+Node versions. The tour's banner shows the version it runs:
+`Obsidian MCP Server Setup (vX.Y.Z)`. If you added an unpinned entry by hand, `npx` chooses the version.
+
+### Uninstall
+
+- Claude Code: `claude mcp remove obsidian -s user`. Also remove any
+  `obsidian-write` entry that an earlier setup left
+  (`claude mcp remove obsidian-write`), and any project entry
+  (`claude mcp remove obsidian -s local`, run in that folder). In each project
+  folder where you set up Obsidian, `claude mcp list` should then show no
+  `obsidian` or `obsidian-write` entry.
+- Claude Desktop: delete `mcpServers.obsidian` (and `mcpServers.obsidian-write`,
+  if present) from `claude_desktop_config.json`,
+  then restart the app. The file is in `~/Library/Application Support/Claude/` on
+  macOS, `%APPDATA%\Claude\` on Windows, and `~/.config/Claude/` (or `$XDG_CONFIG_HOME/Claude/`) on Linux.
+- Global install: `npm uninstall -g @nhangen/obsidian-mcp`
+- Codex and OpenCode: see their guides under
+  [`integrations`](https://github.com/nhangen/obsidian-mcp/tree/master/integrations).
+
+The tour's backups (`.bak` and `.replaced-*.bak`) sit next to each config. Delete
+them when you no longer need them. These steps don't touch your vault.
+
 ## Server and plugin client
 
-This repository owns the independent server and reusable transport/capture
-runtime. The existing cross-app [Obsidian plugin](https://github.com/nhangen/claude-obsidian-plugin)
-is the user-facing client for supported hosts, including Claude Code and Codex.
-The intended normal path is to install the plugin and connect it to a server;
-the plugin should verify and manage compatible runtime dependencies rather than
-require users to install a third product. The private llm-tools harness is not
-required by either product.
+There are three separate pieces:
+
+- **This npm package** is the server. With the setup above, it runs locally over
+  stdio on the machine that holds the vault, for Claude Code, Claude Desktop, or
+  another MCP client. It provides tools only, with no automatic commit or session
+  capture.
+- **The portable client** ([`packages/client`](https://github.com/nhangen/obsidian-mcp/blob/master/packages/client/README.md)) isn't
+  in the npm package. It's for machines without the vault: its launchers connect
+  to a self-hosted HTTP server, and it adds optional capture. It pins its own
+  server release (see below).
+- **The cross-app [Obsidian plugin](https://github.com/nhangen/claude-obsidian-plugin)**
+  is the user-facing client for supported hosts, including Claude Code and Codex.
+
+None of these needs the private llm-tools harness. If you already use the plugin,
+adding this server doesn't by itself move the plugin's saving to it. The plugin
+can keep saving to its own local vault.
 
 Unified plugin onboarding is still tracked in
 [plugin #254](https://github.com/nhangen/claude-obsidian-plugin/issues/254).
@@ -85,22 +133,20 @@ Codex can trust administrator-managed hooks through system requirements or MDM
 instead of asking each user to trust plugin hooks. The public runtime includes an
 offline deployment exporter for reviewing this option. It is **preparatory, not
 an installer**: it neither edits system policy nor activates capture. See the
-[Codex managed-deployment boundary](integrations/codex/README.md#administrator-managed-deployment-preview).
+[Codex managed-deployment boundary](https://github.com/nhangen/obsidian-mcp/blob/master/integrations/codex/README.md#administrator-managed-deployment-preview).
 
 Normal setup-once Codex capture, an explicit managed mode without duplicate local
 handlers, protected executable dependencies, and an ownership-safe install,
 upgrade, and uninstall remain separate acceptance gates. The exporter does not
 complete plugin #254 or establish managed-host acceptance.
 
-The server remains usable through standard MCP without the plugin. Direct
-runtime installation remains an advanced integration and compatibility route;
-it is not a required extra installation for the intended plugin experience.
+The server is usable through standard MCP without the plugin.
 
 ## Shared runtime for integrations
 
 The standalone server release is [mcp-v0.2.4](https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.4).
 The portable client downloads that release, which is older than this package.
-The public portable client source is in [`packages/client`](packages/client/README.md),
+The public portable client source is in [`packages/client`](https://github.com/nhangen/obsidian-mcp/blob/master/packages/client/README.md),
 including the pinned bridge, lifecycle installer, optional isolated Codex capture,
 attached user-wide Codex capture state, and an explicit Claude plugin attachment
 API. The public runtime requires no
@@ -111,17 +157,17 @@ Pre-hook preparation and immutable retries. It needs no Bash stdin helper grant;
 existing MCP tool authorization and recovery checks still apply.
 Claude attach can snapshot a private exact-repository commit route map once with
 `--commit-routes /absolute/private/routes.json`; user-scope children inherit it.
-See [commit route policy](packages/client/README.md#commit-route-policy) for the
+See [commit route policy](https://github.com/nhangen/obsidian-mcp/blob/master/packages/client/README.md#commit-route-policy) for the
 bounded format, frozen-target behavior, and host limits.
 Explicit attached Claude profiles can opt into `--project-mode directory` for
 session-only non-Git workspaces. Git remains the default and is required for
-commit capture. See the [directory-profile boundary](packages/client/README.md#explicit-directory-session-profiles);
+commit capture. See the [directory-profile boundary](https://github.com/nhangen/obsidian-mcp/blob/master/packages/client/README.md#explicit-directory-session-profiles);
 this source support does not establish a released client or whole-host acceptance.
 
 The attached Codex API routes newly opened Git and non-Git workspaces from one
 private user profile without creating workspace configuration. It does not
 register hooks, alter normal Codex settings, trust hooks, or activate a writer.
-See [attached Codex capture](packages/client/README.md#attached-user-wide-codex-capture-api).
+See [attached Codex capture](https://github.com/nhangen/obsidian-mcp/blob/master/packages/client/README.md#attached-user-wide-codex-capture-api).
 Normal plugin activation and administrator-managed deployment remain separate.
 
 From a trusted checkout, with Python 3.11+ and Node.js 22+:
@@ -135,9 +181,9 @@ python3 /absolute/new/client-bundle/bin/obsidian-mcp-client-install \
 The packer requires an output outside the repository and prints the release
 inventory digest. Use the installer and digest from the trusted checkout or CI
 artifact, not from an unauthenticated bundle. Host setup guides are under
-[`integrations/codex`](integrations/codex/README.md),
-[`integrations/claude`](integrations/claude/README.md) and
-[`integrations/opencode`](integrations/opencode/README.md). Setup is explicit;
+[`integrations/codex`](https://github.com/nhangen/obsidian-mcp/blob/master/integrations/codex/README.md),
+[`integrations/claude`](https://github.com/nhangen/obsidian-mcp/blob/master/integrations/claude/README.md) and
+[`integrations/opencode`](https://github.com/nhangen/obsidian-mcp/blob/master/integrations/opencode/README.md). Setup is explicit;
 installation does not change credentials, hooks, host settings or writer ownership.
 Automatic-capture host acceptance and client-release publication remain tracked in
 [issue #2](https://github.com/nhangen/obsidian-mcp/issues/2). Fixture tests are not
@@ -203,16 +249,21 @@ launcher and explicit configuration boundaries:
 }
 ```
 
-The manifest examples use `/absolute/path/to/` as an explicit placeholder. Replace
-that prefix with the absolute path to the installed package before importing the
-manifest; clients must not expand shell variables or rely on an inherited `PATH`.
+The bare command needs a global install
+(`npm install -g @nhangen/obsidian-mcp`). A full path to a global or local
+install also works. GUI
+clients such as Claude Desktop might not inherit your shell `PATH`, so use the
+full path that `command -v claude-obsidian-mcp` prints. The launcher also needs
+to find `node`. If the client can't, use the setup tour, which records Node's full
+path. The [example manifests](https://github.com/nhangen/obsidian-mcp/tree/master/examples/manifests) use `/absolute/path/to/` as a
+placeholder. Replace each placeholder path before you import one.
 
 The client invokes the package command rather than a file inside the package;
 configuration and repository authorization remain explicit environment values.
 Installed packages authorize no repository roots when `MCP_REPOSITORY_ROOTS`
 is omitted. Multiple roots use the platform path delimiter.
 
-Alternatively, the stdio server accepts `--vault <path>` (alias `-v <path>`) directly as a command-line argument for zero-install and config-free local setups:
+Alternatively, the stdio server accepts `--vault <path>` (alias `-v <path>`) directly as a command-line argument for config-free local setups:
 
 ```json
 {
@@ -235,7 +286,7 @@ Running the package binary directly in an interactive terminal (with TTY stdin/s
 obsidian-mcp
 ```
 
-(or `obsidian-mcp --tour` from anywhere) launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, asks whether to enable writing (Enter means yes), and configures Claude Code or Claude Desktop.
+(or `obsidian-mcp --tour` from anywhere) launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, asks whether to enable writing (Enter means yes), and configures Claude Code, Claude Desktop, or both.
 
 When spawned by an AI host (piped stdin/stdout) or invoked with `--serve`, `--vault`, `--daily-path`, `--repo-root`, `--write`, or `--read`, the binary immediately runs the headless stdio MCP server without human prompts.
 
@@ -403,8 +454,8 @@ persistence remains in the client-side shell workflow. Both prompts are exposed
 to clients with `vault:read`. The admin-only `reorganize_vault` workflow remains
 outside the MCP MVP until a separate policy and write contract exists.
 
-The machine-readable contract is [`contract.json`](contract.json). Its fixture
-cases are in [`test/fixtures/contract-fixtures.json`](test/fixtures/contract-fixtures.json)
+The machine-readable contract is [`contract.json`](https://github.com/nhangen/obsidian-mcp/blob/master/contract.json). Its fixture
+cases are in [`test/fixtures/contract-fixtures.json`](https://github.com/nhangen/obsidian-mcp/blob/master/test/fixtures/contract-fixtures.json)
 and are checked by `test/contract.test.mjs`.
 
 Admin prompts and legacy HTTP+SSE remain explicitly gated in the contract. Routine
@@ -517,7 +568,6 @@ MCP_HTTP_JWT_ISSUER=https://issuer.example
 MCP_HTTP_JWT_AUDIENCE=claude-obsidian
 MCP_HTTP_ALLOWED_HOSTS=127.0.0.1,localhost,mcp.example.com
 MCP_HTTP_ALLOWED_ORIGINS=https://client.example
-MCP_STDIO_PROFILE=write
 ```
 
 File permissions must protect credentials (`chmod 0600 /etc/obsidian-mcp/server.env`).

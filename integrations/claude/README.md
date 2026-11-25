@@ -1,59 +1,38 @@
 # Obsidian MCP for Claude Code
 
-Connect Claude Code directly to Obsidian MCP over standard stdio or authenticated Streamable HTTP without requiring the Claude plugin or a local vault checkout on the client machine.
+Connect Claude Code to Obsidian MCP over stdio or authenticated Streamable HTTP without the Claude plugin. Stdio runs on the machine that holds the vault. Streamable HTTP connects to a remote server, so the client machine needs no vault.
 
 ## Prerequisites
 
 - **Claude Code CLI**: A build supporting MCP; verify it against your installed version.
 - **Node.js**: 22 or newer for Streamable HTTP read bridge / launchers; Node 20+ for stdio.
-- **Python**: 3.11+ for this bundle's installer and native utilities.
+- **Python**: 3.11+ for the portable client bundle only. The npm stdio server doesn't need it.
 
 ## Connection Setup
 
 ### 1. Stdio (Local Server)
 
-When running the MCP server locally on the same machine where Claude Code runs:
+When the vault is on the same machine as Claude Code, run the setup tour from the
+npm package:
 
-```json
-{
-  "mcpServers": {
-    "obsidian": {
-      "command": "node",
-      "args": ["/absolute/path/to/installed-server/dist/stdio.mjs"],
-      "env": {
-        "OBSIDIAN_LOCAL_MD": "/absolute/path/to/obsidian.local.md",
-        "MCP_REPOSITORY_ROOTS": "/absolute/path/to/repositories"
-      }
-    }
-  }
-}
+```bash
+npx -y @nhangen/obsidian-mcp
 ```
 
-By default, the stdio server defaults to the read profile. To enable routine note saving and daily note appends without repetitive approval, add a write server:
+To configure it by hand, add one `obsidian` entry. Use `--write` to allow saving,
+or `--read` to allow search only:
 
-```json
-{
-  "mcpServers": {
-    "obsidian": {
-      "command": "node",
-      "args": ["/absolute/path/to/installed-server/dist/stdio.mjs"],
-      "env": {
-        "OBSIDIAN_LOCAL_MD": "/absolute/path/to/obsidian.local.md",
-        "MCP_REPOSITORY_ROOTS": "/absolute/path/to/repositories"
-      }
-    },
-    "obsidian-write": {
-      "command": "node",
-      "args": ["/absolute/path/to/installed-server/dist/stdio.mjs"],
-      "env": {
-        "OBSIDIAN_LOCAL_MD": "/absolute/path/to/obsidian.local.md",
-        "MCP_STDIO_PROFILE": "write",
-        "MCP_REPOSITORY_ROOTS": "/absolute/path/to/repositories"
-      }
-    }
-  }
-}
+```bash
+claude mcp add -s user obsidian -- npx -y @nhangen/obsidian-mcp --vault /absolute/path/to/vault --daily-path Daily/ --write
 ```
+
+For `obsidian_commit_meta`, add `--repo-root <absolute path>` to the server
+command.
+
+You don't need a separate `obsidian-write` entry for stdio. If an earlier setup
+left one, it can still write even when `obsidian` uses `--read`, so remove it if
+you want writing off. See the
+[package README](../../README.md#install-from-npm) for updating and uninstalling.
 
 ### 2. Streamable HTTP (Remote Server)
 
@@ -100,7 +79,7 @@ Automatic MCP writes require scoped host policy rather than repetitive manual co
 }
 ```
 
-This rule permits `obsidian_keeper_save` and `obsidian_daily_append` under the authenticated write profile. Requests outside the MCP contract remain rejected.
+This rule permits `obsidian_keeper_save` and `obsidian_daily_append` under the authenticated write profile. Requests outside the MCP contract remain rejected. With the single stdio entry, allow `mcp__obsidian__obsidian_keeper_save` and `mcp__obsidian__obsidian_daily_append` instead.
 
 ## Workflows & Capabilities
 

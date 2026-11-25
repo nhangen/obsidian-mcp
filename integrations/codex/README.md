@@ -12,6 +12,27 @@ establish hook delivery or automatic-capture acceptance on your installed build.
 - **Node.js**: 22 or newer for Streamable HTTP read bridge / launchers; Node 20+ for stdio.
 - **Python**: 3.11 or newer for native capture execution and metadata parsing.
 
+## Local stdio server (npm package)
+
+When the vault is on the same machine as Codex, add the npm package as one server:
+
+```bash
+codex mcp add obsidian -- npx -y @nhangen/obsidian-mcp --vault /absolute/path/to/vault --daily-path Daily/ --write
+```
+
+Use `--read` to allow search only. This adds MCP tools, not automatic capture.
+To skip the approval prompt on each save, add
+`default_tools_approval_mode = "auto"` under `[mcp_servers.obsidian]` in
+`config.toml`, the same setting the read server uses below. An `obsidian-write`
+server from an earlier setup can still write when `obsidian` uses `--read`;
+remove it with `codex mcp remove obsidian-write`. To uninstall, run
+`codex mcp remove obsidian`, and `codex mcp remove obsidian-write` if you have
+that server. For `obsidian_commit_meta`, add
+`--repo-root <absolute path>` to the server command.
+
+The rest of this page covers the portable client, which connects to a remote
+server.
+
 ## Connection Setup (`config.toml`)
 
 In `~/.codex/config.toml` (or your isolated profile's `CODEX_HOME/config.toml`):

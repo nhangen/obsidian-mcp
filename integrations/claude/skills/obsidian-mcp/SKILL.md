@@ -5,7 +5,7 @@ description: Use the Obsidian MCP adapter for bounded vault reads, commit metada
 
 # Obsidian MCP adapter
 
-Use this skill in a supported host when the user asks to search the configured Obsidian vault, read its published resources, inspect repository commit metadata, save a guarded note, append to a daily note, ask the vault librarian, or summarize a session. Use the `obsidian` MCP server for read workflows. Use `obsidian-write` for task-authorized writes when the host has enabled its write policy; no per-write approval prompt is required.
+Use this skill in a supported host when the user asks to search the configured Obsidian vault, read its published resources, inspect repository commit metadata, save a guarded note, append to a daily note, ask the vault librarian, or summarize a session. Use the `obsidian` MCP server for read workflows. Use `obsidian-write` (or the single `obsidian` stdio entry started with `--write`) for task-authorized writes when the host has enabled its write policy; no per-write approval prompt is required.
 
 The pinned MCP contract is authoritative. Do not invent tools, input fields, resource URIs, prompt names, or write semantics outside the discovered server contract.
 
@@ -18,12 +18,12 @@ The read bridge uses the verified local artifact pinned by the catalog. Only an 
 | Bounded read | obsidian_find_notes | Read-only; keep result previews bounded. |
 | Resource read | resources/read | Read-only; use only discovered resource URIs. |
 | Commit metadata | obsidian_commit_meta | Read-only; repository roots must be explicitly configured. |
-| Opt-in note save | obsidian_keeper_save | Opt-in only. Requires MCP_STDIO_PROFILE=write policy authorization, resolved: true, a vault-relative folder_hint, and an idempotency_key; no per-write approval prompt. |
-| Opt-in daily append | obsidian_daily_append | Opt-in only. Requires MCP_STDIO_PROFILE=write policy authorization and an idempotency_key; target_path selects an exact note, skip_if_hash guards a commit heading, and init_content seeds only an absent note; no per-write approval prompt. |
+| Opt-in note save | obsidian_keeper_save | Opt-in only. Requires `--write` or MCP_STDIO_PROFILE=write policy authorization, resolved: true, a vault-relative folder_hint, and an idempotency_key; no per-write approval prompt. |
+| Opt-in daily append | obsidian_daily_append | Opt-in only. Requires `--write` or MCP_STDIO_PROFILE=write policy authorization and an idempotency_key; target_path selects an exact note, skip_if_hash guards a commit heading, and init_content seeds only an absent note; no per-write approval prompt. |
 | Vault librarian | ask_vault_librarian | Retain the MCP prompt contract; refuse every vault mutation request. |
 | Session summary | summarize_session | Retain the MCP prompt contract; the client performs any provider call. |
 
-The stdio server defaults to the read profile. A trusted host opts into `MCP_STDIO_PROFILE=write` once as policy authorization for routine writes; the host must not request a per-write approval prompt. Streamable HTTP writes require an authenticated request with the `vault:write` scope; the stdio profile and HTTP scope are transport-specific policy gates. Both transports retain path, scope, idempotency, and recovery guards, and requests outside the contract fail closed. Inspect status, retryable, affected_paths, and recovery.required before retrying a write; resolve any recovery action first. A retry reuses the same idempotency key; a changed payload gets a new key only when the user intends a new write.
+The stdio server defaults to the read profile. A trusted host opts into `--write` or `MCP_STDIO_PROFILE=write` once as policy authorization for routine writes; the host must not request a per-write approval prompt. Streamable HTTP writes require an authenticated request with the `vault:write` scope; the stdio profile and HTTP scope are transport-specific policy gates. Both transports retain path, scope, idempotency, and recovery guards, and requests outside the contract fail closed. Inspect status, retryable, affected_paths, and recovery.required before retrying a write; resolve any recovery action first. A retry reuses the same idempotency key; a changed payload gets a new key only when the user intends a new write.
 
 ## Host authorization
 
@@ -32,6 +32,9 @@ The MCP write server must be configured for automatic approval at the host layer
 - Codex: `default_tools_approval_mode = auto for obsidian-write`.
 - Claude Code: `permissions.allow includes mcp__obsidian-write__*`.
 - OpenCode: `permission includes obsidian-write_* = allow`.
+
+With the single `obsidian` stdio entry, apply the write policy to that entry
+instead. The host guide names the rule for each host.
 
 These host rules authorize only the exposed routine MCP write tools. The admin prompt remains excluded and requests outside this contract fail closed.
 
