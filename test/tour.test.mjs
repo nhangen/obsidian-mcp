@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
@@ -15,6 +15,7 @@ import {
   detectClaudeCode,
   detectDailyNotesPath,
   findKnownVaults,
+  getClaudeCodeConfigPath,
   resolveServerLauncher,
   runTour,
   upsertJsonMcpServerConfig,
@@ -711,7 +712,7 @@ for (const [reply, replaced] of [["", true], ["n", false]]) {
 
 for (const [label, removeResult, expected] of [
   ["remove fails", { success: false, error: "remove broke" }, /Could not remove the old entry: remove broke/],
-  ["the second add fails", { success: true }, /previous config is saved at/],
+  ["the second add fails", { success: true }, /The old "obsidian" entry was removed and the new one was not added\. To restore it, .*\.bak/],
 ]) {
   test(`runTour reports failure when ${label}`, { timeout: 15_000 }, async (t) => {
     const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-cli-replace-fail-"));
@@ -719,19 +720,21 @@ for (const [label, removeResult, expected] of [
     const vaultPath = join(fixture, "Vault");
     await mkdir(vaultPath, { recursive: true });
     const claudeCodeConfigPath = join(fixture, "claude.json");
-    await writeFile(claudeCodeConfigPath, "{}");
+    await writeFile(claudeCodeConfigPath, JSON.stringify({ mcpServers: { obsidian: { command: "old" } } }));
 
     const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "1"], ["Replace the existing", ""]]);
+    let calls = 0;
     await assert.rejects(runTour({
       input: io.input,
       output: io.output,
       knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
       claudeCodeConfigPath,
       detectClaudeCode: () => true,
-      configureClaudeCodeViaCli: async () => ({ success: false, method: "cli", error: "server obsidian already exists", spawnFailure: false }),
+      configureClaudeCodeViaCli: async () => ({ success: false, method: "cli", error: calls++ ? "invalid server config" : "server obsidian already exists", spawnFailure: false }),
       removeClaudeCodeViaCli: async () => removeResult,
     }), /1 of 1/);
     assert.match(io.text(), expected);
+    assert.equal(/was removed and the new one was not added/.test(io.text()), removeResult.success);
   });
 }
 
@@ -767,13 +770,18 @@ for (const [reply, writable] of [["", true], ["n", false]]) {
     const claudeCodeConfigPath = join(fixture, "claude.json");
     await writeFile(claudeCodeConfigPath, JSON.stringify({
       mcpServers: { "obsidian-write": { command: "old" } },
-      projects: { "/work/shadowed": { mcpServers: { obsidian: { command: "old" } } }, "/work/clean": { mcpServers: {} } },
+      projects: {
+        "/work/shadowed": { mcpServers: { obsidian: { command: "old" } } },
+        "/work/writer": { mcpServers: { "obsidian-write": { command: "old" } } },
+        "/work/clean": { mcpServers: {} },
+      },
     }));
     const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", reply], ["Select an option", "1"]]);
     await runTour({ input: io.input, output: io.output, knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }], claudeCodeConfigPath, detectClaudeCode: () => false });
     assert.match(io.text(), /\/work\/shadowed has its own "obsidian" entry/);
     assert.doesNotMatch(io.text(), /\/work\/clean/);
     assert.equal(/"obsidian-write" entry .* can still write/.test(io.text()), !writable);
+    assert.equal(/\/work\/writer has an "obsidian-write" entry/.test(io.text()), !writable);
   });
 }
 
@@ -788,4 +796,46 @@ test("configureClaudeCodeViaCli appends --write only when asked", async () => {
     assert.deepEqual(seen.slice(0, 6), ["mcp", "add", "-s", "user", "obsidian", "--"]);
     assert.equal(seen.at(-1), write ? "--write" : "--read");
   }
+});
+
+for (const [label, content] of [
+  ["the config file is missing", undefined],
+  ["the config file has no obsidian entry", JSON.stringify({ mcpServers: {} })],
+  ["the config file is not JSON", "{ truncated"],
+]) {
+  test(`runTour keeps the old entry when it cannot be backed up because ${label}`, { timeout: 15_000 }, async (t) => {
+    const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-no-backup-"));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    const vaultPath = join(fixture, "Vault");
+    await mkdir(vaultPath, { recursive: true });
+    const claudeCodeConfigPath = join(fixture, "claude.json");
+    if (content !== undefined) await writeFile(claudeCodeConfigPath, content);
+    let removed = false;
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "1"], ["Replace the existing", ""]]);
+    await assert.rejects(runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      detectClaudeCode: () => true,
+      configureClaudeCodeViaCli: async () => ({ success: false, method: "cli", error: "server obsidian already exists", spawnFailure: false }),
+      removeClaudeCodeViaCli: async () => { removed = true; return { success: true }; },
+    }), /1 of 1/);
+    assert.equal(removed, false);
+    assert.match(io.text(), /Kept the old entry, because it could not be backed up/);
+    assert.match(io.text(), /claude mcp remove obsidian -s user/);
+  });
+}
+
+test("getClaudeCodeConfigPath follows CLAUDE_CONFIG_DIR", (t) => {
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  t.after(() => {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previous;
+  });
+  process.env.CLAUDE_CONFIG_DIR = "/custom/claude";
+  assert.equal(getClaudeCodeConfigPath(), join("/custom/claude", ".claude.json"));
+  delete process.env.CLAUDE_CONFIG_DIR;
+  assert.equal(getClaudeCodeConfigPath(), join(homedir(), ".claude.json"));
 });

@@ -275,8 +275,11 @@ export async function removeClaudeCodeViaCli({ spawn = spawnSync } = {}) {
   return { success: false, error: (res.stderr || res.stdout || res.error?.message || `exit code ${res.status}`).trim() };
 }
 
+// Throws unless the saved copy holds the entry that is about to be removed.
 async function backupBeforeReplace(configPath) {
-  if (!existsSync(configPath)) return undefined;
+  if (!JSON.parse(await readFile(configPath, "utf8"))?.mcpServers?.obsidian) {
+    throw new Error(`${configPath} has no "obsidian" entry`);
+  }
   const backupPath = `${configPath}.replaced-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
   await copyFile(configPath, backupPath, constants.COPYFILE_EXCL);
   return backupPath;
@@ -294,6 +297,11 @@ export function otherEntryWarnings(configPath, write) {
   for (const [project, settings] of Object.entries(config?.projects ?? {})) {
     if (settings?.mcpServers?.obsidian) {
       warnings.push(`${project} has its own "obsidian" entry, which wins there. To remove it, run \`claude mcp remove obsidian -s local\` in that folder.`);
+    }
+  }
+  for (const [project, settings] of Object.entries(config?.projects ?? {})) {
+    if (!write && settings?.mcpServers?.["obsidian-write"]) {
+      warnings.push(`${project} has an "obsidian-write" entry that can still write to your vault. Remove it if you want writing off.`);
     }
   }
   if (!write && config?.mcpServers?.["obsidian-write"]) {
@@ -329,7 +337,7 @@ export function detectClaudeCode({ platform = process.platform, spawn = spawnSyn
 }
 
 export function getClaudeCodeConfigPath() {
-  return join(homedir(), ".claude.json");
+  return join(process.env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json");
 }
 
 export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/", { spawn = spawnSync, write = false } = {}) {
@@ -531,11 +539,24 @@ export async function runTour(options = {}) {
         if (!cliRes.success && /already exists/i.test(cliRes.error)) {
           const reply = (await ask('Replace the existing "obsidian" entry? [Y/n]: ')).trim().toLowerCase();
           if (["", "y", "yes"].includes(reply)) {
-            const backupPath = await backupBeforeReplace(claudeCodeConfigPath);
-            if (backupPath) print(`  The previous config is saved at ${backupPath}`);
-            const removed = await (options.removeClaudeCodeViaCli || removeClaudeCodeViaCli)();
-            if (removed.success) cliRes = await addViaCli();
-            else print(`Could not remove the old entry: ${removed.error}`);
+            let backupPath;
+            try {
+              backupPath = await backupBeforeReplace(claudeCodeConfigPath);
+            } catch (err) {
+              print(`Kept the old entry, because it could not be backed up: ${err.message}`);
+            }
+            if (backupPath) {
+              print(`  The previous config is saved at ${backupPath}`);
+              const removed = await (options.removeClaudeCodeViaCli || removeClaudeCodeViaCli)();
+              if (removed.success) {
+                cliRes = await addViaCli();
+                if (!cliRes.success) {
+                  print(`The old "obsidian" entry was removed and the new one was not added. To restore it, copy mcpServers.obsidian from ${backupPath} into ${claudeCodeConfigPath}.`);
+                }
+              } else {
+                print(`Could not remove the old entry: ${removed.error}`);
+              }
+            }
           }
         }
         if (cliRes.success) {
