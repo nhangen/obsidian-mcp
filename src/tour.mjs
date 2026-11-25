@@ -673,19 +673,24 @@ export async function runTour(options = {}) {
 
     print("Setup complete!");
     print();
-    if (results.some((r) => r.host === "Claude Code")) {
-      print("To test with Claude Code, launch `claude` and ask:");
+    const configured = (host) => results.some((r) => r.host === host);
+    if (configured("Claude Desktop")) {
+      print("Next: Quit Claude Desktop and open it again.");
+      if (!configured("Claude Code")) {
+        print("The `claude` command line is set up separately. To add it, run this setup again and choose 1.");
+      }
+      print();
+    }
+    if (configured("Claude Code")) {
+      print("Next: start `claude` and ask:");
       print('  "Search my Obsidian notes for project roadmap"');
       print('  "What did I write in my daily note today?"');
       if (write) print('  "Add a line to my daily note saying setup works"');
       print();
     }
-    const runLauncher = resolveServerLauncher();
-    const runCommand = [runLauncher.command, ...serverArgs(runLauncher, selectedVault, selectedDaily, write)]
-      .map((part) => (/\s/.test(part) ? `"${part}"` : part))
-      .join(" ");
-    print("To run the MCP server directly in stdio mode:");
-    print(`  ${runCommand}`);
+    print(results.length > 0
+      ? "There is nothing to start yourself. Your AI app runs the server when it needs it."
+      : "Next: Add the snippet above to your app's settings, then restart the app.");
     print();
 
     return {

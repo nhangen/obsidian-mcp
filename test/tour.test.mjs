@@ -660,8 +660,6 @@ for (const [label, replies, writable] of [
       const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
       assert.equal(args.at(-1), writable ? "--write" : "--read", configPath);
     }
-    const runLine = io.text().split("\n").find((line, index, lines) => lines[index - 1] === "To run the MCP server directly in stdio mode:");
-    assert.ok(runLine.endsWith(writable ? "--write" : "--read"), runLine);
     assert.equal(/Writing is off/.test(io.text()), !writable);
   });
 }
@@ -874,3 +872,29 @@ test("runTour creates no folder when a vault path is typed instead of accepted",
   assert.equal(result.vault, join(home, "Mine"));
   assert.equal(existsSync(join(home, "Documents")), false);
 });
+
+for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, true], ["3", true, true], ["4", false, false]]) {
+  test(`runTour ends with next steps and no server command for host choice ${choice}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-next-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", choice]]);
+    await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath: join(fixture, "claude.json"),
+      claudeDesktopConfigPath: join(fixture, "desktop.json"),
+      detectClaudeCode: () => false,
+    });
+
+    const ending = io.text().slice(io.text().indexOf("Setup complete!"));
+    assert.equal(/stdio|--vault/.test(ending), false, ending);
+    assert.equal(/start `claude` and ask/.test(ending), hasCode);
+    assert.equal(/Quit Claude Desktop and open it again/.test(ending), hasDesktop);
+    assert.equal(/`claude` command line is set up separately/.test(ending), choice === "2");
+    assert.equal(/nothing to start yourself/.test(ending), hasCode || hasDesktop);
+    assert.equal(/Add the snippet above to your app's settings, then restart the app/.test(ending), choice === "4");
+  });
+}
