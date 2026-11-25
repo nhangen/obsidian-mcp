@@ -40,6 +40,22 @@ Add the `obsidian` and `obsidian-write` MCP servers to your OpenCode configurati
 }
 ```
 
+### Local stdio server (npm package)
+
+When the vault is on the same machine as OpenCode, you can use the npm package as
+one local server instead of the two launchers. Use `--read` to allow search only:
+
+```json
+{
+  "mcp": {
+    "obsidian": {
+      "type": "local",
+      "command": ["npx", "-y", "@nhangen/obsidian-mcp", "--vault", "/absolute/path/to/vault", "--daily-path", "Daily/", "--write"]
+    }
+  }
+}
+```
+
 ## Scoped Host Authorization
 
 Routine writes (`obsidian_keeper_save`, `obsidian_daily_append`) require host-level write policy to avoid constant interactive approval prompts. In `opencode.jsonc`:
