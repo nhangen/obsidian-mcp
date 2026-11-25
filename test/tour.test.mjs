@@ -573,7 +573,7 @@ test("runTour expands ~ and rejects relative custom vault paths", async (t) => {
   t.after(() => rm(fixture, { recursive: true, force: true }));
   await mkdir(join(fixture, "Vault"), { recursive: true });
 
-  const io = scriptedTour([["Enter the absolute path", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const io = scriptedTour([["Vault directory", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -838,4 +838,39 @@ test("getClaudeCodeConfigPath follows CLAUDE_CONFIG_DIR", (t) => {
   assert.equal(getClaudeCodeConfigPath(), join("/custom/claude", ".claude.json"));
   delete process.env.CLAUDE_CONFIG_DIR;
   assert.equal(getClaudeCodeConfigPath(), join(homedir(), ".claude.json"));
+});
+
+for (const { label, existing, cwdIsVault, expected, willCreate } of [
+  { label: "the current folder when it is a vault", existing: ["Documents/Obsidian"], cwdIsVault: true, expected: "work", willCreate: false },
+  { label: "~/Documents/Obsidian when it exists", existing: ["Documents/Obsidian", "Obsidian"], expected: "Documents/Obsidian", willCreate: false },
+  { label: "~/Obsidian when that is the one that exists", existing: ["Obsidian"], expected: "Obsidian", willCreate: false },
+  { label: "a new ~/Documents/Obsidian when nothing exists", existing: [], expected: "Documents/Obsidian", willCreate: true },
+]) {
+  test(`runTour accepts Enter at the vault path prompt: ${label}`, { timeout: 15_000 }, async (t) => {
+    const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-default-")));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    const cwd = join(home, "work");
+    await mkdir(cwd, { recursive: true });
+    if (cwdIsVault) await mkdir(join(cwd, ".obsidian"));
+    for (const dir of existing) await mkdir(join(home, dir), { recursive: true });
+
+    const io = scriptedTour([["Vault directory", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+    const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd });
+
+    assert.equal(result.vault, join(home, expected));
+    assert.equal(lstatSync(join(home, expected)).isDirectory(), true);
+    assert.equal(io.text().includes(`Vault directory (default: ${join(home, expected)}${willCreate ? ", will be created" : ""}): `), true);
+  });
+}
+
+test("runTour creates no folder when a vault path is typed instead of accepted", { timeout: 15_000 }, async (t) => {
+  const home = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-typed-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await mkdir(join(home, "Mine"));
+
+  const io = scriptedTour([["Vault directory", "~/Mine"], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
+  const result = await runTour({ input: io.input, output: io.output, knownVaults: [], homeDir: home, cwd: home });
+
+  assert.equal(result.vault, join(home, "Mine"));
+  assert.equal(existsSync(join(home, "Documents")), false);
 });

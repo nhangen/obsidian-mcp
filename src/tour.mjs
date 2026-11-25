@@ -66,6 +66,21 @@ export function findKnownVaults(configPath = getObsidianConfigPath(), logger = (
   }
 }
 
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export function suggestVaultPath(home, cwd) {
+  if (isDirectory(join(cwd, ".obsidian"))) return { path: resolve(cwd), exists: true };
+  const candidates = [join(home, "Documents", "Obsidian"), join(home, "Obsidian")];
+  const found = candidates.find(isDirectory);
+  return found ? { path: found, exists: true } : { path: candidates[0], exists: false };
+}
+
 export function detectDailyNotesPath(vaultPath) {
   try {
     const dailyNotesConfig = join(vaultPath, ".obsidian", "daily-notes.json");
@@ -452,8 +467,17 @@ export async function runTour(options = {}) {
     }
 
     while (!selectedVault) {
-      const customPath = (await ask("Enter the absolute path to your Obsidian vault directory: ")).trim();
-      if (!customPath) continue;
+      const suggestion = suggestVaultPath(home, options.cwd || process.cwd());
+      const note = suggestion.exists ? "" : ", will be created";
+      const typed = (await ask(`Vault directory (default: ${suggestion.path}${note}): `)).trim();
+      if (!typed && !suggestion.exists) {
+        try {
+          await mkdir(suggestion.path, { recursive: true });
+        } catch (err) {
+          throw new Error(`Could not create ${suggestion.path}: ${err.message}`);
+        }
+      }
+      const customPath = typed || suggestion.path;
       const expanded = customPath === "~" || customPath.startsWith("~/") ? join(home, customPath.slice(1)) : customPath;
       if (!isAbsolute(expanded)) {
         print(`Vault path must be absolute (or start with ~/): ${customPath}`);

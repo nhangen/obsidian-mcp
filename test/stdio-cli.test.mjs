@@ -705,7 +705,7 @@ test("server launches tour banner when started with --tour", async (t) => {
   });
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
-    if (stdout.includes("Select a vault") || stdout.includes("Enter the absolute path")) {
+    if (stdout.includes("Select a vault") || stdout.includes("Vault directory (default:")) {
       child.stdin.end();
     }
   });

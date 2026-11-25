@@ -27,6 +27,11 @@ Run it in a terminal. The setup tour finds your vaults, asks for the daily notes
 folder, asks whether to enable writing, and configures Claude Code, Claude
 Desktop, or both. Pressing Enter at the writing question enables it.
 
+Pressing Enter accepts the default at every question. When the tour finds no
+vault, the default is the current folder if it is a vault, then an existing
+`~/Documents/Obsidian` or `~/Obsidian`. If none applies, Enter creates
+`~/Documents/Obsidian`.
+
 To configure Claude Code by hand, with writing enabled:
 
 ```bash
