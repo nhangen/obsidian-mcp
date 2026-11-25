@@ -269,6 +269,8 @@ test("runTour completes interactive walkthrough with isolated config overrides",
         setImmediate(() => inputStream.write("\n"));
       } else if (text.includes("Daily notes directory")) {
         setImmediate(() => inputStream.write("\n"));
+      } else if (text.includes("save notes")) {
+        setImmediate(() => inputStream.write("\n"));
       } else if (text.includes("Select an option [1-4]")) {
         setImmediate(() => inputStream.write("3\n"));
       }
@@ -301,7 +303,7 @@ test("runTour completes interactive walkthrough with isolated config overrides",
 
   for (const configPath of [claudeCodeConfig, claudeDesktopConfig]) {
     const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
-    assert.deepEqual(args.slice(-4), ["--vault", vaultPath, "--daily-path", "Daily/"]);
+    assert.deepEqual(args.slice(-5), ["--vault", vaultPath, "--daily-path", "Daily/", "--write"]);
   }
 });
 
@@ -442,7 +444,7 @@ test("runTour reports a partial host failure as incomplete", async (t) => {
   const claudeDesktopConfigPath = join(fixture, "desktop.json");
   await writeFile(claudeCodeConfigPath, "{ truncated", "utf8");
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "3"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "3"]]);
   await assert.rejects(
     runTour({
       input: io.input,
@@ -467,7 +469,7 @@ test("runTour does not write the config file when claude mcp add rejects", async
   await mkdir(vaultPath, { recursive: true });
   const claudeCodeConfigPath = join(fixture, "claude.json");
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "1"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "1"]]);
   await assert.rejects(
     runTour({
       input: io.input,
@@ -490,7 +492,7 @@ test("runTour falls back to the config file when the claude CLI cannot be spawne
   await mkdir(vaultPath, { recursive: true });
   const claudeCodeConfigPath = join(fixture, "claude.json");
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "1"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "1"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -509,7 +511,7 @@ test("runTour re-prompts until the daily notes path stays inside the vault", asy
   const vaultPath = join(fixture, "Vault");
   await mkdir(vaultPath, { recursive: true });
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ["/Journal", "../outside", "Journal"]], ["Select an option", "4"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ["/Journal", "../outside", "Journal"]], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -551,7 +553,7 @@ test("runTour uses a preselected vault without prompting for one", async (t) => 
   const vaultPath = join(fixture, "Vault");
   await mkdir(vaultPath, { recursive: true });
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -568,7 +570,7 @@ test("runTour expands ~ and rejects relative custom vault paths", async (t) => {
   t.after(() => rm(fixture, { recursive: true, force: true }));
   await mkdir(join(fixture, "Vault"), { recursive: true });
 
-  const io = scriptedTour([["Enter the absolute path", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const io = scriptedTour([["Enter the absolute path", ["Vault", "~/Vault"]], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -586,7 +588,7 @@ test("runTour resolves a symlinked preselected vault to its real path", async (t
   await mkdir(join(fixture, "Real"), { recursive: true });
   await symlink(join(fixture, "Real"), join(fixture, "Link"));
 
-  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["Select an option", "4"]]);
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "4"]]);
   const outcome = await runTour({
     input: io.input,
     output: io.output,
@@ -622,4 +624,77 @@ test("resolveServerLauncher runs the bundle in place for the portable client lay
   const launcher = resolveServerLauncher(bundle);
   assert.equal(launcher.command, process.execPath);
   assert.deepEqual(launcher.argsPrefix, [bundle]);
+});
+
+for (const [label, replies, writable] of [
+  ["Enter", [""], true],
+  ["yes", ["y"], true],
+  ["no", ["n"], false],
+  ["an unrecognized answer, then no", ["maybe", "no"], false],
+]) {
+  test(`runTour write choice: ${label}`, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-write-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    const vaultPath = join(fixture, "Vault");
+    await mkdir(vaultPath, { recursive: true });
+    const claudeCodeConfigPath = join(fixture, "claude.json");
+    const claudeDesktopConfigPath = join(fixture, "desktop.json");
+    const asked = replies.length;
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", [...replies]], ["Select an option", "3"]]);
+    const outcome = await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      claudeDesktopConfigPath,
+      detectClaudeCode: () => false,
+    });
+
+    assert.equal(outcome.write, writable);
+    assert.equal(io.text().match(/save notes and add to your daily note\?/g).length, asked);
+    for (const configPath of [claudeCodeConfigPath, claudeDesktopConfigPath]) {
+      const { args } = JSON.parse(await readFile(configPath, "utf8")).mcpServers.obsidian;
+      assert.equal(args.includes("--write"), writable, configPath);
+    }
+    const runLine = io.text().split("\n").find((line, index, lines) => lines[index - 1] === "To run the MCP server directly in stdio mode:");
+    assert.equal(runLine.endsWith("--write"), writable);
+    assert.equal(/Writing is off/.test(io.text()), !writable);
+  });
+}
+
+test("runTour passes the write choice to the claude CLI and explains how to replace an existing entry", async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "mcp-tour-cli-write-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const vaultPath = join(fixture, "Vault");
+  await mkdir(vaultPath, { recursive: true });
+  let seen;
+
+  const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", "1"]]);
+  await assert.rejects(runTour({
+    input: io.input,
+    output: io.output,
+    knownVaults: [{ id: "1", path: vaultPath, open: true, ts: 0 }],
+    claudeCodeConfigPath: join(fixture, "claude.json"),
+    detectClaudeCode: () => true,
+    configureClaudeCodeViaCli: async (...args) => {
+      seen = args;
+      return { success: false, method: "cli", error: "MCP server obsidian already exists in user config", spawnFailure: false };
+    },
+  }), /1 of 1/);
+  assert.deepEqual(seen[2], { write: true });
+  assert.match(io.text(), /claude mcp remove obsidian -s user/);
+});
+
+test("configureClaudeCodeViaCli appends --write only when asked", async () => {
+  for (const write of [true, false]) {
+    let seen;
+    const spawnStub = (cmd, args) => {
+      seen = args;
+      return { status: 0 };
+    };
+    await configureClaudeCodeViaCli("/vault", "Daily/", { spawn: spawnStub, write });
+    assert.deepEqual(seen.slice(0, 6), ["mcp", "add", "-s", "user", "obsidian", "--"]);
+    assert.equal(seen.at(-1) === "--write", write);
+  }
 });

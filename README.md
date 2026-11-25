@@ -13,6 +13,44 @@ adds `--vault`, `--daily-path`, and `--repo-root` arguments to the stdio server 
 It does not publish a new release, replace an existing deployment, or migrate
 the optional plugin/client integrations. That cutover remains separate work.
 
+## Install from npm
+
+The package is not on npm yet. These commands work after the first publish.
+You need Node.js 20 or newer, Bash, Git, and standard Unix utilities. On
+Windows, use a Unix environment such as WSL.
+
+```bash
+npx -y @nhangen/obsidian-mcp
+```
+
+Run it in a terminal. The setup tour finds your vaults, asks for the daily notes
+folder, asks whether to enable writing, and configures Claude Code, Claude
+Desktop, or both. Pressing Enter at the writing question enables it.
+
+To configure Claude Code by hand, with writing enabled:
+
+```bash
+claude mcp add -s user obsidian -- npx -y @nhangen/obsidian-mcp --vault /absolute/path/to/vault --daily-path Daily/ --write
+```
+
+For Claude Desktop or another MCP client:
+
+```json
+{
+  "mcpServers": {
+    "obsidian": {
+      "command": "npx",
+      "args": ["-y", "@nhangen/obsidian-mcp", "--vault", "/absolute/path/to/vault", "--daily-path", "Daily/", "--write"]
+    }
+  }
+}
+```
+
+Leave out `--write` for a server that can only search notes and read commit
+details. With `--write`, the server also offers `obsidian_keeper_save` and
+`obsidian_daily_append`. To change an existing Claude Code entry, run
+`claude mcp remove obsidian -s user` first.
+
 ## Server and plugin client
 
 This repository owns the independent server and reusable transport/capture
@@ -187,14 +225,15 @@ Running the package binary directly in an interactive terminal (with TTY stdin/s
 obsidian-mcp
 ```
 
-(or `obsidian-mcp --tour` from anywhere) launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, and safely configures Claude Code or Claude Desktop.
+(or `obsidian-mcp --tour` from anywhere) launches an interactive setup tour that auto-discovers Obsidian vaults from the native `obsidian.json` registry, detects daily notes folders, asks whether to enable writing (Enter means yes), and configures Claude Code or Claude Desktop.
 
-When spawned by an AI host (piped stdin/stdout) or invoked with `--serve`, `--vault`, `--daily-path`, or `--repo-root`, the binary immediately runs the headless stdio MCP server without human prompts.
+When spawned by an AI host (piped stdin/stdout) or invoked with `--serve`, `--vault`, `--daily-path`, `--repo-root`, or `--write`, the binary immediately runs the headless stdio MCP server without human prompts.
 
 CLI options supported by `obsidian-mcp` (and `claude-obsidian-mcp`):
 - `-v, --vault <path>`: Absolute path to the Obsidian vault directory.
 - `--daily-path <path>`: Relative path within the vault for daily notes (default: `Daily/`).
 - `--repo-root <path>`: Allowed repository root for commit metadata (can be repeated or platform-delimited).
+- `--write`: Enable the write tools. Takes precedence over `MCP_STDIO_PROFILE`.
 - `--tour`: Explicitly launch the interactive guided setup tour.
 - `--serve, --stdio`: Force headless stdio JSON-RPC server execution even in an interactive terminal.
 - `-h, --help`: Show usage and exit.
@@ -205,7 +244,7 @@ Environment variables:
 - `MCP_STDIO_PROFILE`: Stdio authorization profile (`read` or `write`, default: `read`).
 
 The stdio server defaults to the read profile, exposing only vault and
-repository read tools. Set `MCP_STDIO_PROFILE=write` explicitly as the
+repository read tools. Pass `--write`, or set `MCP_STDIO_PROFILE=write`, as the
 host-level policy authorization for trusted routine Obsidian writes. The write
 profile provides the write tools. The supported client policy requires an
 idempotency key for routine writes and does not require a per-write user

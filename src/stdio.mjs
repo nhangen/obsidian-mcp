@@ -1389,8 +1389,8 @@ export async function closeActiveChildren() {
   await Promise.all([...activeChildren].map((child) => terminateChild(child)));
 }
 
-function stdioScopes() {
-  const profile = process.env.MCP_STDIO_PROFILE?.trim() || "read";
+function stdioScopes(write = false) {
+  const profile = write ? "write" : process.env.MCP_STDIO_PROFILE?.trim() || "read";
   const scopes = stdioScopesByProfile[profile];
   if (!scopes) throw new Error("MCP_STDIO_PROFILE must be read or write");
   return scopes;
@@ -1409,6 +1409,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
   let dailyPath;
   let tour = false;
   let serve = false;
+  let write = false;
   const repoRoots = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -1417,6 +1418,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       tour = true;
     } else if (arg === "--serve" || arg === "--stdio") {
       serve = true;
+    } else if (arg === "--write") {
+      write = true;
     } else if (arg === "-v" || arg === "--vault") {
       i++;
       if (i >= argv.length || argv[i].startsWith("-")) {
@@ -1451,7 +1454,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     }
   }
 
-  return { help: false, tour, serve, vault, dailyPath, repoRoots };
+  return { help: false, tour, serve, write, vault, dailyPath, repoRoots };
 }
 
 export function validateDailyPath(dailyPath, vaultPath) {
@@ -1476,7 +1479,7 @@ export function validateDailyPath(dailyPath, vaultPath) {
 
 export function shouldLaunchTour({ cli = {}, env = process.env, isTTY = false } = {}) {
   if (cli.tour) return true;
-  if (cli.serve) return false;
+  if (cli.serve || cli.write) return false;
   if (cli.vault) return false;
   if (cli.dailyPath || cli.repoRoots?.length) return false;
   if (env.MCP_SERVE_STDIO) return false;
@@ -1542,6 +1545,7 @@ export function startStdio(argv = process.argv.slice(2)) {
       "  -v, --vault <path>       Absolute path to the Obsidian vault directory\n" +
       "      --daily-path <path>  Vault-relative path for daily notes (default: Daily/)\n" +
       "      --repo-root <path>   Allowed repository root for commit metadata (repeatable)\n" +
+      "      --write              Enable the write tools (save notes, append to notes)\n" +
       "      --tour               Launch the interactive guided setup tour\n" +
       "      --serve, --stdio     Run stdio JSON-RPC server directly (even in a terminal)\n" +
       "  -h, --help               Show this help message\n"
@@ -1620,7 +1624,7 @@ export function startStdio(argv = process.argv.slice(2)) {
     setupSyntheticConfig(resolvedVault, effectiveDailyPath);
   }
 
-  const handle = serveStdio(() => createServer({ scopes: stdioScopes() }), { onerror: (error) => stderr(error instanceof Error ? error.message : String(error)) });
+  const handle = serveStdio(() => createServer({ scopes: stdioScopes(cli.write) }), { onerror: (error) => stderr(error instanceof Error ? error.message : String(error)) });
   let shuttingDown = false;
   async function shutdown(exit = false) {
     if (shuttingDown) return;
