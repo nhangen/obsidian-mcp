@@ -2,24 +2,24 @@
   "catalogVersion": 1,
   "contract": {
     "repository": "nhangen/obsidian-mcp",
-    "commit": "2d7f10f3ecdbc978341b09fbe275b67229e3509f",
+    "commit": "f149775627f6ef3d1e7757f4e7d2de59fd03f760",
     "path": "contract.json",
     "contractVersion": "0.1.3",
     "sha256": "fd8fb25009dc830587ba6843dbbe5f6b68224d4d0c5430c7c9326e0cc77dcfa9"
   },
   "release": {
-    "tag": "mcp-v0.2.4",
-    "url": "https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.4",
-    "sourceCommit": "2d7f10f3ecdbc978341b09fbe275b67229e3509f",
+    "tag": "mcp-v0.2.5",
+    "url": "https://github.com/nhangen/obsidian-mcp/releases/tag/mcp-v0.2.5",
+    "sourceCommit": "f149775627f6ef3d1e7757f4e7d2de59fd03f760",
     "asset": {
-      "name": "nhangen-obsidian-mcp-0.2.4.tgz",
-      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.4/nhangen-obsidian-mcp-0.2.4.tgz",
-      "sha256": "a6679b02ac10b0cada81bd9ff7311fd4d058912b24661c73a04ab6afcd310f12"
+      "name": "nhangen-obsidian-mcp-0.2.5.tgz",
+      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.5/nhangen-obsidian-mcp-0.2.5.tgz",
+      "sha256": "4062af101fed8ab08b722df361847fa4d2d107cd8f9d5240f12738b4889dc2ac"
     },
     "metadata": {
-      "name": "nhangen-obsidian-mcp-0.2.4.release.json",
-      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.4/nhangen-obsidian-mcp-0.2.4.release.json",
-      "sha256": "17549c1af21749cbadaad614f17a7d7ab397f2ede034c23fd800a8e37273c365"
+      "name": "nhangen-obsidian-mcp-0.2.5.release.json",
+      "url": "https://github.com/nhangen/obsidian-mcp/releases/download/mcp-v0.2.5/nhangen-obsidian-mcp-0.2.5.release.json",
+      "sha256": "7884fac99c9902d612bf291ced52df3a39934e238b20bc52553198c882b54b00"
     }
   },
   "server": {
