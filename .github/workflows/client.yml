@@ -9,6 +9,7 @@ on:
       - 'helpers/**'
       - 'scripts/build-shell-capture-parser.py'
       - 'scripts/pack-obsidian-mcp-client.py'
+      - 'scripts/release-client.sh'
       - 'scripts/build.mjs'
       - 'src/**'
       - 'package.json'
@@ -100,6 +101,7 @@ jobs:
           for suite in client client-lifecycle commit-event capture-commit native codex-user managed-export; do
             bash "tests/obsidian-mcp-${suite}.test.sh"
           done
+          bash tests/obsidian-mcp-release-client.test.sh
       - name: Pack immutable client artifact
         run: |
           python3 scripts/pack-obsidian-mcp-client.py --output "$RUNNER_TEMP/obsidian-mcp-client"
