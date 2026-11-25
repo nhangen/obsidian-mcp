@@ -537,10 +537,20 @@ export async function runTour(options = {}) {
     print("  [4] Skip automatic configuration (display snippet only)");
     print();
 
+    const hasClaudeCli = options.detectClaudeCode ? options.detectClaudeCode() : detectClaudeCode();
+    const claudeCodeConfigPath = options.claudeCodeConfigPath || getClaudeCodeConfigPath();
+    const claudeDesktopConfigPath = options.claudeDesktopConfigPath || getClaudeDesktopConfigPath();
+    // The desktop app creates its config directory the first time it runs.
+    const hasClaudeDesktop = existsSync(dirname(claudeDesktopConfigPath));
+    const detected = [hasClaudeCli && "Claude Code", hasClaudeDesktop && "Claude Desktop"].filter(Boolean);
+    const defaultChoice = hasClaudeCli ? (hasClaudeDesktop ? 3 : 1) : (hasClaudeDesktop ? 2 : 4);
+    print(detected.length > 0 ? `Found: ${detected.join(", ")}` : "Found no Claude app.");
+    print();
+
     let hostChoice = 0;
     while (!hostChoice) {
-      const choiceStr = (await ask("Select an option [1-4] (default: 1): ")).trim();
-      const choice = choiceStr === "" ? 1 : parseInt(choiceStr, 10);
+      const choiceStr = (await ask(`Select an option [1-4] (default: ${defaultChoice}): `)).trim();
+      const choice = choiceStr === "" ? defaultChoice : parseInt(choiceStr, 10);
       if (choice >= 1 && choice <= 4) {
         hostChoice = choice;
       } else {
@@ -549,9 +559,6 @@ export async function runTour(options = {}) {
     }
 
     print();
-    const hasClaudeCli = options.detectClaudeCode ? options.detectClaudeCode() : detectClaudeCode();
-    const claudeCodeConfigPath = options.claudeCodeConfigPath || getClaudeCodeConfigPath();
-    const claudeDesktopConfigPath = options.claudeDesktopConfigPath || getClaudeDesktopConfigPath();
     const results = [];
 
     if (hostChoice === 1 || hostChoice === 3) {

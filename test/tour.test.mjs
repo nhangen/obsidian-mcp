@@ -898,3 +898,38 @@ for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, tr
     assert.equal(/Add the snippet above to your app's settings, then restart the app/.test(ending), choice === "4");
   });
 }
+
+for (const { code, desktop, expected, found } of [
+  { code: true, desktop: true, expected: 3, found: "Found: Claude Code, Claude Desktop" },
+  { code: true, desktop: false, expected: 1, found: "Found: Claude Code" },
+  { code: false, desktop: true, expected: 2, found: "Found: Claude Desktop" },
+  { code: false, desktop: false, expected: 4, found: "Found no Claude app" },
+]) {
+  test(`runTour Enter connects what it detects: code=${code} desktop=${desktop}`, { timeout: 15_000 }, async (t) => {
+    const fixture = realpathSync(await mkdtemp(join(tmpdir(), "mcp-tour-detect-")));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    await mkdir(join(fixture, "Vault"));
+    const claudeCodeConfigPath = join(fixture, "claude.json");
+    const claudeDesktopConfigPath = join(fixture, "DesktopApp", "claude_desktop_config.json");
+    if (desktop) await mkdir(join(fixture, "DesktopApp"));
+    let cliAdds = 0;
+
+    const io = scriptedTour([["Select a vault", ""], ["Daily notes directory", ""], ["save notes", ""], ["Select an option", ""]]);
+    const outcome = await runTour({
+      input: io.input,
+      output: io.output,
+      knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
+      claudeCodeConfigPath,
+      claudeDesktopConfigPath,
+      detectClaudeCode: () => code,
+      configureClaudeCodeViaCli: async () => { cliAdds += 1; return { success: true, method: "cli" }; },
+    });
+
+    assert.equal(outcome.hostChoice, expected);
+    assert.equal(io.text().includes(`${found}\n`) || io.text().includes(`${found}.`), true, io.text());
+    assert.equal(io.text().includes(`Select an option [1-4] (default: ${expected}): `), true);
+    assert.equal(cliAdds, code ? 1 : 0);
+    assert.equal(existsSync(claudeDesktopConfigPath), desktop);
+    assert.equal(existsSync(claudeCodeConfigPath), false);
+  });
+}
