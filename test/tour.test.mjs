@@ -932,7 +932,7 @@ for (const [choice, hasCode, hasDesktop] of [["1", true, false], ["2", false, tr
       output: io.output,
       knownVaults: [{ id: "1", path: join(fixture, "Vault"), open: true, ts: 0 }],
       claudeCodeConfigPath: join(fixture, "claude.json"),
-      claudeDesktopConfigPath: join(fixture, "desktop.json"),
+      claudeDesktopConfigPath: join(fixture, "DesktopApp", "claude_desktop_config.json"),
       detectClaudeCode: () => false,
     });
 
