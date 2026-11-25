@@ -25,6 +25,7 @@
     "prepack": "npm run build",
     "pretest": "npm run build",
     "release:bundle": "node scripts/release.mjs",
+    "release:client": "npm run build && bash scripts/release-client.sh",
     "monitor": "node monitor.mjs",
     "start": "node dist/stdio.mjs",
     "start:http": "node dist/http.mjs",

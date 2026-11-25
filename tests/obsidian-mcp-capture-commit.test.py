@@ -54,6 +54,8 @@ for line in sys.stdin:
             result["protocolVersion"] = "2026-07-28"
         elif scenario == "protocol-missing":
             result.pop("protocolVersion")
+        elif scenario == "numeric-version":
+            result["serverInfo"]["version"] = 9
         elif scenario == "tools-capability-missing":
             result["capabilities"] = {}
         elif scenario == "tools-capability-malformed":
@@ -444,6 +446,26 @@ class CaptureCommitTest(unittest.TestCase):
         self.started.unlink()
         version = self.run_capture(self.event(), version="0.1.15")
         self.assert_error(version, "SERVER_VERSION_MISMATCH")
+        self.assertEqual(self.call_records(), [])
+
+    def test_newer_server_versions_are_accepted(self):
+        major, minor, patch = (int(part) for part in PINNED_VERSION.split("."))
+        for version in (f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 10}.0", f"{major + 1}.0.0"):
+            with self.subTest(version=version):
+                self.calls.unlink(missing_ok=True)
+                result = self.run_capture(self.event(), version=version)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.call_records()), 1)
+
+    def test_malformed_server_versions_stop_before_write(self):
+        cases = ("", "9", "9.9", "v9.9.9", "9.9.9-rc.1", "9.9.9.1", "9999garbage", " 9.9.9", "9.9.9\n", "\u0669.9.9")
+        for version in cases:
+            with self.subTest(version=version):
+                result = self.run_capture(self.event(), version=version)
+                self.assert_error(result, "SERVER_VERSION_MISMATCH")
+                self.assertEqual(self.call_records(), [])
+        result = self.run_capture(self.event(), scenario="numeric-version")
+        self.assert_error(result, "SERVER_VERSION_MISMATCH")
         self.assertEqual(self.call_records(), [])
 
     def test_mismatched_initialize_protocol_stops_before_initialized_notification(self):
