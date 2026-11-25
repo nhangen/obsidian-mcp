@@ -58,10 +58,13 @@ For Claude Desktop or another MCP client:
 }
 ```
 
-For a server that can only search notes, use `--read` instead of `--write`.
-`obsidian_commit_meta` answers only for repositories under a
-`--repo-root <absolute path>` that you add (repeatable). The tour doesn't add
-one. With `--write`, the server also offers
+For a server that can't write, use `--read` instead of `--write`. A separate
+`obsidian-write` entry from an earlier setup, or a project's own `obsidian`
+entry that uses `--write`, can still write. Remove or change those if you want
+writing off. `obsidian_commit_meta` answers only for repositories under a
+`--repo-root <absolute path>` (repeatable) or `MCP_REPOSITORY_ROOTS`. The tour
+doesn't set either.
+With `--write`, the server also offers
 `obsidian_keeper_save` and `obsidian_daily_append`. To change an existing Claude
 Code entry, run the tour again and let it replace the entry, or run
 `claude mcp remove obsidian -s user` and add it again.
@@ -74,15 +77,24 @@ the Claude Desktop entry and keeps a backup. For Claude Code, if it asks to
 replace the existing `obsidian` entry, answer `Y`. If you installed with `npm install -g`,
 run `npm install -g @nhangen/obsidian-mcp@latest` and restart the app. A global
 install's entry records the path to Node, so run the tour again after you switch
-Node versions. If you added an unpinned entry by hand, `npx` chooses the version.
+Node versions. The tour's banner shows the version it runs:
+`Obsidian MCP Server Setup (vX.Y.Z)`. If you added an unpinned entry by hand, `npx` chooses the version.
 
 ### Uninstall
 
-- Claude Code: `claude mcp remove obsidian -s user`
-- Claude Desktop: delete `mcpServers.obsidian` from `claude_desktop_config.json`,
+- Claude Code: `claude mcp remove obsidian -s user`. Also remove any
+  `obsidian-write` entry that an earlier setup left
+  (`claude mcp remove obsidian-write`), and any project entry
+  (`claude mcp remove obsidian -s local`, run in that folder). In each project
+  folder where you set up Obsidian, `claude mcp list` should then show no
+  `obsidian` or `obsidian-write` entry.
+- Claude Desktop: delete `mcpServers.obsidian` (and `mcpServers.obsidian-write`,
+  if present) from `claude_desktop_config.json`,
   then restart the app. The file is in `~/Library/Application Support/Claude/` on
-  macOS, `%APPDATA%\Claude\` on Windows, and `~/.config/Claude/` on Linux.
+  macOS, `%APPDATA%\Claude\` on Windows, and `~/.config/Claude/` (or `$XDG_CONFIG_HOME/Claude/`) on Linux.
 - Global install: `npm uninstall -g @nhangen/obsidian-mcp`
+- Codex and OpenCode: see their guides under
+  [`integrations`](https://github.com/nhangen/obsidian-mcp/tree/master/integrations).
 
 The tour's backups (`.bak` and `.replaced-*.bak`) sit next to each config. Delete
 them when you no longer need them. These steps don't touch your vault.
@@ -237,7 +249,9 @@ launcher and explicit configuration boundaries:
 }
 ```
 
-This form needs a global install (`npm install -g @nhangen/obsidian-mcp`). GUI
+The bare command needs a global install
+(`npm install -g @nhangen/obsidian-mcp`). A full path to a global or local
+install also works. GUI
 clients such as Claude Desktop might not inherit your shell `PATH`, so use the
 full path that `command -v claude-obsidian-mcp` prints. The launcher also needs
 to find `node`. If the client can't, use the setup tour, which records Node's full
@@ -440,7 +454,7 @@ persistence remains in the client-side shell workflow. Both prompts are exposed
 to clients with `vault:read`. The admin-only `reorganize_vault` workflow remains
 outside the MCP MVP until a separate policy and write contract exists.
 
-The machine-readable contract is [`contract.json`](contract.json). Its fixture
+The machine-readable contract is [`contract.json`](https://github.com/nhangen/obsidian-mcp/blob/master/contract.json). Its fixture
 cases are in [`test/fixtures/contract-fixtures.json`](https://github.com/nhangen/obsidian-mcp/blob/master/test/fixtures/contract-fixtures.json)
 and are checked by `test/contract.test.mjs`.
 

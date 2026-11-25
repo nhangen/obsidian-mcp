@@ -26,6 +26,9 @@ or `--read` to allow search only:
 claude mcp add -s user obsidian -- npx -y @nhangen/obsidian-mcp --vault /absolute/path/to/vault --daily-path Daily/ --write
 ```
 
+For `obsidian_commit_meta`, add `--repo-root <absolute path>` to the server
+command.
+
 You don't need a separate `obsidian-write` entry for stdio. If an earlier setup
 left one, it can still write even when `obsidian` uses `--read`, so remove it if
 you want writing off. See the

@@ -70,6 +70,8 @@ Routine writes (`obsidian_keeper_save`, `obsidian_daily_append`) require host-le
 
 This grants authorization specifically to the `obsidian-write` server's declared tools. The read server requires no special permissions beyond normal tool execution.
 
+With the single local `obsidian` entry, allow `"obsidian_obsidian_keeper_save": "allow"` and `"obsidian_obsidian_daily_append": "allow"` instead. These names follow OpenCode's `<server>_<tool>` pattern and haven't been tried on a live OpenCode install. An `obsidian-write` entry from an earlier setup can still write when `obsidian` uses `--read`; delete `mcp.obsidian-write` and its permission rule if you want writing off. To uninstall, delete `mcp.obsidian` from your OpenCode config, plus `mcp.obsidian-write` and its permission rule if you have them. For `obsidian_commit_meta`, add `"--repo-root", "<absolute path>"` to the command.
+
 ## Supported Workflows
 
 - **Bounded Search**: Call `obsidian_find_notes` with `{ "query": "..." }` to find up to 5 matching note snippets.
