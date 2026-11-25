@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -261,17 +261,60 @@ export function getClaudeDesktopConfigPath() {
     : join(homedir(), ".config", "Claude", "claude_desktop_config.json");
 }
 
+function serverArgs(launcher, vaultPath, dailyPath, write) {
+  return [...launcher.argsPrefix, "--vault", vaultPath, "--daily-path", dailyPath, write ? "--write" : "--read"];
+}
+
+export async function removeClaudeCodeViaCli({ spawn = spawnSync } = {}) {
+  const res = spawn("claude", ["mcp", "remove", "obsidian", "-s", "user"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 10_000,
+  });
+  if (res.status === 0) return { success: true };
+  return { success: false, error: (res.stderr || res.stdout || res.error?.message || `exit code ${res.status}`).trim() };
+}
+
+// Throws unless the saved copy holds the entry that is about to be removed.
+async function backupBeforeReplace(configPath) {
+  if (!JSON.parse(await readFile(configPath, "utf8"))?.mcpServers?.obsidian) {
+    throw new Error(`${configPath} has no "obsidian" entry`);
+  }
+  const backupPath = `${configPath}.replaced-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+  await copyFile(configPath, backupPath, constants.COPYFILE_EXCL);
+  return backupPath;
+}
+
+// Entries the tour does not manage can still decide whether a session can write.
+export function otherEntryWarnings(configPath, write) {
+  let config;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch (err) {
+    return err.code === "ENOENT" ? [] : [`Could not check ${configPath} for other Obsidian entries: ${err.message}`];
+  }
+  const warnings = [];
+  for (const [project, settings] of Object.entries(config?.projects ?? {})) {
+    if (settings?.mcpServers?.obsidian) {
+      warnings.push(`${project} has its own "obsidian" entry, which wins there. To remove it, run \`claude mcp remove obsidian -s local\` in that folder.`);
+    }
+  }
+  for (const [project, settings] of Object.entries(config?.projects ?? {})) {
+    if (!write && settings?.mcpServers?.["obsidian-write"]) {
+      warnings.push(`${project} has an "obsidian-write" entry that can still write to your vault. Remove it if you want writing off.`);
+    }
+  }
+  if (!write && config?.mcpServers?.["obsidian-write"]) {
+    warnings.push(`A separate "obsidian-write" entry in ${configPath} can still write to your vault. Remove it if you want writing off.`);
+  }
+  return warnings;
+}
+
 export async function configureClaudeDesktop(vaultPath, dailyPath = "Daily/", configPath = getClaudeDesktopConfigPath(), options = {}) {
   const launcher = resolveServerLauncher();
   const serverEntry = {
     command: launcher.command,
-    args: [
-      ...launcher.argsPrefix,
-      "--vault",
-      vaultPath,
-      "--daily-path",
-      dailyPath,
-    ],
+    args: serverArgs(launcher, vaultPath, dailyPath, options.write),
   };
   return upsertJsonMcpServerConfig(configPath, serverEntry, options);
 }
@@ -294,10 +337,10 @@ export function detectClaudeCode({ platform = process.platform, spawn = spawnSyn
 }
 
 export function getClaudeCodeConfigPath() {
-  return join(homedir(), ".claude.json");
+  return join(process.env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json");
 }
 
-export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/", { spawn = spawnSync } = {}) {
+export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/", { spawn = spawnSync, write = false } = {}) {
   const launcher = resolveServerLauncher();
   const args = [
     "mcp",
@@ -307,11 +350,7 @@ export async function configureClaudeCodeViaCli(vaultPath, dailyPath = "Daily/",
     "obsidian",
     "--",
     launcher.command,
-    ...launcher.argsPrefix,
-    "--vault",
-    vaultPath,
-    "--daily-path",
-    dailyPath,
+    ...serverArgs(launcher, vaultPath, dailyPath, write),
   ];
   let res;
   try {
@@ -334,13 +373,7 @@ export async function configureClaudeCodeViaFile(vaultPath, dailyPath = "Daily/"
   const launcher = resolveServerLauncher();
   const serverEntry = {
     command: launcher.command,
-    args: [
-      ...launcher.argsPrefix,
-      "--vault",
-      vaultPath,
-      "--daily-path",
-      dailyPath,
-    ],
+    args: serverArgs(launcher, vaultPath, dailyPath, options.write),
   };
   const result = await upsertJsonMcpServerConfig(configPath, serverEntry, options);
   return { ...result, method: "file" };
@@ -463,6 +496,16 @@ export async function runTour(options = {}) {
     print(`Daily notes path: ${selectedDaily}`);
     print();
 
+    let write;
+    while (write === undefined) {
+      const reply = (await ask("Let your AI app save notes and add to your daily note? [Y/n]: ")).trim().toLowerCase();
+      if (["", "y", "yes"].includes(reply)) write = true;
+      else if (["n", "no"].includes(reply)) write = false;
+      else print("Answer y or n.");
+    }
+    print(write ? "Writing is on." : 'Writing is off. To turn it on later, run the tour again or change "--read" to "--write" in the server arguments.');
+    print();
+
     print("AI Host Configuration:");
     print("  [1] Configure Claude Code");
     print("  [2] Configure Claude Desktop");
@@ -491,9 +534,31 @@ export async function runTour(options = {}) {
       let codeConfigured = false;
       if (hasClaudeCli && !options.forceFileConfig) {
         print("Configuring Claude Code via `claude mcp add`...");
-        const cliRes = options.configureClaudeCodeViaCli
-          ? await options.configureClaudeCodeViaCli(selectedVault, selectedDaily)
-          : await configureClaudeCodeViaCli(selectedVault, selectedDaily);
+        const addViaCli = () => (options.configureClaudeCodeViaCli || configureClaudeCodeViaCli)(selectedVault, selectedDaily, { write });
+        let cliRes = await addViaCli();
+        if (!cliRes.success && /already exists/i.test(cliRes.error)) {
+          const reply = (await ask('Replace the existing "obsidian" entry? [Y/n]: ')).trim().toLowerCase();
+          if (["", "y", "yes"].includes(reply)) {
+            let backupPath;
+            try {
+              backupPath = await backupBeforeReplace(claudeCodeConfigPath);
+            } catch (err) {
+              print(`Kept the old entry, because it could not be backed up: ${err.message}`);
+            }
+            if (backupPath) {
+              print(`  The previous config is saved at ${backupPath}`);
+              const removed = await (options.removeClaudeCodeViaCli || removeClaudeCodeViaCli)();
+              if (removed.success) {
+                cliRes = await addViaCli();
+                if (!cliRes.success) {
+                  print(`The old "obsidian" entry was removed and the new one was not added. To restore it, copy mcpServers.obsidian from ${backupPath} into ${claudeCodeConfigPath}.`);
+                }
+              } else {
+                print(`Could not remove the old entry: ${removed.error}`);
+              }
+            }
+          }
+        }
         if (cliRes.success) {
           print("✓ Claude Code configured successfully via CLI!");
           codeConfigured = true;
@@ -502,6 +567,7 @@ export async function runTour(options = {}) {
           print(`CLI add unavailable (${cliRes.error}). Trying direct config write...`);
         } else {
           print(`CLI add reported: ${cliRes.error}.`);
+          if (/already exists/i.test(cliRes.error)) print("To replace it yourself, run `claude mcp remove obsidian -s user`, then run this tour again.");
           results.push({ host: "Claude Code", success: false, method: "cli", error: cliRes.error });
           codeConfigured = true;
         }
@@ -510,7 +576,7 @@ export async function runTour(options = {}) {
       if (!codeConfigured) {
         try {
           print(`Configuring Claude Code in ${claudeCodeConfigPath}...`);
-          const fileRes = await configureClaudeCodeViaFile(selectedVault, selectedDaily, claudeCodeConfigPath, { overwrite: true });
+          const fileRes = await configureClaudeCodeViaFile(selectedVault, selectedDaily, claudeCodeConfigPath, { overwrite: true, write });
           print(fileRes.updated ? `✓ Updated ${fileRes.configPath}` : `✓ Already configured in ${fileRes.configPath}`);
           if (fileRes.replacedBackupPath) print(`  Replaced an existing "obsidian" entry; the previous config is saved at ${fileRes.replacedBackupPath}`);
           results.push({ host: "Claude Code", success: true, method: "file" });
@@ -524,7 +590,7 @@ export async function runTour(options = {}) {
     if (hostChoice === 2 || hostChoice === 3) {
       try {
         print(`Configuring Claude Desktop in ${claudeDesktopConfigPath}...`);
-        const desktopRes = await configureClaudeDesktop(selectedVault, selectedDaily, claudeDesktopConfigPath, { overwrite: true });
+        const desktopRes = await configureClaudeDesktop(selectedVault, selectedDaily, claudeDesktopConfigPath, { overwrite: true, write });
         print(desktopRes.updated ? `✓ Updated ${desktopRes.configPath}` : `✓ Already configured in ${desktopRes.configPath}`);
         if (desktopRes.replacedBackupPath) print(`  Replaced an existing "obsidian" entry; the previous config is saved at ${desktopRes.replacedBackupPath}`);
         results.push({ host: "Claude Desktop", success: true });
@@ -534,6 +600,14 @@ export async function runTour(options = {}) {
       }
     }
 
+    const checkedPaths = [
+      ...(hostChoice === 1 || hostChoice === 3 ? [claudeCodeConfigPath] : []),
+      ...(hostChoice === 2 || hostChoice === 3 ? [claudeDesktopConfigPath] : []),
+    ];
+    for (const configPath of checkedPaths) {
+      for (const warning of otherEntryWarnings(configPath, write)) print(`⚠️ ${warning}`);
+    }
+
     if (hostChoice === 4) {
       const launcher = resolveServerLauncher();
       print("Configuration snippet for Claude Desktop or Claude Code:");
@@ -541,7 +615,7 @@ export async function runTour(options = {}) {
         mcpServers: {
           obsidian: {
             command: launcher.command,
-            args: [...launcher.argsPrefix, "--vault", selectedVault, "--daily-path", selectedDaily],
+            args: serverArgs(launcher, selectedVault, selectedDaily, write),
           },
         },
       }, null, 2));
@@ -579,10 +653,11 @@ export async function runTour(options = {}) {
       print("To test with Claude Code, launch `claude` and ask:");
       print('  "Search my Obsidian notes for project roadmap"');
       print('  "What did I write in my daily note today?"');
+      if (write) print('  "Add a line to my daily note saying setup works"');
       print();
     }
     const runLauncher = resolveServerLauncher();
-    const runCommand = [runLauncher.command, ...runLauncher.argsPrefix, "--vault", selectedVault, "--daily-path", selectedDaily]
+    const runCommand = [runLauncher.command, ...serverArgs(runLauncher, selectedVault, selectedDaily, write)]
       .map((part) => (/\s/.test(part) ? `"${part}"` : part))
       .join(" ");
     print("To run the MCP server directly in stdio mode:");
@@ -592,6 +667,7 @@ export async function runTour(options = {}) {
     return {
       vault: selectedVault,
       dailyPath: selectedDaily,
+      write,
       hostChoice,
       results,
     };
