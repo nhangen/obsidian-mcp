@@ -52,19 +52,16 @@ class CaptureError(Exception):
 
 
 def version_at_least(actual, minimum):
-    """Return True if `actual` is semantically >= `minimum` (dotted numeric)."""
-    def parts(v):
-        nums = []
-        for seg in str(v).split(".")[:3]:
-            m = re.match(r"(\d+)", seg)
-            nums.append(int(m.group(1)) if m else 0)
-        while len(nums) < 3:
-            nums.append(0)
-        return tuple(nums)
-    try:
-        return parts(str(actual)) >= parts(str(minimum))
-    except (ValueError, TypeError, AttributeError):
-        return False
+    """Return True if both are plain MAJOR.MINOR.PATCH strings and actual >= minimum."""
+
+    def parts(value):
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value)
+        return tuple(map(int, match.groups())) if match else None
+
+    found, floor = parts(actual), parts(minimum)
+    return found is not None and floor is not None and found >= floor
 
 
 def bounded_utf8(value, maximum, allow_empty=True):
@@ -868,7 +865,8 @@ def invoke(bundle, expected_version, protocol, allowed_errors, arguments, target
         server_info = initialized.get("serverInfo")
         if (
             not isinstance(server_info, dict)
-            or not version_at_least(server_info.get("version", ""), expected_version)
+            # Newer servers are allowed; discovered_schema still gates the write.
+            or not version_at_least(server_info.get("version"), expected_version)
         ):
             raise CaptureError("SERVER_VERSION_MISMATCH")
         bridge.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
