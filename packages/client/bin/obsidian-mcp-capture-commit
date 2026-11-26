@@ -46,22 +46,10 @@ MATRIX_STATUSES = {"supported", "compatibility", "planned"}
 
 
 class CaptureError(Exception):
-    def __init__(self, code, envelope=None):
+    def __init__(self, code, envelope=None, detail=None):
         self.code = code
         self.envelope = envelope
-
-
-def version_at_least(actual, minimum):
-    """Return True if both are plain MAJOR.MINOR.PATCH strings and actual >= minimum."""
-
-    def parts(value):
-        if not isinstance(value, str):
-            return None
-        match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value)
-        return tuple(map(int, match.groups())) if match else None
-
-    found, floor = parts(actual), parts(minimum)
-    return found is not None and floor is not None and found >= floor
+        self.detail = detail
 
 
 def bounded_utf8(value, maximum, allow_empty=True):
@@ -148,15 +136,19 @@ def read_json_file(path, limit, code):
 
 
 def validate_tool_schema(schema):
-    if not isinstance(schema, dict):
-        raise CaptureError("CAPABILITY_UNAVAILABLE")
-    properties = schema.get("properties")
+    properties = schema.get("properties") if isinstance(schema, dict) else None
     if not isinstance(properties, dict):
-        raise CaptureError("CAPABILITY_UNAVAILABLE")
-    for field in REQUIRED_TOOL_FIELDS:
+        raise CaptureError(
+            "CAPABILITY_UNAVAILABLE",
+            detail="obsidian_daily_append has no readable input schema.",
+        )
+    for field in sorted(REQUIRED_TOOL_FIELDS):
         descriptor = properties.get(field)
         if not isinstance(descriptor, dict) or descriptor.get("type") != "string":
-            raise CaptureError("CAPABILITY_UNAVAILABLE")
+            raise CaptureError(
+                "CAPABILITY_UNAVAILABLE",
+                detail=f"obsidian_daily_append must accept a string field named {field}.",
+            )
 
 
 def select_initialize_protocol(contract):
@@ -262,7 +254,7 @@ def load_bundle():
         )
     ):
         raise CaptureError("BUNDLE_INVALID")
-    return bundle, release[5:], protocol, frozenset(errors)
+    return bundle, protocol, frozenset(errors)
 
 
 def group_exists(process):
@@ -728,7 +720,10 @@ def discovered_schema(result):
         if isinstance(tool, dict) and tool.get("name") == "obsidian_daily_append"
     ]
     if len(matches) != 1:
-        raise CaptureError("CAPABILITY_UNAVAILABLE")
+        raise CaptureError(
+            "CAPABILITY_UNAVAILABLE",
+            detail="The server must offer exactly one obsidian_daily_append tool.",
+        )
     validate_tool_schema(matches[0].get("inputSchema"))
 
 
@@ -835,7 +830,7 @@ def validate_outcome(result, target, arguments, allowed_errors):
     raise CaptureError("WRITE_REJECTED", envelope)
 
 
-def invoke(bundle, expected_version, protocol, allowed_errors, arguments, target):
+def invoke(bundle, protocol, allowed_errors, arguments, target):
     bridge = Bridge(bundle / "bin/obsidian-mcp-write", bridge_timeout())
     dispatched = False
     try:
@@ -862,13 +857,6 @@ def invoke(bundle, expected_version, protocol, allowed_errors, arguments, target
             capabilities.get("tools"), dict
         ):
             raise CaptureError("CAPABILITY_UNAVAILABLE")
-        server_info = initialized.get("serverInfo")
-        if (
-            not isinstance(server_info, dict)
-            # Newer servers are allowed; discovered_schema still gates the write.
-            or not version_at_least(server_info.get("version"), expected_version)
-        ):
-            raise CaptureError("SERVER_VERSION_MISMATCH")
         bridge.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         bridge.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         discovered_schema(bridge.response(2))
@@ -914,12 +902,10 @@ def invoke(bundle, expected_version, protocol, allowed_errors, arguments, target
 
 def capture():
     event, context = read_input()
-    bundle, expected_version, protocol, allowed_errors = load_bundle()
+    bundle, protocol, allowed_errors = load_bundle()
     metadata = run_producer(bundle, event)
     target, arguments = capture_arguments(metadata, context)
-    status = invoke(
-        bundle, expected_version, protocol, allowed_errors, arguments, target
-    )
+    status = invoke(bundle, protocol, allowed_errors, arguments, target)
     return {"status": status, "path": target}
 
 
@@ -932,6 +918,8 @@ def main():
     except CaptureError as error:
         if error.envelope is None:
             sys.stderr.write(f"error:{error.code}\n")
+            if error.detail:
+                sys.stderr.write(f"{error.detail}\n")
         else:
             sys.stderr.write(json.dumps(error.envelope, separators=(",", ":")) + "\n")
         return 64

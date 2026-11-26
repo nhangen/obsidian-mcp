@@ -65,9 +65,9 @@ for line in sys.stdin:
         continue
     elif request.get("method") == "tools/list":
         properties = {name:{"type":"string"} for name in ("content","section","target_path","skip_if_hash","idempotency_key")}
-        if scenario == "missing-capability":
-            properties.pop("target_path")
-        send({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[{"name":"obsidian_daily_append","inputSchema":{"type":"object","properties":properties}}]}})
+        if scenario == "incompatible-schema":
+            properties["skip_if_hash"] = {"type":"integer"}
+        send({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[] if scenario == "no-tool" else [{"name":"obsidian_daily_append","inputSchema":{"type":"object","properties":properties}}]}})
     elif request.get("method") == "tools/call":
         arguments = request["params"]["arguments"]
         with Path(os.environ["FAKE_CALLS"]).open("a") as handle:
@@ -439,33 +439,37 @@ class CaptureCommitTest(unittest.TestCase):
         self.assert_error(result, "EVENT_REJECTED")
         self.assertFalse(self.started.exists())
 
-    def test_discovered_tool_and_live_version_gate_before_write(self):
-        missing = self.run_capture(self.event(), scenario="missing-capability")
-        self.assert_error(missing, "CAPABILITY_UNAVAILABLE")
-        self.assertEqual(self.call_records(), [])
-        self.started.unlink()
-        version = self.run_capture(self.event(), version="0.1.15")
-        self.assert_error(version, "SERVER_VERSION_MISMATCH")
+    def test_missing_tool_is_refused_with_a_reason_before_write(self):
+        result = self.run_capture(self.event(), scenario="no-tool")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "error:CAPABILITY_UNAVAILABLE\n"
+            "The server must offer exactly one obsidian_daily_append tool.\n",
+        )
         self.assertEqual(self.call_records(), [])
 
-    def test_newer_server_versions_are_accepted(self):
-        major, minor, patch = (int(part) for part in PINNED_VERSION.split("."))
-        for version in (f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 10}.0", f"{major + 1}.0.0"):
+    def test_server_version_never_decides_acceptance(self):
+        for version in ("0.0.1", "0.1.15", PINNED_VERSION, "99.0.0", "9.9.9-rc.1", "dev", ""):
             with self.subTest(version=version):
                 self.calls.unlink(missing_ok=True)
                 result = self.run_capture(self.event(), version=version)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(self.call_records()), 1)
-
-    def test_malformed_server_versions_stop_before_write(self):
-        cases = ("", "9", "9.9", "v9.9.9", "9.9.9-rc.1", "9.9.9.1", "9999garbage", " 9.9.9", "9.9.9\n", "\u0669.9.9")
-        for version in cases:
-            with self.subTest(version=version):
-                result = self.run_capture(self.event(), version=version)
-                self.assert_error(result, "SERVER_VERSION_MISMATCH")
-                self.assertEqual(self.call_records(), [])
+        self.calls.unlink(missing_ok=True)
         result = self.run_capture(self.event(), scenario="numeric-version")
-        self.assert_error(result, "SERVER_VERSION_MISMATCH")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.call_records()), 1)
+
+    def test_incompatible_tool_schema_names_the_missing_field(self):
+        result = self.run_capture(self.event(), scenario="incompatible-schema")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertEqual(
+            result.stderr,
+            "error:CAPABILITY_UNAVAILABLE\n"
+            "obsidian_daily_append must accept a string field named skip_if_hash.\n",
+        )
         self.assertEqual(self.call_records(), [])
 
     def test_mismatched_initialize_protocol_stops_before_initialized_notification(self):
