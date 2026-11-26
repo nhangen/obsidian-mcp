@@ -160,7 +160,7 @@ def validate_tool_schema(schema, source):
     if unsent:
         raise CaptureError(
             "CAPABILITY_UNAVAILABLE",
-            detail=f"{source}'s obsidian_daily_append requires fields this client does not send: {', '.join(unsent)}.",
+            detail=f"{source}'s obsidian_daily_append requires fields this client does not send: {', '.join(map(json.dumps, unsent))}.",
         )
 
 

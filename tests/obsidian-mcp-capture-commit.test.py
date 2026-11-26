@@ -72,7 +72,7 @@ for line in sys.stdin:
         if scenario == "incompatible-schema":
             properties["skip_if_hash"] = {"type":"integer"}
         tool = {"name":"obsidian_daily_append","inputSchema":{"type":"object","properties":properties}}
-        required = {"requires-unsent": ["content", "workspace_id"], "requires-sent": ["content"], "required-malformed": "content"}.get(scenario)
+        required = {"requires-unsent": ["content", "workspace_id"], "requires-sent": ["content"], "required-malformed": "content", "required-nonstring": ["content", 5], "required-multiline": ["content", "a\nerror:FAKE"]}.get(scenario)
         if required is not None:
             tool["inputSchema"]["required"] = required
         if scenario == "extra-optional":
@@ -473,10 +473,13 @@ class CaptureCommitTest(unittest.TestCase):
 
     def test_server_requiring_an_unsent_field_is_refused_before_write(self):
         for scenario, detail in (
-            ("requires-unsent", "The server's obsidian_daily_append requires fields this client does not send: workspace_id."),
+            ("requires-unsent", "The server's obsidian_daily_append requires fields this client does not send: \"workspace_id\"."),
+            ("required-multiline", "The server's obsidian_daily_append requires fields this client does not send: \"a\\nerror:FAKE\"."),
+            ("required-nonstring", "The server has no readable obsidian_daily_append input schema."),
             ("required-malformed", "The server has no readable obsidian_daily_append input schema."),
         ):
             with self.subTest(scenario=scenario):
+                self.calls.unlink(missing_ok=True)
                 result = self.run_capture(self.event(), scenario=scenario)
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertEqual(result.stderr, f"error:CAPABILITY_UNAVAILABLE\n{detail}\n")
