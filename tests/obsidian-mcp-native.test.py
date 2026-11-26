@@ -830,6 +830,38 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(result.returncode, 64)
         self.assertIn("PROFILE_DRIFT", result.stderr)
 
+    def test_unreadable_contract_error_codes_leave_commit_recovery(self):
+        native = self.load_native()
+        bundle = Path(tempfile.mkdtemp(dir=self.directory))
+        shutil.copytree(self.bundle / "bin", bundle / "bin")
+        native.BUNDLE = bundle
+        arguments = {"idempotency_key": "fixture-key"}
+        for contract in ('{"tools": {}}', "not-json", None):
+            with self.subTest(contract=contract):
+                if contract is None:
+                    (bundle / "contract.json").unlink()
+                else:
+                    (bundle / "contract.json").write_text(contract)
+                pending = dict(
+                    path="Projects/note.md",
+                    native_arguments=arguments,
+                    in_flight="call-1",
+                    status="pending",
+                )
+                event = dict(
+                    hook_event_name="PostToolUse",
+                    tool_use_id="call-1",
+                    tool_input=arguments,
+                    tool_response={},
+                )
+                with mock.patch.object(
+                    native, "matching_commits", return_value=[pending]
+                ):
+                    native.observe_commit({}, event)
+                self.assertEqual(pending["recovery"]["client_error"], "RECEIPT_INVALID")
+                self.assertEqual(pending["status"], "pending")
+                self.assertFalse(pending["in_flight"])
+
     def test_partial_commit_outcome_stays_visible_and_blocks_automatic_retry(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
