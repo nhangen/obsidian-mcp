@@ -178,8 +178,9 @@ without a successful-event channel must report that capability as unavailable.
 required `context` array of one to eight single-line, client-authored summary
 items. It invokes the bundled event producer locally, then appends through the
 bundled write bridge only after both the bundled contract and live discovered
-`obsidian_daily_append` schema expose `target_path`, `skip_if_hash`, `section`,
-and `idempotency_key`. The client requests `2025-11-25` only when the pinned
+`obsidian_daily_append` schema expose `content`, `target_path`, `skip_if_hash`,
+`section`, and `idempotency_key` as strings. It also refuses a schema that
+requires any other field. The client requests `2025-11-25` only when the pinned
 matrix approves that implemented initialize revision for both stdio and Streamable
 HTTP with non-planned status. The initialize response must return that exact
 protocol and an initialized tools capability object before the client sends any
