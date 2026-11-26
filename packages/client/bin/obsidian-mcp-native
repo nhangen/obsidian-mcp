@@ -4764,7 +4764,7 @@ def observe_commit(state, event, *, attached=False, routes=None):
         pending["recovery"] = error.envelope or consumer["unknown_outcome"](
             "RECEIPT_INVALID", pending["path"], arguments
         )
-    except (NativeError, ValueError, TypeError, KeyError):
+    except (NativeError, OSError, ValueError, TypeError, KeyError):
         pending["recovery"] = consumer["unknown_outcome"](
             "RECEIPT_INVALID", pending["path"], arguments
         )

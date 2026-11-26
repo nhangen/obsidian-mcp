@@ -836,9 +836,12 @@ class NativeCaptureTest(NativeCaptureFixture):
         shutil.copytree(self.bundle / "bin", bundle / "bin")
         native.BUNDLE = bundle
         arguments = {"idempotency_key": "fixture-key"}
-        for contract in ('{"tools": {}}', "not-json"):
+        for contract in ('{"tools": {}}', "not-json", None):
             with self.subTest(contract=contract):
-                (bundle / "contract.json").write_text(contract)
+                if contract is None:
+                    (bundle / "contract.json").unlink()
+                else:
+                    (bundle / "contract.json").write_text(contract)
                 pending = dict(
                     path="Projects/note.md",
                     native_arguments=arguments,
