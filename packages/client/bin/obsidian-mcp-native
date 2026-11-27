@@ -5,6 +5,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import datetime
 import fcntl
+import functools
 import hashlib
 from heapq import nlargest
 import json
@@ -271,6 +272,10 @@ def git(root, *args, allow_failure=False):
         raise NativeError("GIT_FAILED") from None
 
 
+# Verification hashes the whole release, and a session sweep reaches this once or
+# more per binding, which overran the host's hook deadline. A process verifies each
+# digest once; a failure raises and is not remembered.
+@functools.cache
 def trusted_bundle(expected):
     installer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-client-install"))
     try:
