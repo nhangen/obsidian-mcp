@@ -5,6 +5,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import datetime
 import fcntl
+import functools
 import hashlib
 from heapq import nlargest
 import json
@@ -271,6 +272,11 @@ def git(root, *args, allow_failure=False):
         raise NativeError("GIT_FAILED") from None
 
 
+# Cached by digest for the life of the process, because verification hashes the whole
+# release and a session sweep asks once or more per binding. A failure raises and is
+# not cached. load_profile is the trust point: the later call in commit_routes is
+# served from the cache, and an uncached one would bring the per-binding hashing back.
+@functools.cache
 def trusted_bundle(expected):
     installer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-client-install"))
     try:
@@ -532,6 +538,7 @@ def load_profile(home, *, parent_only=False, inspect=False):
         or profile.get("active") is not True
         or profile.get("host") not in ("codex", "claude-plugin")
         or profile.get("bundle") != str(BUNDLE)
+        or not isinstance(profile.get("releaseSha256"), str)
         or (attached_profile(profile) and profile.get("files") != {})
         or (
             attached_profile(profile)
