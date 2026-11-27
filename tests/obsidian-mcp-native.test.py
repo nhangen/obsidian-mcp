@@ -10111,5 +10111,226 @@ raise SystemExit(namespace['main']())
         )
 
 
+class OutsideCommitTest(NativeCaptureFixture):
+    expected_rewrite_decision = None
+    event = ClaudePluginCaptureTest.event
+    session_arguments = ClaudePluginCaptureTest.session_arguments
+    save = ClaudePluginCaptureTest.save
+    commit_receipt = ClaudePluginCaptureTest.commit_receipt
+    configure = UserCaptureTest.configure
+    state_paths = UserCaptureTest.state_paths
+    drain = UserCaptureTest.drain
+    terminal_session = UserCaptureTest.terminal_session
+    workspace_key = UserCaptureTest.workspace_key
+    session_state = UserCaptureTest.session_state
+    add_worktree = UserCaptureTest.add_worktree
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.directory / "conversation.jsonl"
+        self.transcript.write_text('{"type":"system","uuid":"start"}\n')
+
+    def start(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Work")
+        return self.state_paths()[0]
+
+    def next_prompt(self, **extra):
+        count = len(self.transcript.read_text().splitlines())
+        self.transcript.write_text(
+            self.transcript.read_text()
+            + json.dumps(dict(type="user", uuid=f"prompt-{count}"))
+            + "\n"
+        )
+        return self.hook("UserPromptSubmit", prompt="Next", **extra)
+
+    def outside_entry(self, commit="a" * 40, status="pending", **extra):
+        return dict(
+            event=dict(
+                schemaVersion=1,
+                event="git.commit",
+                outcome="success",
+                repository=str(self.directory / "elsewhere"),
+                commit=commit,
+                registration="agent",
+            ),
+            metadata=dict(
+                schemaVersion=1,
+                hash=commit,
+                branch="",
+                files=["a.txt"],
+                org_repo="fixture/other",
+                repo_name="other",
+                ticket="",
+                date="2026-11-01",
+                time="09:00",
+            ),
+            status=status,
+            capture_path="Projects/Development/fixture/other/2026-11-01.md",
+            **extra,
+        )
+
+    def put_outside(self, path, entry=None, key="1" * 64):
+        state = json.loads(path.read_text())
+        state.setdefault("outside_commits", {})[key] = entry or self.outside_entry()
+        path.write_text(json.dumps(state))
+        return key
+
+    def saved_with_outside(self, entry=None):
+        path = self.start()
+        self.save(path)
+        self.put_outside(path, entry)
+        return path
+
+    def test_open_outside_entry_blocks_drain(self):
+        path = self.saved_with_outside()
+        result = self.drain()
+        self.assertFalse(result["quiescent"])
+        self.assertEqual(
+            [s["unresolved"] for s in result["sessions"]],
+            [["outside_commit_pending"]],
+        )
+        state = json.loads(path.read_text())
+        state["outside_commits"]["1" * 64]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.assertTrue(self.drain()["quiescent"])
+
+    def test_open_outside_entry_blocks_project_scope_drain(self):
+        attached = ClaudePluginCaptureTest.configure(self)
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self.hook("UserPromptSubmit", prompt="Work")
+        (path,) = NativeCaptureFixture.state_paths(self)
+        self.save(path)
+        self.put_outside(path)
+        result = self.drain()
+        self.assertFalse(result["quiescent"])
+        self.assertEqual(
+            result["sessions"],
+            [dict(session=path.stem, unresolved=["outside_commit_pending"])],
+        )
+
+    def test_open_outside_entry_blocks_no_new_turn(self):
+        path = self.saved_with_outside()
+        before = json.loads(path.read_text())
+        output = self.next_prompt()
+        self.assertNotIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        after = json.loads(path.read_text())
+        self.assertNotEqual(after["turn"], before["turn"])
+        self.assertEqual(after["outside_commits"], before["outside_commits"])
+
+    def test_new_turn_drops_finished_outside_entries(self):
+        path = self.saved_with_outside(self.outside_entry(status="committed"))
+        self.put_outside(path, self.outside_entry("b" * 40, "skipped"), key="2" * 64)
+        self.next_prompt()
+        self.assertNotIn("outside_commits", json.loads(path.read_text()))
+
+    def test_enrollment_check_accepts_carried_outside_entries(self):
+        self.configure()
+        native = self.load_native()
+        _, profile = native.load_profile(str(self.home))
+        session = self.session_key("session-1")
+
+        def admitted(outside):
+            state = native.initial_session_state(
+                profile, session, "c" * 64, "d" * 64, date="2026-11-01"
+            )
+            state["outside_commits"] = outside
+            return state
+
+        native.validate_initial_state(
+            profile, session, admitted({"1" * 64: self.outside_entry()})
+        )
+        for outside in (
+            {},
+            [],
+            {"1" * 64: self.outside_entry(status="committed")},
+            {"1" * 64: dict(status="pending")},
+        ):
+            with self.subTest(outside=outside):
+                with self.assertRaisesRegex(
+                    native.NativeError, "ENROLLMENT_PUBLICATION_INVALID"
+                ):
+                    native.validate_initial_state(profile, session, admitted(outside))
+
+    def test_session_with_open_outside_entry_is_not_archived(self):
+        self.configure()
+        path = self.terminal_session()
+        self.put_outside(path)
+        before = path.read_bytes()
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_session_with_finished_outside_entries_archives_and_restores(self):
+        self.configure()
+        path = self.terminal_session()
+        self.put_outside(path, self.outside_entry(status="committed"))
+        original = json.loads(path.read_text())
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other")
+        self.assertFalse(path.exists())
+        self.assertTrue(self.drain()["complete"])
+        self.hook("SessionStart", source="resume")
+        self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_workspace_rebind_carries_pending_outside_entry(self):
+        path = self.saved_with_outside()
+        carried = json.loads(path.read_text())["outside_commits"]
+        worktree = self.add_worktree()
+        output = self.next_prompt(cwd=str(worktree))
+        self.assertNotIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertNotIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        moved = self.session_state(
+            self.home / "workspaces" / self.workspace_key(worktree)
+        )
+        self.assertEqual(json.loads(moved.read_text())["outside_commits"], carried)
+
+    def test_workspace_rebind_refuses_in_flight_outside_entry(self):
+        path = self.saved_with_outside(self.outside_entry(in_flight="write-1"))
+        before = path.read_bytes()
+        output = self.next_prompt(cwd=str(self.add_worktree()))
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertIn("in-flight", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_malformed_outside_entry_is_invalid_drain_state(self):
+        path = self.start()
+        original = json.loads(path.read_text())
+        for outside in (
+            [],
+            {"1" * 64: []},
+            {"1" * 64: self.outside_entry(status="unknown")},
+        ):
+            with self.subTest(outside=outside):
+                path.write_text(json.dumps(dict(original, outside_commits=outside)))
+                result = self.cli("drain-status", "--home", str(self.home))
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn("DRAIN_STATE_INVALID", result.stderr)
+
+    def test_status_shows_outside_commits_without_request_or_arguments(self):
+        path = self.start()
+        self.put_outside(
+            path,
+            self.outside_entry(
+                request=dict(context=["private"]), native_arguments=dict(a=1)
+            ),
+        )
+        child = path.parents[1]
+        result = self.cli("status", "--home", str(child), "--session", path.stem)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (entry,) = json.loads(result.stdout)["outside_commits"].values()
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotIn("request", entry)
+        self.assertNotIn("native_arguments", entry)
+
+    def test_watcher_skips_a_commit_already_in_outside_entries(self):
+        path = self.start()
+        (self.project / "file.txt").write_text("fixture\n")
+        self.git("add", "file.txt")
+        self.git("commit", "-m", "fixture")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.put_outside(path, self.outside_entry(head))
+        self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(json.loads(path.read_text())["commits"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

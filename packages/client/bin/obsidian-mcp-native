@@ -1188,7 +1188,7 @@ def retire_terminal_sessions(home, profile):
                     state is not None
                     and (
                         state.get("disposition") in ("open", "pending")
-                        or drain_reasons(state)
+                        or unresolved_reasons(state)
                     )
                 ) or (active_request(child) or {}).get("session") == entry.stem:
                     active += 1
@@ -1488,6 +1488,11 @@ def carried_evidence_refusal(state, repositories):
         return None
     if state.get("snapshots") or has_unresolved_snapshot(state):
         return "resolve pending command snapshots before a workspace transition"
+    for pending in outside_entries(state).values():
+        if not isinstance(pending, dict):
+            return "commit evidence is invalid"
+        if pending.get("in_flight") or pending.get("recovery"):
+            return "resolve in-flight commit capture before a workspace transition"
     for pending in (state.get("commits") or {}).values():
         if not isinstance(pending, dict):
             return "commit evidence is invalid"
@@ -2149,11 +2154,26 @@ def validate_initial_state(profile, session, state):
         parsed = datetime.date.fromisoformat(date).isoformat() if date else None
     except (TypeError, ValueError):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID") from None
+    if "outside_commits" in state:
+        carried = state["outside_commits"]
+        if (
+            not isinstance(carried, dict)
+            or not carried
+            or not all(
+                commit_entry_valid(entry) and outside_open(entry)
+                for entry in carried.values()
+            )
+        ):
+            raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
     if (
         not capture_identity_valid(profile, turn, transcript)
         or not isinstance(date, str)
         or parsed != date
-        or {key: value for key, value in state.items() if key != "git_watch"}
+        or {
+            key: value
+            for key, value in state.items()
+            if key not in ("git_watch", "outside_commits")
+        }
         != initial_session_state(profile, session, turn, transcript, date=date)
     ):
         raise NativeError("ENROLLMENT_PUBLICATION_INVALID")
@@ -2679,7 +2699,7 @@ def user_drain_status(home, profile):
                         if record["paused"] and not drain_reasons(state):
                             record["paused"] = False
                             atomic_write(binding_path, encode(record))
-                    reasons = drain_reasons(state) if state is not None else []
+                    reasons = unresolved_reasons(state) if state is not None else []
                     if record["enrolled"] != (state is not None):
                         raise NativeError("SESSION_BINDING_INVALID")
             except NativeError as error:
@@ -2916,6 +2936,40 @@ def active_request(home):
     return value
 
 
+def outside_entries(state):
+    return state.get("outside_commits", {})
+
+
+def outside_open(entry):
+    return bool(
+        entry.get("status") in ("pending", "not_captured")
+        or entry.get("in_flight")
+        or entry.get("recovery")
+    )
+
+
+def has_open_outside(state):
+    return any(outside_open(entry) for entry in outside_entries(state).values())
+
+
+def commit_entry_valid(entry):
+    return (
+        isinstance(entry, dict)
+        and entry.get("status")
+        in ("pending", "committed", "skipped", "not_captured")
+        and isinstance(entry.get("event"), dict)
+        and isinstance(entry.get("metadata"), dict)
+    )
+
+
+def unresolved_reasons(state):
+    """drain_reasons plus the work that holds a handoff but never a turn."""
+    reasons = drain_reasons(state)
+    if has_open_outside(state):
+        reasons = sorted([*reasons, "outside_commit_pending"])
+    return reasons
+
+
 def drain_reasons(state):
     reconcile_in_flight_session(state)
     if (
@@ -2924,6 +2978,8 @@ def drain_reasons(state):
         or state.get("disposition") not in ("open", "pending", "saved", "skipped_by_policy")
         or not isinstance(state.get("snapshots"), dict)
         or not isinstance(state.get("commits"), dict)
+        or not isinstance(outside_entries(state), dict)
+        or not all(commit_entry_valid(p) for p in outside_entries(state).values())
         or not isinstance(state.get("session_save"), dict)
         or any(not isinstance(p, dict) for p in state["snapshots"].values())
         or not isinstance(state.get("snapshot_resolutions", []), list)
@@ -2964,13 +3020,7 @@ def drain_reasons(state):
     if state["snapshots"]:
         reasons.append("snapshots")
     for pending in state["commits"].values():
-        if (
-            not isinstance(pending, dict)
-            or pending.get("status")
-            not in ("pending", "committed", "skipped", "not_captured")
-            or not isinstance(pending.get("event"), dict)
-            or not isinstance(pending.get("metadata"), dict)
-        ):
+        if not commit_entry_valid(pending):
             raise NativeError("DRAIN_STATE_INVALID")
         if (
             pending["status"] in ("pending", "not_captured")
@@ -3011,7 +3061,7 @@ def drain_status(home):
             present.add(key)
             if reconcile_in_flight_session(state):
                 atomic_write(state_path, encode(state))
-            sessions.append(dict(session=key, unresolved=drain_reasons(state)))
+            sessions.append(dict(session=key, unresolved=unresolved_reasons(state)))
         if owner and owner["session"] not in present:
             raise NativeError("DRAIN_ACTIVE_STATE_MISSING")
         if {p.stem for p in directory.glob("*.json") if p.name != ACTIVE} != present:
@@ -3296,7 +3346,7 @@ def session_records_commit(home, owner, commit):
         state = json.loads(private_read(home / "capture-state" / (owner + ".json")))
         return any(
             pending["event"].get("commit") == commit
-            for pending in state["commits"].values()
+            for pending in [*state["commits"].values(), *outside_entries(state).values()]
         ) or any(
             (snapshot.get("captured") or [{}])[0].get("commit") == commit
             for snapshot in state["snapshots"].values()
@@ -3351,7 +3401,10 @@ def record_watch_result(home, session, state, path):
 
 
 def accounted_commits(state):
-    commits = {pending["event"].get("commit") for pending in state["commits"].values()}
+    commits = {
+        pending["event"].get("commit")
+        for pending in [*state["commits"].values(), *outside_entries(state).values()]
+    }
     commits.update(
         record.get("observed_head") for record in state.get("snapshot_resolutions", [])
     )
@@ -4178,6 +4231,11 @@ def engine_hook(home, profile, event):
                         reconcile_note = WATCH_UNAVAILABLE + "\n"
                     if has_pending_capture(state):
                         raise NativeError("PREVIOUS_CAPTURE_UNRESOLVED")
+                carried = {
+                    key: entry
+                    for key, entry in outside_entries(state or {}).items()
+                    if outside_open(entry)
+                }
                 state = initial_session_state(
                     profile,
                     session,
@@ -4188,6 +4246,8 @@ def engine_hook(home, profile, event):
                         else None
                     ),
                 )
+                if carried:
+                    state["outside_commits"] = carried
                 if mode == "git":
                     try:
                         state["git_watch"] = git_position(Path(profile["project"]))
@@ -5012,7 +5072,10 @@ def main():
 def status_result(state, owner):
     result = json.loads(encode(state)) if state else {"status": "session_unavailable"}
     result.pop("session_request", None)
-    for pending in result.get("commits", {}).values():
+    for pending in [
+        *result.get("commits", {}).values(),
+        *result.get("outside_commits", {}).values(),
+    ]:
         pending.pop("request", None)
         pending.pop("native_arguments", None)
     result["gate"] = owner
