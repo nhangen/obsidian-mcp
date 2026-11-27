@@ -473,9 +473,10 @@ host settings and instructions, and writes none of those files. `--daily-folder`
 defaults to `Daily`; both folders must be normalized vault-relative directories.
 The supplied daily folder must match the server configuration: receipts naming a
 different daily path remain unresolved rather than relaxing verification.
-Every profile load verifies the same release bytes and installed trust record as
-the isolated runtime. A profile remains pinned to its immutable release even if
-the installer's `current` pointer later changes.
+Each process verifies the same release bytes and installed trust record as the
+isolated runtime once per pinned digest, before the first profile load uses them.
+A change on disk is caught by the next process. A profile remains pinned to its
+immutable release even if the installer's `current` pointer later changes.
 
 ### Commit route policy
 
