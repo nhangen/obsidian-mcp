@@ -10781,5 +10781,164 @@ class OutsideCommitTest(NativeCaptureFixture):
                 self.append_receipt(call, path="Other/forged.md")
 
 
+    ADD_COMMIT = ["/usr/bin/python3", "/fixture dir/capture-owner.py", "add-commit"]
+
+    def offer_command(self, path):
+        return shlex.join(
+            [
+                *self.ADD_COMMIT,
+                "--home",
+                str(path.parents[1]),
+                "--session",
+                path.stem,
+            ]
+        )
+
+    def additional(self, output):
+        return output.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def bash(self, command, call="shell-call"):
+        return self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id=call,
+            tool_input={"command": command},
+        )
+
+    def assert_runs_unchanged(self, output):
+        specific = output.get("hookSpecificOutput", {})
+        self.assertNotIn("permissionDecision", specific, output)
+        self.assertNotIn("updatedInput", specific, output)
+
+    def pending_project_commit(self):
+        path = self.start()
+        self.commit_in(self.project)
+        self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(len(json.loads(path.read_text())["commits"]), 1)
+        return path
+
+    def test_prompt_guidance_offers_add_commit_with_session_filled_in(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.configure()
+        prompted = self.additional(self.hook("UserPromptSubmit", prompt="Work"))
+        (path,) = self.state_paths()
+        expected = self.offer_command(path) + " --repo "
+        self.assertIn(expected, prompted)
+        self.assertIn("Subagents report", prompted)
+        self.assertIn(
+            expected, self.additional(self.hook("SessionStart", source="resume"))
+        )
+
+    def test_no_offer_without_the_plugin_prefix_or_for_directory_or_codex(self):
+        self.configure()
+        for value in (
+            None,
+            "not json",
+            "[]",
+            json.dumps("add-commit"),
+            json.dumps(["relative", "/x", "add-commit"]),
+            json.dumps(["/x", "relative", "add-commit"]),
+            json.dumps(["/x", "/y", 3]),
+        ):
+            with self.subTest(prefix=value):
+                if value is None:
+                    self.environment.pop("OBSIDIAN_CAPTURE_ADD_COMMIT", None)
+                else:
+                    self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = value
+                output = self.hook(
+                    "UserPromptSubmit", session_id=f"s-{value}", prompt="Work"
+                )
+                self.assertIn("obsidian_keeper_save", self.additional(output))
+                self.assertNotIn("add-commit", self.additional(output))
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        plain = self.directory / "plain"
+        plain.mkdir()
+        output = self.hook(
+            "UserPromptSubmit", cwd=str(plain), session_id="plain", prompt="Work"
+        )
+        self.assertNotIn("add-commit", self.additional(output))
+        self.home = self.directory / "codex-profile"
+        NativeCaptureFixture.configure(self)
+        output = self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=NativeCaptureFixture.event(self, "UserPromptSubmit", prompt="x"),
+        )
+        self.assertIn("obsidian_keeper_save", output.stdout)
+        self.assertNotIn("add-commit", output.stdout)
+
+    def test_stop_with_nothing_pending_is_not_blocked_by_the_offer(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.start()
+        self.save(path)
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+
+    def test_stop_lists_an_open_outside_entry_in_each_new_turn(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        for turn in ("first", "second"):
+            with self.subTest(turn=turn):
+                self.save(path, call=f"save-{turn}")
+                output = self.hook("Stop", stop_hook_active=False)
+                self.assertEqual(output.get("decision"), "block", output)
+                self.assertIn(arguments["skip_if_hash"], output["reason"])
+                self.assertIn(f"--commit {key} --reason", output["reason"])
+                self.assertIn("project root", output["reason"])
+                self.next_prompt()
+
+    def test_in_flight_outside_guidance_gives_retry_and_no_skip(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        self.hook("PreToolUse", **self.append_call(arguments))
+        output = self.hook("Stop", stop_hook_active=False)
+        self.assertIn("authoritative-path-inspected", output["reason"])
+        self.assertNotIn(f"--commit {key} --reason", output["reason"])
+
+    def test_other_repository_commit_is_not_denied_while_a_project_commit_is_pending(
+        self,
+    ):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.pending_project_commit()
+        root, _ = self.other_repo()
+        before = json.loads(path.read_text())["snapshots"]
+        for message in ('plain', '"a; b & c $ d | e"', '"first line\nsecond"'):
+            with self.subTest(message=message):
+                output = self.bash(
+                    f"git -C {shlex.quote(str(root))} commit -m {message}"
+                )
+                self.assert_runs_unchanged(output)
+                self.assertIn("add-commit", self.additional(output))
+                self.assertNotIn("prevents capture wrapping", self.additional(output))
+        self.assertEqual(json.loads(path.read_text())["snapshots"], before)
+
+    def test_chained_and_substituted_commits_stay_denied_while_pending(self):
+        self.pending_project_commit()
+        root, _ = self.other_repo()
+        quoted = shlex.quote(str(root))
+        for command in (
+            f"git -C {quoted} commit -m a && git commit -m b",
+            f'git -C {quoted} commit -m "$(git commit -m b)"',
+            f"git -C {quoted} -c user.name=x commit -m a",
+            "git commit -m b",
+        ):
+            with self.subTest(command=command):
+                warning = self.assert_bash_advisory(self.bash(command))
+                self.assertIn("prevents capture wrapping", warning)
+                self.assertIn("Save or skip the pending capture first", warning)
+
+    def test_printed_add_commit_command_passes_pretooluse_unchanged(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.pending_project_commit()
+        root, commit = self.other_repo()
+        command = shlex.join(
+            [*shlex.split(self.offer_command(path)), "--repo", str(root), "--commit", commit]
+        )
+        self.assert_runs_unchanged(self.bash(command, "pending-call"))
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(self.next_prompt()))
+        self.assert_runs_unchanged(self.bash(command, "paused-call"))
+
+
 if __name__ == "__main__":
     unittest.main()

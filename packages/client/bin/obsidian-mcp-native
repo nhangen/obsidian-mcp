@@ -2501,6 +2501,7 @@ def user_hook(home, profile, event):
                                 descriptor["host"],
                                 commit_routes(descriptor),
                                 retained=True,
+                                offer_add_commit=project_mode(descriptor) == "git",
                             )
                         return context(
                             "UserPromptSubmit",
@@ -3203,7 +3204,9 @@ def context(event, message):
     }
 
 
-def shell_commit(command, cwd, project, *, allow_subdirectory=False):
+def shell_commit(
+    command, cwd, project, *, allow_subdirectory=False, detect_other=False
+):
     if not isinstance(command, str):
         return None
     analysis = analyze_shell_command(command)
@@ -3222,13 +3225,24 @@ def shell_commit(command, cwd, project, *, allow_subdirectory=False):
         return None
     words.pop(0)
     root = Path(cwd).resolve()
-    if words[:1] == ["-C"] and len(words) >= 3:
+    named = words[:1] == ["-C"] and len(words) >= 3
+    if named:
         root = (root / words[1]).resolve()
         words = words[2:]
     if not words or words[0] != "commit":
         if "commit" in words:
             raise NativeError("unsupported git options before commit")
         return None
+    # Ahead of the punctuation checks: this command is never wrapped, and the
+    # parser has already classified chains and substitutions as "detected".
+    if (
+        detect_other
+        and named
+        and not any(w in ("-c", "--config-env") for w in words)
+    ):
+        top = git(root, "rev-parse", "--show-toplevel", allow_failure=True).strip()
+        if top and top != str(Path(project)):
+            raise NativeError("OTHER_REPOSITORY")
     if any(ord(c) < 32 or ord(c) == 127 for c in command):
         raise NativeError(
             "unsupported commit command; contains control characters"
@@ -3863,7 +3877,114 @@ def retry_guidance(home, state, payload_digest, *, commit=None):
     )
 
 
-def capture_guidance(home, state, host="codex", routes=None, *, retained=False, include_session=True):
+def add_commit_prefix():
+    """The plugin's add-commit wrapper, or None when no plugin passed one."""
+    try:
+        prefix = json.loads(os.environ["OBSIDIAN_CAPTURE_ADD_COMMIT"])
+    except (KeyError, ValueError):
+        return None
+    if (
+        not isinstance(prefix, list)
+        or len(prefix) < 2
+        or not all(isinstance(word, str) for word in prefix)
+        or not all(Path(word).is_absolute() for word in prefix[:2])
+    ):
+        return None
+    return prefix
+
+
+def add_commit_command(home, session):
+    prefix = add_commit_prefix()
+    if prefix is None:
+        return None
+    return (
+        shlex.join([*prefix, "--home", str(home), "--session", session])
+        + " --repo <repository root> --commit <full commit hash>"
+        + " [--path <vault note.md>]"
+    )
+
+
+def other_repository_note(home, session):
+    command = add_commit_command(home, session)
+    if command is None:
+        return (
+            "This commit is in another repository. It runs unchanged and is not"
+            " captured."
+        )
+    return (
+        "This commit is in another repository. It runs unchanged and is not"
+        " captured automatically. After it succeeds, send it with: " + command
+    )
+
+
+def claude_commit_guidance(home, state, event_id, pending, routes):
+    arguments = pending.get("native_arguments")
+    if arguments is None:
+        consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+        _, arguments = consumer["capture_arguments"](
+            pending["metadata"],
+            COMMIT_CONTEXT_TEMPLATE,
+            target_path=pending_target(pending, consumer, routes),
+        )
+        instruction = (
+            "Replace the three placeholder bullets with 3-8 concise factual context bullets. "
+            "Preserve the Branch line and every other argument exactly. "
+        )
+    else:
+        instruction = "Preserve these prepared arguments exactly. "
+        if pending.get("in_flight") or pending.get("recovery"):
+            instruction += (
+                retry_guidance(home, state, pending["payload_digest"], commit=event_id)
+                + " "
+            )
+    return (
+        "Capture the pending commit through mcp__obsidian-write__obsidian_daily_append. Further Git work may continue without capture wrapping. "
+        + instruction
+        + "Call MCP directly; no shell preparation is needed. Inspect the result; do not claim capture on failure. "
+        "An in-flight or recovery outcome requires inspection before retry.\n"
+        "Commit capture arguments: "
+        + json.dumps(arguments, ensure_ascii=False)
+    )
+
+
+def outside_guidance(home, state, event_id, pending, routes):
+    text = (
+        f"Unsaved capture from another repository ({pending['metadata']['org_repo']})."
+        " Run the save from this session's project root. "
+        + claude_commit_guidance(home, state, event_id, pending, routes)
+    )
+    if pending.get("in_flight") or pending.get("recovery"):
+        return text
+    skip = shlex.join(
+        [
+            state["python"],
+            str(BUNDLE / "bin/obsidian-mcp-native"),
+            "skip",
+            "--home",
+            str(home),
+            "--session",
+            state["session"],
+            "--commit",
+            event_id,
+        ]
+    )
+    return (
+        text
+        + f"\nTo dismiss it instead: {skip} --reason no_meaningful_work"
+        + " (or user_requested_no_capture)."
+    )
+
+
+def capture_guidance(
+    home,
+    state,
+    host="codex",
+    routes=None,
+    *,
+    retained=False,
+    include_session=True,
+    offer_add_commit=False,
+):
     key = state["session"]
     plan = state["session_save"]
     commands = []
@@ -3873,36 +3994,8 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False, 
     for event_id, pending in state["commits"].items():
         if pending["status"] == "pending":
             if host == "claude-plugin":
-                arguments = pending.get("native_arguments")
-                if arguments is None:
-                    consumer = runpy.run_path(
-                        str(BUNDLE / "bin/obsidian-mcp-capture-commit")
-                    )
-                    _, arguments = consumer["capture_arguments"](
-                        pending["metadata"],
-                        COMMIT_CONTEXT_TEMPLATE,
-                        target_path=pending_target(pending, consumer, routes),
-                    )
-                    instruction = (
-                        "Replace the three placeholder bullets with 3-8 concise factual context bullets. "
-                        "Preserve the Branch line and every other argument exactly. "
-                    )
-                else:
-                    instruction = "Preserve these prepared arguments exactly. "
-                    if pending.get("in_flight") or pending.get("recovery"):
-                        instruction += (
-                            retry_guidance(
-                                home, state, pending["payload_digest"], commit=event_id
-                            )
-                            + " "
-                        )
                 commands.append(
-                    f"Capture the pending commit through {tool_prefix}obsidian_daily_append. Further Git work may continue without capture wrapping. "
-                    + instruction
-                    + "Call MCP directly; no shell preparation is needed. Inspect the result; do not claim capture on failure. "
-                    "An in-flight or recovery outcome requires inspection before retry.\n"
-                    "Commit capture arguments: "
-                    + json.dumps(arguments, ensure_ascii=False)
+                    claude_commit_guidance(home, state, event_id, pending, routes)
                 )
                 continue
             command = shlex.join(
@@ -3981,6 +4074,22 @@ def capture_guidance(home, state, host="codex", routes=None, *, retained=False, 
         )
         commands.append(
             f"Only for no meaningful work or user-requested no capture, acknowledge explicitly with {command} --reason no_meaningful_work (or user_requested_no_capture). Planning/review can be meaningful without edits."
+        )
+    for event_id, pending in outside_entries(state).items():
+        if outside_open(pending):
+            commands.append(outside_guidance(home, state, event_id, pending, routes))
+    offer = (
+        add_commit_command(home, key)
+        if offer_add_commit and host == "claude-plugin"
+        else None
+    )
+    if offer is not None:
+        commands.append(
+            "To capture a commit made in another repository, run: "
+            + offer
+            + " and save with the returned arguments, adding 3-8 factual context"
+            " bullets. Subagents report the repository root and full commit hash"
+            " to the main agent."
         )
     if state.get("snapshots"):
         commands.append(
@@ -4291,7 +4400,13 @@ def engine_hook(home, profile, event):
                 return context(
                     name,
                     "Obsidian persisted capture state retained.\n"
-                    + capture_guidance(home, state, profile["host"], routes),
+                    + capture_guidance(
+                        home,
+                        state,
+                        profile["host"],
+                        routes,
+                        offer_add_commit=mode == "git",
+                    ),
                 )
         turn = identifier(event.get("turn_id"))
         if name == "UserPromptSubmit":
@@ -4376,7 +4491,13 @@ def engine_hook(home, profile, event):
                         else "This isolated profile owns capture through MCP only.\n"
                     )
                 )
-                + capture_guidance(home, state, profile["host"], routes),
+                + capture_guidance(
+                    home,
+                    state,
+                    profile["host"],
+                    routes,
+                    offer_add_commit=mode == "git",
+                ),
             )
         if state is None:
             raise NativeError("PROMPT_EVENT_REQUIRED")
@@ -4545,6 +4666,7 @@ def engine_hook(home, profile, event):
                 event["cwd"],
                 profile["project"],
                 allow_subdirectory=attached_profile(profile),
+                detect_other=profile["host"] == "claude-plugin",
             )
         except ShellParseError as error:
             if name == "PreToolUse":
@@ -4561,15 +4683,27 @@ def engine_hook(home, profile, event):
                 }
             return context(name, "Obsidian commit not captured: " + str(error))
         except NativeError as error:
-            if name == "PreToolUse" and (
-                state["snapshots"]
-                or any(p["status"] == "pending" for p in state["commits"].values())
+            other_repository = str(error) == "OTHER_REPOSITORY"
+            if name == "PreToolUse" and other_repository:
+                return context(name, other_repository_note(home, session))
+            if (
+                name == "PreToolUse"
+                and not other_repository
+                and (
+                    state["snapshots"]
+                    or any(
+                        p["status"] == "pending" for p in state["commits"].values()
+                    )
+                )
             ):
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": name,
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "An outstanding commit event prevents capture wrapping.",
+                        "permissionDecisionReason": (
+                            "An outstanding commit event prevents capture wrapping."
+                            " Save or skip the pending capture first."
+                        ),
                     }
                 }
             if name == "PreToolUse":
@@ -4616,7 +4750,8 @@ def engine_hook(home, profile, event):
                     "hookSpecificOutput": {
                         "hookEventName": name,
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "A pending commit prevents capture wrapping.\n"
+                        "permissionDecisionReason": "A pending commit prevents capture wrapping."
+                        " Save or skip the pending capture first.\n"
                         + capture_guidance(home, state, profile["host"], routes, include_session=False),
                     }
                 }
