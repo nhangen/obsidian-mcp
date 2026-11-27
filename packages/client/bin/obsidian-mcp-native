@@ -537,6 +537,7 @@ def load_profile(home, *, parent_only=False, inspect=False):
         or profile.get("active") is not True
         or profile.get("host") not in ("codex", "claude-plugin")
         or profile.get("bundle") != str(BUNDLE)
+        or not isinstance(profile.get("releaseSha256"), str)
         or (attached_profile(profile) and profile.get("files") != {})
         or (
             attached_profile(profile)

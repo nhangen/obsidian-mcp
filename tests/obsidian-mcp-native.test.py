@@ -6651,6 +6651,19 @@ module.hook(home, descriptor, json.loads(event))
             self.assertIn("obsidian_keeper_save", json.dumps(result))
             self.assertEqual(count(), 1)
 
+    def test_a_release_digest_that_is_not_text_is_an_invalid_profile(self):
+        self.configure()
+        path = self.home / "capture-profile.json"
+        original = json.loads(path.read_text())
+        native = self.load_native()
+        for value in (None, [], {}, 1):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({**original, "releaseSha256": value}))
+                with self.assertRaisesRegex(
+                    native.NativeError, "PROFILE_INACTIVE_OR_INVALID"
+                ):
+                    native.load_profile(self.home)
+
     def test_a_verified_bundle_does_not_vouch_for_another_digest(self):
         self.configure()
         native = self.load_native()
