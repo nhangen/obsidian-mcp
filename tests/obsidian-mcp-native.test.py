@@ -6616,6 +6616,41 @@ module.hook(home, descriptor, json.loads(event))
             self.assertIn("obsidian_keeper_save", json.dumps(result))
             self.assertEqual(count(), 1)
 
+    def test_an_installed_release_is_verified_once_across_many_sessions(self):
+        prefix = self.directory / "managed-client"
+        installed = subprocess.run(
+            [
+                str(self.bundle / "bin/obsidian-mcp-client-install"),
+                "--prefix",
+                str(prefix),
+                "--bundle",
+                str(self.bundle),
+                "--release-sha256",
+                self.digest,
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.bundle = prefix / "current"
+        self.configure()
+        for number in range(4):
+            self.hook(
+                "UserPromptSubmit", session_id="live-" + str(number), prompt="Work"
+            )
+        native = self.load_native()
+        self.assertEqual(native.BUNDLE.parent.name, "releases")
+        with self.counted_verifications(native) as count:
+            home, profile = native.load_profile(self.home)
+            result = native.hook(
+                home,
+                profile,
+                self.event("UserPromptSubmit", session_id="next", prompt="Work"),
+            )
+            self.assertIn("obsidian_keeper_save", json.dumps(result))
+            self.assertEqual(count(), 1)
+
     def test_a_verified_bundle_does_not_vouch_for_another_digest(self):
         self.configure()
         native = self.load_native()
