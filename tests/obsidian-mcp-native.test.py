@@ -10605,5 +10605,181 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.assertEqual(self.added(path, root, commit)["status"], "pending")
 
 
+    def add_other(self, path):
+        root, commit = self.other_repo()
+        result = self.added(path, root, commit)
+        arguments = dict(result["arguments"])
+        arguments["content"] += "\n- Changed the other project\n- Ran its checks"
+        return root, result["commit_id"], arguments
+
+    def append_call(self, arguments, call="outside-write"):
+        return dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id=call,
+            tool_input=arguments,
+        )
+
+    def append_receipt(self, call, **changes):
+        receipt = dict(self.commit_receipt(call["tool_input"]), **changes)
+        return self.hook("PostToolUse", **call, tool_response=json.dumps(receipt))
+
+    def entry(self, path, key):
+        return json.loads(path.read_text())["outside_commits"][key]
+
+    def skip_commit(self, path, key):
+        return self.cli(
+            "skip",
+            "--home",
+            str(path.parents[1]),
+            "--session",
+            path.stem,
+            "--commit",
+            key,
+            "--reason",
+            "no_meaningful_work",
+        )
+
+    def assert_denied(self, output, code):
+        specific = output.get("hookSpecificOutput", {})
+        self.assertEqual(specific.get("permissionDecision"), "deny", output)
+        self.assertIn(code, specific["permissionDecisionReason"])
+
+    def test_outside_save_flow_ends_committed(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.assertEqual(self.entry(path, key)["in_flight"], "outside-write")
+        self.append_receipt(call)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+        self.assertTrue(self.drain()["quiescent"])
+
+    def test_outside_save_after_new_commits_in_that_repo(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        self.commit_in(root, "later.txt")
+        call = self.append_call(arguments)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.append_receipt(call)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+
+    def test_outside_changed_arguments_are_denied(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        forged = dict(arguments, target_path="Projects/Development/forged.md")
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(forged)),
+            "COMMIT_PAYLOAD_CHANGED",
+        )
+        self.assertNotIn("native_arguments", self.entry(path, key))
+        self.assertEqual(self.hook("PreToolUse", **self.append_call(arguments)), {})
+        changed = dict(arguments, content=arguments["content"] + "\n- Another")
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(changed)),
+            "COMMIT_PAYLOAD_CHANGED",
+        )
+
+    def test_outside_bad_receipt_keeps_recovery_and_retry_reopens_it(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.hook("PreToolUse", **call)
+        self.append_receipt(call, path="Other/forged.md")
+        self.assertEqual(self.entry(path, key)["status"], "pending")
+        self.assertTrue(self.entry(path, key)["recovery"])
+        self.assertFalse(self.drain()["quiescent"])
+        retried = self.cli(
+            "retry",
+            "--home",
+            str(path.parents[1]),
+            "--session",
+            path.stem,
+            "--commit",
+            key,
+            "--payload-sha256",
+            self.entry(path, key)["payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(json.loads(retried.stdout)["arguments"], arguments)
+        again = self.append_call(arguments, "reviewed-write")
+        self.assertEqual(self.hook("PreToolUse", **again), {})
+        self.append_receipt(again)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+
+    def test_outside_save_when_the_repository_is_gone_stays_skippable(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        shutil.rmtree(root)
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(arguments)),
+            "COMMIT_EVENT_REJECTED",
+        )
+        entry = self.entry(path, key)
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotIn("in_flight", entry)
+        skipped = self.skip_commit(path, key)
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertEqual(self.entry(path, key)["status"], "skipped")
+
+    def test_outside_save_from_another_cwd_leaves_the_entry_pending(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        before = path.read_bytes()
+        output = self.hook(
+            "PreToolUse", cwd=str(root), **self.append_call(arguments)
+        )
+        self.assert_denied(output, "SESSION_WORKSPACE_CHANGED")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_skip_commit_leaves_the_session_disposition(self):
+        path = self.start()
+        _, key, _ = self.add_other(path)
+        before = json.loads(path.read_text())
+        skipped = self.skip_commit(path, key)
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        after = json.loads(path.read_text())
+        self.assertEqual(after["disposition"], before["disposition"])
+        self.assertNotIn("skip_reason", after)
+        self.assertEqual(self.entry(path, key)["status"], "skipped")
+        self.assertEqual(self.entry(path, key)["skip_reason"], "no_meaningful_work")
+        for refused in (key, "f" * 64):
+            with self.subTest(commit=refused):
+                result = self.skip_commit(path, refused)
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn("TURN_OR_REASON_INVALID", result.stderr)
+
+    def test_skip_commit_refuses_a_project_commit(self):
+        path = self.start()
+        self.commit_in(self.project)
+        self.hook("Stop", stop_hook_active=False)
+        ((key, _),) = json.loads(path.read_text())["commits"].items()
+        before = path.read_bytes()
+        result = self.skip_commit(path, key)
+        self.assertEqual(result.returncode, 64, result.stdout)
+        self.assertIn("TURN_OR_REASON_INVALID", result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_skip_commit_refuses_an_attempted_write(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.hook("PreToolUse", **call)
+        for state in ("in flight", "recovery"):
+            with self.subTest(state=state):
+                before = path.read_bytes()
+                result = self.skip_commit(path, key)
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn(
+                    "ATTEMPTED_WRITE_CANNOT_BE_POLICY_SKIPPED", result.stderr
+                )
+                self.assertEqual(path.read_bytes(), before)
+            if state == "in flight":
+                self.append_receipt(call, path="Other/forged.md")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3810,9 +3810,21 @@ def add_commit(home, profile, args):
     return dict(status="pending", commit_id=event_id, arguments=arguments)
 
 
+def skip_outside(home, args):
+    with state_lock(home, args.session) as (state, path):
+        entry = outside_entries(state or {}).get(args.commit)
+        if entry is None or args.reason is None or not outside_open(entry):
+            raise NativeError("TURN_OR_REASON_INVALID")
+        if entry.get("in_flight") or entry.get("recovery"):
+            raise NativeError("ATTEMPTED_WRITE_CANNOT_BE_POLICY_SKIPPED")
+        entry.update(status="skipped", skip_reason=args.reason)
+        atomic_write(path, encode(state))
+    return {"status": "skipped_by_policy", "commit_id": args.commit}
+
+
 def matching_commits(state, arguments, *, consumer=None, routes=None):
     matches = []
-    for pending in state["commits"].values():
+    for pending in [*state["commits"].values(), *outside_entries(state).values()]:
         planned = pending.get("native_arguments", {})
         if consumer is not None and "native_arguments" not in pending:
             _, planned = consumer["capture_arguments"](
@@ -4693,7 +4705,12 @@ def prepare_pending(pending, payload, consumer, *, producer_timeout=None, routes
             ),
         )
     except consumer["CaptureError"]:
-        raise NativeError("COMMIT_EVENT_REJECTED; commit must still be HEAD") from None
+        raise NativeError(
+            "COMMIT_EVENT_REJECTED; the repository or commit can no longer be read;"
+            " skip the entry if it is gone"
+            if "registration" in pending["event"]
+            else "COMMIT_EVENT_REJECTED; commit must still be HEAD"
+        ) from None
     if "native_arguments" in pending:
         return {
             "tool": "obsidian_daily_append",
@@ -4732,10 +4749,14 @@ def prepare_commit(home, profile, args):
     consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
     payload = input_json()
     with state_lock(home, args.session) as (state, path):
-        if state is None or args.commit not in state["commits"]:
+        pending = state and (
+            state["commits"].get(args.commit)
+            or outside_entries(state).get(args.commit)
+        )
+        if not pending:
             raise NativeError("COMMIT_EVENT_UNAVAILABLE")
         result = prepare_pending(
-            state["commits"][args.commit],
+            pending,
             payload,
             consumer,
             routes=commit_routes(profile),
@@ -4948,7 +4969,9 @@ def review_retry(home, profile, args):
         if state is None:
             raise NativeError("SESSION_UNAVAILABLE")
         if args.commit:
-            pending = state["commits"].get(args.commit)
+            pending = state["commits"].get(args.commit) or outside_entries(
+                state
+            ).get(args.commit)
             if not pending or pending.get("payload_digest") != args.payload_sha256:
                 raise NativeError("PAYLOAD_DIGEST_MISMATCH")
             payload = pending["request"]
@@ -5360,6 +5383,8 @@ def dispatch_command(args, extra, locks):
                 if args.operation == "prepare"
                 else review_retry(home, profile, args)
             )
+        elif args.operation == "skip" and args.commit is not None:
+            result = skip_outside(home, args)
         elif args.operation == "skip":
             with state_lock(home, args.session) as (state, path):
                 if state is None or state["turn"] != args.turn or args.reason is None:
