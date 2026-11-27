@@ -118,6 +118,56 @@ class CommitEventTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, f"error:{code}\n")
 
+    def test_registered_event_accepts_a_commit_that_is_not_head(self):
+        first = self.commit("first.txt")
+        self.commit("second.txt")
+
+        result = self.run_producer(self.event(first, registration="agent"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            (payload["hash"], payload["branch"], payload["ticket"], payload["files"]),
+            (first, "", "", ["first.txt"]),
+        )
+
+    def test_registered_event_at_head_keeps_the_branch(self):
+        commit = self.commit()
+
+        result = self.run_producer(self.event(commit, registration="agent"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            (payload["branch"], payload["ticket"]),
+            ("codex/939-native-capture", "939"),
+        )
+
+    def test_registered_event_rejects_a_non_commit_object(self):
+        self.commit()
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+
+        self.assert_error(
+            self.run_producer(self.event(tree, registration="agent")),
+            "COMMIT_INVALID",
+        )
+
+    def test_unknown_registration_value_is_invalid(self):
+        commit = self.commit()
+
+        for value in ("hook", "", None, True):
+            with self.subTest(value=value):
+                self.assert_error(
+                    self.run_producer(self.event(commit, registration=value)),
+                    "EVENT_INVALID",
+                )
+
+    def test_unregistered_event_still_requires_head(self):
+        first = self.commit("first.txt")
+        self.commit("second.txt")
+
+        self.assert_error(self.run_producer(self.event(first)), "COMMIT_STALE")
+
     def test_successful_event_emits_bounded_metadata(self):
         commit = self.commit("notes/space and ünicode.md")
         self.git(

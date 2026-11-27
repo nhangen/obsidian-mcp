@@ -125,7 +125,9 @@ def read_event():
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ProducerError("INPUT_INVALID") from None
     required = {"schemaVersion", "event", "outcome", "repository", "commit"}
-    if not isinstance(event, dict) or set(event) != required:
+    if not isinstance(event, dict) or set(event) - {"registration"} != required:
+        raise ProducerError("EVENT_INVALID")
+    if "registration" in event and event["registration"] != "agent":
         raise ProducerError("EVENT_INVALID")
     if type(event["schemaVersion"]) is not int or event["schemaVersion"] != 1:
         raise ProducerError("EVENT_INVALID")
@@ -141,7 +143,7 @@ def read_event():
         or HASH_PATTERN.fullmatch(commit) is None
     ):
         raise ProducerError("EVENT_INVALID")
-    return repository, commit
+    return repository, commit, "registration" in event
 
 
 def resolve_repository(repository):
@@ -178,9 +180,13 @@ def validate_commit(repository, commit):
         raise ProducerError("COMMIT_INVALID")
 
 
-def validate_head(repository, commit):
+def head_hash(repository):
     _, head = git(repository, ["rev-parse", "--verify", "HEAD"], limit=128)
-    if head.strip() != commit:
+    return head.strip()
+
+
+def validate_head(repository, commit):
+    if head_hash(repository) != commit:
         raise ProducerError("COMMIT_STALE")
 
 
@@ -317,15 +323,20 @@ def commit_timestamp(repository, commit):
 
 
 def produce():
-    repository_text, commit = read_event()
+    repository_text, commit, registered = read_event()
     repository = resolve_repository(repository_text)
     validate_commit(repository, commit)
-    validate_head(repository, commit)
-    branch = branch_name(repository)
+    # A registered commit may be behind HEAD, so the branch is only known at HEAD.
+    if registered:
+        branch = branch_name(repository) if head_hash(repository) == commit else ""
+    else:
+        validate_head(repository, commit)
+        branch = branch_name(repository)
     files = commit_files(repository, commit)
     org_repo, repo_name = repository_identity(repository)
     date, commit_time = commit_timestamp(repository, commit)
-    validate_head(repository, commit)
+    if not registered:
+        validate_head(repository, commit)
     segment = branch.rsplit("/", 1)[-1] if branch else ""
     ticket_match = TICKET_PATTERN.match(segment)
     return {
