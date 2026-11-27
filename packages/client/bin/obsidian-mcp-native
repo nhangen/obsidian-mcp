@@ -3712,6 +3712,104 @@ def pending_target(pending, consumer, routes=None):
         raise NativeError("COMMIT_ROUTES_INVALID") from None
 
 
+DENIED_DESTINATION_ROOTS = ("daily", "profile", "ceo")
+
+
+def outside_destination(profile, metadata, routes, path):
+    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+    try:
+        target = (
+            consumer["capture_target"](metadata, routes)
+            if path is None
+            else consumer["validate_capture_path"](path)
+        )
+    except consumer["CaptureError"]:
+        raise NativeError("DESTINATION_NOT_ALLOWED") from None
+    folders = ["Projects/Development"]
+    for template in routes.values():
+        folder, separator, _ = template.rpartition("/")
+        if separator and "{" not in folder:
+            folders.append(folder)
+    folded = target.casefold()
+    daily = profile.get("dailyFolder", "Daily").casefold()
+    # The deny list wins over a route, and the vault may be case-insensitive.
+    if (
+        not any(target.startswith(folder + "/") for folder in folders)
+        or folded.split("/", 1)[0] in DENIED_DESTINATION_ROOTS
+        or folded.startswith(daily + "/")
+    ):
+        raise NativeError("DESTINATION_NOT_ALLOWED")
+    return target
+
+
+def require_lease():
+    """Stop an accidental direct call. This is not a security boundary."""
+    try:
+        os.fstat(int(os.environ["OBSIDIAN_CAPTURE_LEASE_FD"]))
+    except (KeyError, ValueError, OverflowError, OSError):
+        raise NativeError(
+            "LEASE_REQUIRED; run the add-commit command shown in capture guidance"
+        ) from None
+
+
+def add_commit(home, profile, args):
+    if profile["host"] != "claude-plugin":
+        raise NativeError("HOST_UNSUPPORTED")
+    require_lease()
+    require_git_profile(profile)
+    if not args.repo or not args.commit:
+        raise NativeError("ARGUMENTS_INVALID")
+    repository = Path(args.repo)
+    try:
+        if repository.is_absolute():
+            repository = repository.resolve(strict=True)
+        else:
+            repository = args.repo
+    except (OSError, RuntimeError):
+        raise NativeError("COMMIT_EVENT_REJECTED") from None
+    event = dict(
+        schemaVersion=1,
+        event="git.commit",
+        outcome="success",
+        repository=str(repository),
+        commit=args.commit,
+        registration="agent",
+    )
+    routes = commit_routes(profile)
+    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+    try:
+        metadata = consumer["run_producer"](BUNDLE, event, sys.executable)
+    except consumer["CaptureError"]:
+        raise NativeError("COMMIT_EVENT_REJECTED") from None
+    target = outside_destination(profile, metadata, routes, args.path)
+    with state_lock(home, args.session) as (state, path):
+        if state is None:
+            raise NativeError("SESSION_UNAVAILABLE")
+        drain_reasons(state)
+        for key, known in [*state["commits"].items(), *outside_entries(state).items()]:
+            if (
+                known["event"].get("commit") == args.commit
+                and known["metadata"].get("org_repo") == metadata["org_repo"]
+            ):
+                return dict(status="already_pending", commit_id=key)
+        if event["repository"] == profile["project"]:
+            raise NativeError(
+                "PROJECT_REPOSITORY_WATCHED; the project's own commits are captured"
+                " from its history"
+            )
+        if sum(map(outside_open, outside_entries(state).values())) >= MAX_PENDING:
+            raise NativeError("OUTSIDE_LIMIT; save or skip an open entry first")
+        if not claim_commit(home, args.session, args.commit):
+            return dict(status="already_claimed")
+        event_id = digest(encode(event))
+        state.setdefault("outside_commits", {})[event_id] = dict(
+            event=event, metadata=metadata, status="pending", capture_path=target
+        )
+        atomic_write(path, encode(state))
+    _, arguments = consumer["capture_arguments"](metadata, [], target_path=target)
+    return dict(status="pending", commit_id=event_id, arguments=arguments)
+
+
 def matching_commits(state, arguments, *, consumer=None, routes=None):
     matches = []
     for pending in state["commits"].values():
@@ -5021,6 +5119,7 @@ def main():
     parser.add_argument(
         "operation",
         choices=(
+            "add-commit",
             "create",
             "attach",
             "capabilities",
@@ -5051,6 +5150,8 @@ def main():
     parser.add_argument("--turn")
     parser.add_argument("--commit")
     parser.add_argument("--commit-routes")
+    parser.add_argument("--repo")
+    parser.add_argument("--path")
     parser.add_argument("--snapshot")
     parser.add_argument("--payload-sha256")
     parser.add_argument(
@@ -5249,6 +5350,8 @@ def dispatch_command(args, extra, locks):
             )
         elif args.operation == "execute-commit":
             return execute_commit(home, profile, args, locks)
+        elif args.operation == "add-commit":
+            result = add_commit(home, profile, args)
         elif args.operation == "hook":
             result = hook(home, profile, input_json())
         elif args.operation in ("prepare", "retry"):
