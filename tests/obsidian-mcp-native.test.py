@@ -10925,6 +10925,11 @@ class OutsideCommitTest(NativeCaptureFixture):
                 )
                 self.assertIn("obsidian_keeper_save", self.additional(output))
                 self.assertNotIn("add-commit", self.additional(output))
+                self.assertEqual(
+                    "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid"
+                    in self.additional(output),
+                    value is not None,
+                )
         self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
         plain = self.directory / "plain"
         plain.mkdir()

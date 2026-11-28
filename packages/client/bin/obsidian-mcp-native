@@ -3886,8 +3886,8 @@ def retry_guidance(home, state, payload_digest, *, commit=None):
 def add_commit_prefix():
     """The plugin's add-commit wrapper, or None when no plugin passed one."""
     try:
-        prefix = json.loads(os.environ["OBSIDIAN_CAPTURE_ADD_COMMIT"])
-    except (KeyError, ValueError):
+        prefix = json.loads(os.environ.get("OBSIDIAN_CAPTURE_ADD_COMMIT", "null"))
+    except ValueError:
         return None
     if (
         not isinstance(prefix, list)
@@ -4084,11 +4084,13 @@ def capture_guidance(
     for event_id, pending in outside_entries(state).items():
         if outside_open(pending):
             commands.append(outside_guidance(home, state, event_id, pending, routes))
-    offer = (
-        add_commit_command(home, key)
-        if offer_add_commit and host == "claude-plugin"
-        else None
-    )
+    offered = offer_add_commit and host == "claude-plugin"
+    offer = add_commit_command(home, key) if offered else None
+    if offered and offer is None and "OBSIDIAN_CAPTURE_ADD_COMMIT" in os.environ:
+        commands.append(
+            "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid, so commits from other"
+            " repositories cannot be sent. Update or reinstall the Obsidian plugin."
+        )
     if offer is not None:
         commands.append(
             "To capture a commit made in another repository, run: "
