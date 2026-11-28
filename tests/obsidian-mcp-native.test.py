@@ -10291,6 +10291,14 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.assertIn("in-flight", json.dumps(output))
         self.assertEqual(path.read_bytes(), before)
 
+    def test_workspace_rebind_refuses_outside_entry_in_recovery(self):
+        path = self.saved_with_outside(self.outside_entry(recovery=True))
+        before = path.read_bytes()
+        output = self.next_prompt(cwd=str(self.add_worktree()))
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertIn("in-flight", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+
     def test_malformed_outside_entry_is_invalid_drain_state(self):
         path = self.start()
         original = json.loads(path.read_text())
@@ -10588,6 +10596,24 @@ class OutsideCommitTest(NativeCaptureFixture):
                     target,
                 )
 
+    def test_add_commit_refuses_the_configured_daily_folder_even_when_routed(self):
+        routes = self.directory / "routes.json"
+        routes.write_text(json.dumps({"fixture/diary": "Log/Routed/{date}.md"}))
+        routes.chmod(0o600)
+        self.configure("--daily-folder", "Log", "--commit-routes", str(routes))
+        self.hook("UserPromptSubmit", prompt="Work")
+        (path,) = self.state_paths()
+        root, commit = self.other_repo()
+        self.freeze(path)
+        for target in ("Log/Routed/x.md", "log/Routed/x.md"):
+            with self.subTest(target=target):
+                self.assert_refused(
+                    path,
+                    self.add(path, root, commit, "--path", target),
+                    "DESTINATION_NOT_ALLOWED",
+                    commit,
+                )
+
     def test_add_commit_limit_counts_only_open_entries(self):
         path = self.start()
         root, commit = self.other_repo()
@@ -10717,6 +10743,12 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.assert_denied(
             self.hook("PreToolUse", **self.append_call(arguments)),
             "COMMIT_EVENT_REJECTED",
+        )
+        self.assertIn(
+            "skip the entry if it is gone",
+            json.dumps(
+                self.hook("PreToolUse", **self.append_call(arguments, "again"))
+            ),
         )
         entry = self.entry(path, key)
         self.assertEqual(entry["status"], "pending")
@@ -10868,6 +10900,25 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.assertIn("obsidian_keeper_save", output.stdout)
         self.assertNotIn("add-commit", output.stdout)
 
+    def test_retained_guidance_in_a_directory_session_has_no_offer(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.configure()
+        plain = self.directory / "plain"
+        plain.mkdir()
+        self.hook("UserPromptSubmit", cwd=str(plain), prompt="Work")
+        retained = self.additional(self.next_prompt(cwd=str(plain)))
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", retained)
+        self.assertNotIn("add-commit", retained)
+
+    def test_own_project_commit_named_with_dash_c_is_not_another_repository(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.pending_project_commit()
+        (self.project / "nested").mkdir()
+        for target in (self.project, self.project / "nested"):
+            with self.subTest(target=target.name):
+                output = self.bash(f"git -C {shlex.quote(str(target))} commit -m x")
+                self.assertNotIn("another repository", json.dumps(output))
+
     def test_stop_with_nothing_pending_is_not_blocked_by_the_offer(self):
         self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
         path = self.start()
@@ -10936,7 +10987,9 @@ class OutsideCommitTest(NativeCaptureFixture):
             [*shlex.split(self.offer_command(path)), "--repo", str(root), "--commit", commit]
         )
         self.assert_runs_unchanged(self.bash(command, "pending-call"))
-        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(self.next_prompt()))
+        retained = self.additional(self.next_prompt())
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", retained)
+        self.assertIn(self.offer_command(path) + " --repo ", retained)
         self.assert_runs_unchanged(self.bash(command, "paused-call"))
 
 
