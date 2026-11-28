@@ -568,6 +568,21 @@ except namespace['NativeError'] as error:
 
 
 class NativeCaptureTest(NativeCaptureFixture):
+    def test_codex_guidance_keeps_the_explicit_skip_command(self):
+        self.configure()
+        prompt = self.hook("UserPromptSubmit", prompt="work")
+        text = prompt["hookSpecificOutput"]["additionalContext"]
+        (path,) = self.state_paths()
+        state = json.loads(path.read_text())
+        self.assertNotIn("obsidian-capture-skip", text)
+        self.assertIn(
+            f"skip --home {shlex.quote(str(self.home))} --session {state['session']} "
+            f"--turn {state['turn']} --reason no_meaningful_work",
+            text,
+        )
+        self.assertIn("Planning/review can be meaningful without edits.", text)
+        self.assertIn("Preserve this payload on retry; inspect partial/recovery/conflict outcomes.", text)
+
     def test_codex_direct_append_still_requires_cli_preparation(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
