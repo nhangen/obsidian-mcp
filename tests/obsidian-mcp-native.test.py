@@ -2569,6 +2569,7 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(repaired.returncode, 0, repaired.stderr)
         outcome = json.loads(repaired.stdout)
         self.assertFalse(outcome["range_known"])
+        self.assertIn("other repositories", outcome["note"])
 
         path.with_name(path.name + ".invalid").unlink()
         path.unlink()

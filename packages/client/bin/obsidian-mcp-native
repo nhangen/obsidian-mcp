@@ -5211,6 +5211,10 @@ def repair_state(home, profile, args):
             head_unavailable=observed_head is None,
             range_known=False,
             watch_unavailable=watch_unavailable,
+            note=(
+                "Captures from other repositories are not rebuilt. Run add-commit"
+                " again for any that were not saved."
+            ),
         )
 
 
