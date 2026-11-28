@@ -855,7 +855,8 @@ the native `skip` command, also without an `allow` decision. A receipt from an
 earlier turn reports `SKIP_RECEIPT_STALE`, and any other non-commit command
 containing `false obsidian-capture-skip` reports `SKIP_REQUEST_MALFORMED`. In
 both cases, or when the hook is not installed, the literal `false` runs and
-fails. Commands that only mention the token are not affected.
+fails. Commands that mention the token without `false` before it are not
+affected, and the advisory never rewrites or blocks a command.
 For attached Claude, pending-commit guidance supplies canonical
 `obsidian_daily_append` arguments with three context placeholders. Replace those
 bullets with factual context and call MCP directly; no Bash `prepare` command or
