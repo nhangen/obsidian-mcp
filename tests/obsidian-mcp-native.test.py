@@ -3576,7 +3576,9 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
             for field in (state["python"], str(self.bundle), str(self.home),
                           state["session"], state["turn"]):
                 self.assertNotIn(field, text)
-            self.assertLess(len(text), 730)
+            self.assertLess(len(text), 760)
+            self.assertIn("planning/review counts", text)
+            self.assertIn("partial or conflict", text)
             self.assertIn("mcp__obsidian-write__obsidian_keeper_save", text)
             for field in ("title", "folder", "date", "idempotency_key"):
                 self.assertIn(state["session_save"][field], text)

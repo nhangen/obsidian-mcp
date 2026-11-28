@@ -4116,7 +4116,7 @@ def capture_guidance(
                 }
             )
             + (
-                ", resolved=true, and a factual Markdown body. Inspect failures; retry unchanged."
+                ", resolved=true, and a factual Markdown body. Inspect failed, partial or conflict results; retry unchanged."
                 if host == "claude-plugin"
                 else ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
             )
@@ -4128,9 +4128,9 @@ def capture_guidance(
         )
         if host == "claude-plugin":
             commands.append(
-                "If no meaningful work, run in Bash: "
+                "If no meaningful work (planning/review counts), run in Bash: "
                 f"`false obsidian-capture-skip {session_skip_receipt(state)} no_meaningful_work`. "
-                "If the user asked not to save, use user_requested_no_capture instead."
+                "If the user declined capture, use user_requested_no_capture."
             )
         else:
             command = session_skip_command(home, state, "no_meaningful_work")
