@@ -3831,6 +3831,8 @@ def add_commit(home, profile, args):
 def skip_outside(home, args):
     with state_lock(home, args.session) as (state, path):
         entry = outside_entries(state or {}).get(args.commit)
+        if entry is None and args.commit not in (state or {}).get("commits", {}):
+            raise NativeError("COMMIT_EVENT_UNAVAILABLE")
         if entry is None or args.reason is None or not outside_open(entry):
             raise NativeError("TURN_OR_REASON_INVALID")
         if entry.get("in_flight") or entry.get("recovery"):

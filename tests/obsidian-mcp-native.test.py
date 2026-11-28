@@ -10818,11 +10818,14 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.assertNotIn("skip_reason", after)
         self.assertEqual(self.entry(path, key)["status"], "skipped")
         self.assertEqual(self.entry(path, key)["skip_reason"], "no_meaningful_work")
-        for refused in (key, "f" * 64):
+        for refused, code in (
+            (key, "TURN_OR_REASON_INVALID"),
+            ("f" * 64, "COMMIT_EVENT_UNAVAILABLE"),
+        ):
             with self.subTest(commit=refused):
                 result = self.skip_commit(path, refused)
                 self.assertEqual(result.returncode, 64, result.stdout)
-                self.assertIn("TURN_OR_REASON_INVALID", result.stderr)
+                self.assertIn(code, result.stderr)
 
     def test_skip_commit_refuses_a_project_commit(self):
         path = self.start()
