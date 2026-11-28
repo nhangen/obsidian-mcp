@@ -3574,7 +3574,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
                     stop["reason"][len(marker):])
         for text in guidance:
             for field in (state["python"], str(self.bundle), str(self.home),
-                          state["session"], state["turn"]):
+                          state["session"], state["turn"], str(self.project),
+                          "obsidian-mcp-native", "--home", "--session"):
                 self.assertNotIn(field, text)
             self.assertLess(len(text), 760)
             self.assertIn("planning/review counts", text)
@@ -3585,7 +3586,8 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         pattern = r"false obsidian-capture-skip [a-f0-9]{64} no_meaningful_work"
         command = re.search(pattern, guidance[0]).group()
         self.assertEqual(re.search(pattern, guidance[1]).group(), command)
-        self.assertNotEqual(subprocess.run(shlex.split(command)).returncode, 0)
+        literal = subprocess.run(shlex.split(command), capture_output=True, timeout=30)
+        self.assertNotEqual(literal.returncode, 0)
         for bad in (command + " && true", command.replace("no_meaningful_work", "other"),
                     command + " ", "`" + command + "`", "cd /tmp && " + command):
             output = self.hook(
@@ -3613,7 +3615,7 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"status": "skipped_by_policy"})
         self.assertEqual(self.hook("Stop", stop_hook_active=True), {})
-        self.hook("UserPromptSubmit", prompt="New turn")
+        prompt = self.hook("UserPromptSubmit", prompt="New turn")
         output = self.hook(
             "PreToolUse", tool_name="Bash", tool_use_id="stale-skip",
             tool_input=tool_input,
@@ -3621,6 +3623,19 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.assertNotIn("updatedInput", output)
         self.assertIn("SKIP_RECEIPT_STALE", output["additionalContext"])
         self.assertIn("current Obsidian guidance", output["additionalContext"])
+        declined = re.search(
+            pattern, prompt["hookSpecificOutput"]["additionalContext"]
+        ).group().replace("no_meaningful_work", "user_requested_no_capture")
+        output = self.hook(
+            "PreToolUse", tool_name="Bash", tool_use_id="declined-skip",
+            tool_input={"command": declined},
+        )["hookSpecificOutput"]
+        result = subprocess.run(
+            shlex.split(output["updatedInput"]["command"]), env=self.environment,
+            cwd=self.project, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(path.read_text())["skip_reason"], "user_requested_no_capture")
 
     def test_stop_is_bounded_and_orphan_hook_cannot_create_turn(self):
         self.assertEqual(self.configure().returncode, 0)
@@ -4415,6 +4430,9 @@ class DirectoryCaptureTest(NativeCaptureFixture):
     drain = ClaudePluginCaptureTest.drain
     test_generic_hook_errors_are_advisory_except_protected_mcp_writes = (
         ClaudePluginCaptureTest.test_generic_hook_errors_are_advisory_except_protected_mcp_writes
+    )
+    test_compact_skip_runs_through_the_claude_hook = (
+        ClaudePluginCaptureTest.test_compact_skip_runs_through_the_claude_hook
     )
 
     def setUp(self):
