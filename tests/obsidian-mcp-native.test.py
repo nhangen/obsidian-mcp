@@ -2569,6 +2569,7 @@ class NativeCaptureTest(NativeCaptureFixture):
         self.assertEqual(repaired.returncode, 0, repaired.stderr)
         outcome = json.loads(repaired.stdout)
         self.assertFalse(outcome["range_known"])
+        self.assertIn("other repositories", outcome["note"])
 
         path.with_name(path.name + ".invalid").unlink()
         path.unlink()
@@ -10109,6 +10110,952 @@ raise SystemExit(namespace['main']())
             [p["event"]["commit"] for p in state_next["commits"].values()],
             [self.head()],
         )
+
+
+class OutsideCommitTest(NativeCaptureFixture):
+    expected_rewrite_decision = None
+    event = ClaudePluginCaptureTest.event
+    session_arguments = ClaudePluginCaptureTest.session_arguments
+    save = ClaudePluginCaptureTest.save
+    commit_receipt = ClaudePluginCaptureTest.commit_receipt
+    configure = UserCaptureTest.configure
+    state_paths = UserCaptureTest.state_paths
+    drain = UserCaptureTest.drain
+    terminal_session = UserCaptureTest.terminal_session
+    workspace_key = UserCaptureTest.workspace_key
+    session_state = UserCaptureTest.session_state
+    add_worktree = UserCaptureTest.add_worktree
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.directory / "conversation.jsonl"
+        self.transcript.write_text('{"type":"system","uuid":"start"}\n')
+
+    def start(self):
+        self.configure()
+        self.hook("UserPromptSubmit", prompt="Work")
+        return self.state_paths()[0]
+
+    def next_prompt(self, **extra):
+        count = len(self.transcript.read_text().splitlines())
+        self.transcript.write_text(
+            self.transcript.read_text()
+            + json.dumps(dict(type="user", uuid=f"prompt-{count}"))
+            + "\n"
+        )
+        return self.hook("UserPromptSubmit", prompt="Next", **extra)
+
+    def outside_entry(self, commit="a" * 40, status="pending", **extra):
+        return dict(
+            event=dict(
+                schemaVersion=1,
+                event="git.commit",
+                outcome="success",
+                repository=str(self.directory / "elsewhere"),
+                commit=commit,
+                registration="agent",
+            ),
+            metadata=dict(
+                schemaVersion=1,
+                hash=commit,
+                branch="",
+                files=["a.txt"],
+                org_repo="fixture/other",
+                repo_name="other",
+                ticket="",
+                date="2026-11-01",
+                time="09:00",
+            ),
+            status=status,
+            capture_path="Projects/Development/fixture/other/2026-11-01.md",
+            **extra,
+        )
+
+    def put_outside(self, path, entry=None, key="1" * 64):
+        state = json.loads(path.read_text())
+        state.setdefault("outside_commits", {})[key] = entry or self.outside_entry()
+        path.write_text(json.dumps(state))
+        return key
+
+    def saved_with_outside(self, entry=None):
+        path = self.start()
+        self.save(path)
+        self.put_outside(path, entry)
+        return path
+
+    def test_open_outside_entry_blocks_drain(self):
+        path = self.saved_with_outside()
+        result = self.drain()
+        self.assertFalse(result["quiescent"])
+        self.assertEqual(
+            [s["unresolved"] for s in result["sessions"]],
+            [["outside_commit_pending"]],
+        )
+        state = json.loads(path.read_text())
+        state["outside_commits"]["1" * 64]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.assertTrue(self.drain()["quiescent"])
+
+    def test_open_outside_entry_blocks_project_scope_drain(self):
+        attached = ClaudePluginCaptureTest.configure(self)
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self.hook("UserPromptSubmit", prompt="Work")
+        (path,) = NativeCaptureFixture.state_paths(self)
+        self.save(path)
+        self.put_outside(path)
+        result = self.drain()
+        self.assertFalse(result["quiescent"])
+        self.assertEqual(
+            result["sessions"],
+            [dict(session=path.stem, unresolved=["outside_commit_pending"])],
+        )
+
+    def test_open_outside_entry_blocks_no_new_turn(self):
+        path = self.saved_with_outside()
+        before = json.loads(path.read_text())
+        output = self.next_prompt()
+        self.assertNotIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        after = json.loads(path.read_text())
+        self.assertNotEqual(after["turn"], before["turn"])
+        self.assertEqual(after["outside_commits"], before["outside_commits"])
+
+    def test_new_turn_drops_finished_outside_entries(self):
+        path = self.saved_with_outside(self.outside_entry(status="committed"))
+        self.put_outside(path, self.outside_entry("b" * 40, "skipped"), key="2" * 64)
+        self.next_prompt()
+        self.assertNotIn("outside_commits", json.loads(path.read_text()))
+
+    def test_enrollment_check_accepts_carried_outside_entries(self):
+        self.configure()
+        native = self.load_native()
+        _, profile = native.load_profile(str(self.home))
+        session = self.session_key("session-1")
+
+        def admitted(outside):
+            state = native.initial_session_state(
+                profile, session, "c" * 64, "d" * 64, date="2026-11-01"
+            )
+            state["outside_commits"] = outside
+            return state
+
+        native.validate_initial_state(
+            profile, session, admitted({"1" * 64: self.outside_entry()})
+        )
+        for outside in (
+            {},
+            [],
+            {"1" * 64: self.outside_entry(status="committed")},
+            {"1" * 64: dict(status="pending")},
+        ):
+            with self.subTest(outside=outside):
+                with self.assertRaisesRegex(
+                    native.NativeError, "ENROLLMENT_PUBLICATION_INVALID"
+                ):
+                    native.validate_initial_state(profile, session, admitted(outside))
+
+    def test_session_with_open_outside_entry_is_not_archived(self):
+        self.configure()
+        path = self.terminal_session()
+        self.put_outside(path)
+        before = path.read_bytes()
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_session_with_finished_outside_entries_archives_and_restores(self):
+        self.configure()
+        path = self.terminal_session()
+        self.put_outside(path, self.outside_entry(status="committed"))
+        original = json.loads(path.read_text())
+        self.hook("UserPromptSubmit", session_id="second", prompt="Other")
+        self.assertFalse(path.exists())
+        self.assertTrue(self.drain()["complete"])
+        self.hook("SessionStart", source="resume")
+        self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_workspace_rebind_carries_pending_outside_entry(self):
+        path = self.saved_with_outside()
+        carried = json.loads(path.read_text())["outside_commits"]
+        worktree = self.add_worktree()
+        output = self.next_prompt(cwd=str(worktree))
+        self.assertNotIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertNotIn("PREVIOUS_CAPTURE_UNRESOLVED", json.dumps(output))
+        moved = self.session_state(
+            self.home / "workspaces" / self.workspace_key(worktree)
+        )
+        self.assertEqual(json.loads(moved.read_text())["outside_commits"], carried)
+
+    def test_workspace_rebind_refuses_in_flight_outside_entry(self):
+        path = self.saved_with_outside(self.outside_entry(in_flight="write-1"))
+        before = path.read_bytes()
+        output = self.next_prompt(cwd=str(self.add_worktree()))
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertIn("in-flight", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_workspace_rebind_refuses_outside_entry_in_recovery(self):
+        path = self.saved_with_outside(self.outside_entry(recovery=True))
+        before = path.read_bytes()
+        output = self.next_prompt(cwd=str(self.add_worktree()))
+        self.assertIn("SESSION_WORKSPACE_CHANGED", json.dumps(output))
+        self.assertIn("in-flight", json.dumps(output))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_malformed_outside_entry_is_invalid_drain_state(self):
+        path = self.start()
+        original = json.loads(path.read_text())
+        for outside in (
+            [],
+            {"1" * 64: []},
+            {"1" * 64: self.outside_entry(status="unknown")},
+        ):
+            with self.subTest(outside=outside):
+                path.write_text(json.dumps(dict(original, outside_commits=outside)))
+                result = self.cli("drain-status", "--home", str(self.home))
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn("DRAIN_STATE_INVALID", result.stderr)
+
+    def test_status_shows_outside_commits_without_request_or_arguments(self):
+        path = self.start()
+        self.put_outside(
+            path,
+            self.outside_entry(
+                request=dict(context=["private"]), native_arguments=dict(a=1)
+            ),
+        )
+        child = path.parents[1]
+        result = self.cli("status", "--home", str(child), "--session", path.stem)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (entry,) = json.loads(result.stdout)["outside_commits"].values()
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotIn("request", entry)
+        self.assertNotIn("native_arguments", entry)
+
+    def test_watcher_skips_a_commit_already_in_outside_entries(self):
+        path = self.start()
+        (self.project / "file.txt").write_text("fixture\n")
+        self.git("add", "file.txt")
+        self.git("commit", "-m", "fixture")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.put_outside(path, self.outside_entry(head))
+        self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(json.loads(path.read_text())["commits"], {})
+
+
+    def repository_git(self, root, *args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            env=dict(
+                self.environment,
+                GIT_AUTHOR_DATE="2026-11-03T10:15:00-04:00",
+                GIT_COMMITTER_DATE="2026-11-03T10:15:00-04:00",
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+    def commit_in(self, root, name="note.txt"):
+        (root / name).write_text(name + "\n")
+        self.repository_git(root, "add", "--", name)
+        self.repository_git(root, "commit", "-m", "private subject " + name)
+        return self.repository_git(root, "rev-parse", "HEAD")
+
+    def other_repo(self, name="other"):
+        root = self.directory / name
+        root.mkdir()
+        self.repository_git(root, "init", "-b", "other-branch")
+        self.repository_git(
+            root, "remote", "add", "origin", f"git@github.com:fixture/{name}.git"
+        )
+        return root, self.commit_in(root)
+
+    def add(self, path, repo, commit, *extra, lease=True, home=None):
+        command = [
+            str(self.bundle / "bin/obsidian-mcp-native"),
+            "add-commit",
+            "--home",
+            str(home or path.parents[1]),
+            "--session",
+            path.stem,
+            "--repo",
+            str(repo),
+            "--commit",
+            commit,
+            *extra,
+        ]
+        with open(self.directory / "lease", "w") as stream:
+            environment = dict(self.environment)
+            if lease is True:
+                environment["OBSIDIAN_CAPTURE_LEASE_FD"] = str(stream.fileno())
+            elif lease:
+                environment["OBSIDIAN_CAPTURE_LEASE_FD"] = lease
+            return subprocess.run(
+                command,
+                env=environment,
+                pass_fds=(stream.fileno(),),
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+
+    def added(self, path, repo, commit, *extra):
+        result = self.add(path, repo, commit, *extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def assert_refused(self, path, result, code, commit):
+        before = self.frozen
+        self.assertEqual(result.returncode, 64, result.stdout)
+        self.assertIn(code, result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((path.parents[1] / "commit-claims" / commit).exists())
+
+    def freeze(self, path):
+        self.frozen = path.read_bytes()
+
+    def test_add_commit_creates_one_pending_entry_from_git_data(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        result = self.added(path, root, commit)
+        self.assertEqual(result["status"], "pending")
+        state = json.loads(path.read_text())
+        self.assertEqual(state["commits"], {})
+        ((key, entry),) = state["outside_commits"].items()
+        self.assertEqual(result["commit_id"], key)
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["event"]["registration"], "agent")
+        self.assertEqual(entry["event"]["repository"], str(root))
+        self.assertEqual(entry["metadata"]["org_repo"], "fixture/other")
+        self.assertEqual(entry["metadata"]["files"], ["note.txt"])
+        target = "Projects/Development/fixture/other/2026-11-03.md"
+        self.assertEqual(entry["capture_path"], target)
+        self.assertEqual(result["arguments"]["target_path"], target)
+        self.assertEqual(result["arguments"]["skip_if_hash"], commit)
+        self.assertTrue((path.parents[1] / "commit-claims" / commit).is_file())
+
+    def test_add_commit_twice_returns_already_pending(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        first = self.added(path, root, commit)
+        before = path.read_bytes()
+        self.assertEqual(
+            self.added(path, root, commit),
+            dict(
+                status="already_pending",
+                commit_id=first["commit_id"],
+                entry_status="pending",
+                capture_path="Projects/Development/fixture/other/2026-11-03.md",
+            ),
+        )
+        self.assertEqual(
+            self.added(path, root, commit, "--path", "CEO/x.md")["commit_id"],
+            first["commit_id"],
+        )
+        self.assertEqual(path.read_bytes(), before)
+        state = json.loads(before)
+        state["outside_commits"][first["commit_id"]]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.assertEqual(
+            self.added(path, root, commit)["entry_status"], "committed"
+        )
+
+    def test_add_commit_same_hash_in_another_repository_is_not_a_duplicate(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        entry = self.outside_entry(commit)
+        entry["metadata"]["org_repo"] = "fixture/else"
+        self.put_outside(path, entry)
+        self.assertEqual(self.added(path, root, commit)["status"], "pending")
+
+    def test_add_commit_refuses_malformed_outside_state(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        self.put_outside(path, dict(status="pending"))
+        self.freeze(path)
+        self.assert_refused(
+            path, self.add(path, root, commit), "DRAIN_STATE_INVALID", commit
+        )
+
+    def test_add_commit_of_a_watched_project_commit_is_already_pending(self):
+        path = self.start()
+        commit = self.commit_in(self.project)
+        self.hook("Stop", stop_hook_active=False)
+        ((key, watched),) = json.loads(path.read_text())["commits"].items()
+        self.assertEqual(
+            self.added(path, self.project, commit),
+            dict(
+                status="already_pending",
+                commit_id=key,
+                entry_status="pending",
+                capture_path=watched["capture_path"],
+            ),
+        )
+        self.assertNotIn("outside_commits", json.loads(path.read_text()))
+
+    def test_add_commit_of_an_unseen_project_commit_leaves_it_to_the_watcher(self):
+        path = self.start()
+        commit = self.commit_in(self.project)
+        self.freeze(path)
+        self.assert_refused(
+            path,
+            self.add(path, self.project, commit),
+            "PROJECT_REPOSITORY_WATCHED",
+            commit,
+        )
+        self.hook("Stop", stop_hook_active=False)
+        state = json.loads(path.read_text())
+        self.assertEqual(
+            [p["event"]["commit"] for p in state["commits"].values()], [commit]
+        )
+
+    def test_add_commit_claimed_by_another_session(self):
+        path = self.start()
+        self.hook("UserPromptSubmit", session_id="session-2", prompt="Other")
+        second = path.with_name(self.session_key("session-2") + ".json")
+        root, commit = self.other_repo()
+        self.added(path, root, commit)
+        before = second.read_bytes()
+        self.assertEqual(
+            self.added(second, root, commit),
+            dict(
+                status="already_claimed",
+                note="another session holds this commit; nothing to save here",
+            ),
+        )
+        self.assertEqual(second.read_bytes(), before)
+
+    def test_add_commit_requires_the_lease(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        self.freeze(path)
+        for lease in (False, "987", "not-a-number"):
+            with self.subTest(lease=lease):
+                self.assert_refused(
+                    path,
+                    self.add(path, root, commit, lease=lease),
+                    "LEASE_REQUIRED",
+                    commit,
+                )
+
+    def test_add_commit_refuses_subdirectory_relative_and_short_hash(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        (root / "nested").mkdir()
+        self.freeze(path)
+        self.assert_refused(
+            path,
+            self.add(path, "other", commit),
+            "REPOSITORY_NOT_ABSOLUTE",
+            commit,
+        )
+        for repo, value in (
+            (root / "nested", commit),
+            (root, commit[:12]),
+            (self.directory / "missing", commit),
+        ):
+            with self.subTest(repo=str(repo), commit=value):
+                self.assert_refused(
+                    path,
+                    self.add(path, repo, value),
+                    "COMMIT_EVENT_REJECTED",
+                    commit,
+                )
+
+    def test_add_commit_refuses_directory_mode_codex_and_unknown_session(self):
+        self.configure()
+        root, commit = self.other_repo()
+        plain = self.directory / "plain"
+        plain.mkdir()
+        self.hook("UserPromptSubmit", cwd=str(plain), prompt="Work")
+        (path,) = self.state_paths()
+        self.freeze(path)
+        self.assert_refused(
+            path, self.add(path, root, commit), "DIRECTORY_SESSION_ONLY", commit
+        )
+        unknown = path.with_name(self.session_key("nobody") + ".json")
+        result = self.add(unknown, root, commit)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("SESSION_BINDING_REQUIRED", result.stderr)
+        self.home = self.directory / "codex-profile"
+        NativeCaptureFixture.configure(self)
+        result = self.add(path, root, commit, home=self.home)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("ADD_COMMIT_HOST_UNSUPPORTED", result.stderr)
+
+    def test_add_commit_destination_rules(self):
+        routes = self.directory / "routes.json"
+        routes.write_text(
+            json.dumps(
+                {
+                    "fixture/routed": "Notes/Routed/{date}.md",
+                    "fixture/diary": "Daily/Routed/{date}.md",
+                }
+            )
+        )
+        routes.chmod(0o600)
+        self.configure("--commit-routes", str(routes))
+        self.hook("UserPromptSubmit", prompt="Work")
+        (path,) = self.state_paths()
+        root, commit = self.other_repo()
+        self.freeze(path)
+        for target in (
+            "Daily/x.md",
+            "daily/x.md",
+            "Journal/x.md",
+            "journal/x.md",
+            "Profile/x.md",
+            "CEO/x.md",
+            "ceo/x.md",
+            "Projects/Development/../CEO/x.md",
+            "Inbox/x.md",
+            "Daily/Routed/x.md",
+            "/Projects/Development/x.md",
+            "Projects/Development/x.txt",
+        ):
+            with self.subTest(target=target):
+                self.assert_refused(
+                    path,
+                    self.add(path, root, commit, "--path", target),
+                    "DESTINATION_NOT_ALLOWED",
+                    commit,
+                )
+        diary, diary_commit = self.other_repo("diary")
+        self.assert_refused(
+            path,
+            self.add(path, diary, diary_commit),
+            "DESTINATION_NOT_ALLOWED",
+            diary_commit,
+        )
+        routed, routed_commit = self.other_repo("routed")
+        self.assertEqual(
+            self.added(path, routed, routed_commit)["arguments"]["target_path"],
+            "Notes/Routed/2026-11-03.md",
+        )
+        for index, target in enumerate(
+            ("Projects/Development/fixture/chosen.md", "Notes/Routed/chosen.md")
+        ):
+            with self.subTest(target=target):
+                chosen = self.commit_in(root, f"chosen-{index}.txt")
+                self.assertEqual(
+                    self.added(path, root, chosen, "--path", target)["arguments"][
+                        "target_path"
+                    ],
+                    target,
+                )
+
+    def test_add_commit_refuses_the_configured_daily_folder_even_when_routed(self):
+        routes = self.directory / "routes.json"
+        routes.write_text(json.dumps({"fixture/diary": "Log/Routed/{date}.md"}))
+        routes.chmod(0o600)
+        self.configure("--daily-folder", "Log", "--commit-routes", str(routes))
+        self.hook("UserPromptSubmit", prompt="Work")
+        (path,) = self.state_paths()
+        root, commit = self.other_repo()
+        self.freeze(path)
+        for target in ("Log/Routed/x.md", "log/Routed/x.md"):
+            with self.subTest(target=target):
+                self.assert_refused(
+                    path,
+                    self.add(path, root, commit, "--path", target),
+                    "DESTINATION_NOT_ALLOWED",
+                    commit,
+                )
+
+    def test_add_commit_limit_counts_only_open_entries(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        for index in range(16):
+            self.put_outside(
+                path, self.outside_entry(f"{index:040x}"), key=f"{index:064x}"
+            )
+        self.freeze(path)
+        self.assert_refused(
+            path, self.add(path, root, commit), "OUTSIDE_LIMIT", commit
+        )
+        state = json.loads(path.read_text())
+        state["outside_commits"][f"{0:064x}"]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.added(path, root, commit)["status"], "pending")
+
+
+    def add_other(self, path):
+        root, commit = self.other_repo()
+        result = self.added(path, root, commit)
+        arguments = dict(result["arguments"])
+        arguments["content"] += "\n- Changed the other project\n- Ran its checks"
+        return root, result["commit_id"], arguments
+
+    def append_call(self, arguments, call="outside-write"):
+        return dict(
+            tool_name="mcp__obsidian-write__obsidian_daily_append",
+            tool_use_id=call,
+            tool_input=arguments,
+        )
+
+    def append_receipt(self, call, **changes):
+        receipt = dict(self.commit_receipt(call["tool_input"]), **changes)
+        return self.hook("PostToolUse", **call, tool_response=json.dumps(receipt))
+
+    def entry(self, path, key):
+        return json.loads(path.read_text())["outside_commits"][key]
+
+    def skip_commit(self, path, key):
+        return self.cli(
+            "skip",
+            "--home",
+            str(path.parents[1]),
+            "--session",
+            path.stem,
+            "--commit",
+            key,
+            "--reason",
+            "no_meaningful_work",
+        )
+
+    def assert_denied(self, output, code):
+        specific = output.get("hookSpecificOutput", {})
+        self.assertEqual(specific.get("permissionDecision"), "deny", output)
+        self.assertIn(code, specific["permissionDecisionReason"])
+
+    def test_outside_save_flow_ends_committed(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.assertEqual(self.entry(path, key)["in_flight"], "outside-write")
+        self.append_receipt(call)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+        self.assertTrue(self.drain()["quiescent"])
+
+    def test_outside_save_after_new_commits_in_that_repo(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        self.commit_in(root, "later.txt")
+        call = self.append_call(arguments)
+        self.assertEqual(self.hook("PreToolUse", **call), {})
+        self.append_receipt(call)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+
+    def test_outside_changed_arguments_are_denied(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        forged = dict(arguments, target_path="Projects/Development/forged.md")
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(forged)),
+            "COMMIT_PAYLOAD_CHANGED",
+        )
+        self.assertNotIn("native_arguments", self.entry(path, key))
+        self.assertEqual(self.hook("PreToolUse", **self.append_call(arguments)), {})
+        changed = dict(arguments, content=arguments["content"] + "\n- Another")
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(changed)),
+            "COMMIT_PAYLOAD_CHANGED",
+        )
+
+    def test_outside_bad_receipt_keeps_recovery_and_retry_reopens_it(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.hook("PreToolUse", **call)
+        self.append_receipt(call, path="Other/forged.md")
+        self.assertEqual(self.entry(path, key)["status"], "pending")
+        self.assertTrue(self.entry(path, key)["recovery"])
+        self.assertFalse(self.drain()["quiescent"])
+        retried = self.cli(
+            "retry",
+            "--home",
+            str(path.parents[1]),
+            "--session",
+            path.stem,
+            "--commit",
+            key,
+            "--payload-sha256",
+            self.entry(path, key)["payload_digest"],
+            "--verification",
+            "authoritative-path-inspected",
+        )
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(json.loads(retried.stdout)["arguments"], arguments)
+        again = self.append_call(arguments, "reviewed-write")
+        self.assertEqual(self.hook("PreToolUse", **again), {})
+        self.append_receipt(again)
+        self.assertEqual(self.entry(path, key)["status"], "committed")
+
+    def test_outside_save_when_the_repository_is_gone_stays_skippable(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        shutil.rmtree(root)
+        self.assert_denied(
+            self.hook("PreToolUse", **self.append_call(arguments)),
+            "COMMIT_EVENT_REJECTED",
+        )
+        self.assertIn(
+            "skip the entry if it is gone",
+            json.dumps(
+                self.hook("PreToolUse", **self.append_call(arguments, "again"))
+            ),
+        )
+        entry = self.entry(path, key)
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotIn("in_flight", entry)
+        skipped = self.skip_commit(path, key)
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertEqual(self.entry(path, key)["status"], "skipped")
+
+    def test_outside_save_from_another_cwd_leaves_the_entry_pending(self):
+        path = self.start()
+        root, key, arguments = self.add_other(path)
+        before = path.read_bytes()
+        output = self.hook(
+            "PreToolUse", cwd=str(root), **self.append_call(arguments)
+        )
+        self.assert_denied(output, "SESSION_WORKSPACE_CHANGED")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_skip_commit_leaves_the_session_disposition(self):
+        path = self.start()
+        _, key, _ = self.add_other(path)
+        before = json.loads(path.read_text())
+        skipped = self.skip_commit(path, key)
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        after = json.loads(path.read_text())
+        self.assertEqual(after["disposition"], before["disposition"])
+        self.assertNotIn("skip_reason", after)
+        self.assertEqual(self.entry(path, key)["status"], "skipped")
+        self.assertEqual(self.entry(path, key)["skip_reason"], "no_meaningful_work")
+        for refused, code in (
+            (key, "TURN_OR_REASON_INVALID"),
+            ("f" * 64, "COMMIT_EVENT_UNAVAILABLE"),
+        ):
+            with self.subTest(commit=refused):
+                result = self.skip_commit(path, refused)
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn(code, result.stderr)
+
+    def test_skip_commit_refuses_a_project_commit(self):
+        path = self.start()
+        self.commit_in(self.project)
+        self.hook("Stop", stop_hook_active=False)
+        ((key, _),) = json.loads(path.read_text())["commits"].items()
+        before = path.read_bytes()
+        result = self.skip_commit(path, key)
+        self.assertEqual(result.returncode, 64, result.stdout)
+        self.assertIn("TURN_OR_REASON_INVALID", result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_skip_commit_refuses_an_attempted_write(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        call = self.append_call(arguments)
+        self.hook("PreToolUse", **call)
+        for state in ("in flight", "recovery"):
+            with self.subTest(state=state):
+                before = path.read_bytes()
+                result = self.skip_commit(path, key)
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn(
+                    "ATTEMPTED_WRITE_CANNOT_BE_POLICY_SKIPPED", result.stderr
+                )
+                self.assertEqual(path.read_bytes(), before)
+            if state == "in flight":
+                self.append_receipt(call, path="Other/forged.md")
+
+
+    ADD_COMMIT = ["/usr/bin/python3", "/fixture dir/capture-owner.py", "add-commit"]
+
+    def offer_command(self, path):
+        return shlex.join(
+            [
+                *self.ADD_COMMIT,
+                "--home",
+                str(path.parents[1]),
+                "--session",
+                path.stem,
+            ]
+        )
+
+    def additional(self, output):
+        return output.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def bash(self, command, call="shell-call"):
+        return self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_use_id=call,
+            tool_input={"command": command},
+        )
+
+    def assert_runs_unchanged(self, output):
+        specific = output.get("hookSpecificOutput", {})
+        self.assertNotIn("permissionDecision", specific, output)
+        self.assertNotIn("updatedInput", specific, output)
+
+    def pending_project_commit(self):
+        path = self.start()
+        self.commit_in(self.project)
+        self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(len(json.loads(path.read_text())["commits"]), 1)
+        return path
+
+    def test_prompt_guidance_offers_add_commit_with_session_filled_in(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.configure()
+        prompted = self.additional(self.hook("UserPromptSubmit", prompt="Work"))
+        (path,) = self.state_paths()
+        expected = self.offer_command(path) + " --repo "
+        self.assertIn(expected, prompted)
+        self.assertIn("Subagents report", prompted)
+        self.assertIn(
+            expected, self.additional(self.hook("SessionStart", source="resume"))
+        )
+
+    def test_no_offer_without_the_plugin_prefix_or_for_directory_or_codex(self):
+        self.configure()
+        for value in (
+            None,
+            "not json",
+            "[]",
+            json.dumps("add-commit"),
+            json.dumps(["relative", "/x", "add-commit"]),
+            json.dumps(["/x", "relative", "add-commit"]),
+            json.dumps(["/x", "/y", 3]),
+        ):
+            with self.subTest(prefix=value):
+                if value is None:
+                    self.environment.pop("OBSIDIAN_CAPTURE_ADD_COMMIT", None)
+                else:
+                    self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = value
+                output = self.hook(
+                    "UserPromptSubmit", session_id=f"s-{value}", prompt="Work"
+                )
+                self.assertIn("obsidian_keeper_save", self.additional(output))
+                self.assertNotIn("add-commit", self.additional(output))
+                self.assertEqual(
+                    "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid"
+                    in self.additional(output),
+                    value is not None,
+                )
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        plain = self.directory / "plain"
+        plain.mkdir()
+        output = self.hook(
+            "UserPromptSubmit", cwd=str(plain), session_id="plain", prompt="Work"
+        )
+        self.assertNotIn("add-commit", self.additional(output))
+        self.home = self.directory / "codex-profile"
+        NativeCaptureFixture.configure(self)
+        output = self.cli(
+            "hook",
+            "--home",
+            str(self.home),
+            payload=NativeCaptureFixture.event(self, "UserPromptSubmit", prompt="x"),
+        )
+        self.assertIn("obsidian_keeper_save", output.stdout)
+        self.assertNotIn("add-commit", output.stdout)
+
+    def test_retained_guidance_in_a_directory_session_has_no_offer(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.configure()
+        plain = self.directory / "plain"
+        plain.mkdir()
+        self.hook("UserPromptSubmit", cwd=str(plain), prompt="Work")
+        retained = self.additional(self.next_prompt(cwd=str(plain)))
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", retained)
+        self.assertNotIn("add-commit", retained)
+
+    def test_own_project_commit_named_with_dash_c_is_not_another_repository(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        self.pending_project_commit()
+        (self.project / "nested").mkdir()
+        for target in (self.project, self.project / "nested"):
+            with self.subTest(target=target.name):
+                output = self.bash(f"git -C {shlex.quote(str(target))} commit -m x")
+                self.assertNotIn("another repository", json.dumps(output))
+
+    def test_other_repository_note_reports_an_invalid_wrapper_variable(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = "not json"
+        self.pending_project_commit()
+        root, _ = self.other_repo()
+        output = self.bash(f"git -C {shlex.quote(str(root))} commit -m x")
+        self.assert_runs_unchanged(output)
+        self.assertIn(
+            "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid", self.additional(output)
+        )
+
+    def test_stop_with_nothing_pending_is_not_blocked_by_the_offer(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.start()
+        self.save(path)
+        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+
+    def test_stop_lists_an_open_outside_entry_in_each_new_turn(self):
+        path = self.start()
+        _, key, arguments = self.add_other(path)
+        for turn in ("first", "second"):
+            with self.subTest(turn=turn):
+                self.save(path, call=f"save-{turn}")
+                output = self.hook("Stop", stop_hook_active=False)
+                self.assertEqual(output.get("decision"), "block", output)
+                self.assertIn(arguments["skip_if_hash"], output["reason"])
+                self.assertIn(f"--commit {key} --reason", output["reason"])
+                self.assertIn("project root", output["reason"])
+                self.next_prompt()
+
+    def test_in_flight_outside_guidance_gives_retry_and_no_skip(self):
+        path = self.start()
+        self.save(path)
+        _, key, arguments = self.add_other(path)
+        self.hook("PreToolUse", **self.append_call(arguments))
+        output = self.hook("Stop", stop_hook_active=False)
+        self.assertIn("authoritative-path-inspected", output["reason"])
+        self.assertNotIn(f"--commit {key} --reason", output["reason"])
+
+    def test_other_repository_commit_is_not_denied_while_a_project_commit_is_pending(
+        self,
+    ):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.pending_project_commit()
+        root, _ = self.other_repo()
+        before = json.loads(path.read_text())["snapshots"]
+        for message in ('plain', '"a; b & c $ d | e"', '"first line\nsecond"'):
+            with self.subTest(message=message):
+                output = self.bash(
+                    f"git -C {shlex.quote(str(root))} commit -m {message}"
+                )
+                self.assert_runs_unchanged(output)
+                self.assertIn("add-commit", self.additional(output))
+                self.assertNotIn("prevents capture wrapping", self.additional(output))
+        self.assertEqual(json.loads(path.read_text())["snapshots"], before)
+
+    def test_chained_and_substituted_commits_stay_denied_while_pending(self):
+        self.pending_project_commit()
+        root, _ = self.other_repo()
+        quoted = shlex.quote(str(root))
+        for command in (
+            f"git -C {quoted} commit -m a && git commit -m b",
+            f'git -C {quoted} commit -m "$(git commit -m b)"',
+            f"git -C {quoted} -c user.name=x commit -m a",
+            "git commit -m b",
+        ):
+            with self.subTest(command=command):
+                warning = self.assert_bash_advisory(self.bash(command))
+                self.assertIn("prevents capture wrapping", warning)
+                self.assertIn("Save or skip the pending capture first", warning)
+
+    def test_printed_add_commit_command_passes_pretooluse_unchanged(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
+        path = self.pending_project_commit()
+        root, commit = self.other_repo()
+        command = shlex.join(
+            [*shlex.split(self.offer_command(path)), "--repo", str(root), "--commit", commit]
+        )
+        self.assert_runs_unchanged(self.bash(command, "pending-call"))
+        retained = self.additional(self.next_prompt())
+        self.assertIn("PREVIOUS_CAPTURE_UNRESOLVED", retained)
+        self.assertIn(self.offer_command(path) + " --repo ", retained)
+        self.assert_runs_unchanged(self.bash(command, "paused-call"))
 
 
 if __name__ == "__main__":

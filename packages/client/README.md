@@ -523,6 +523,43 @@ Other native operations/hosts and the standalone consumer reject it. Codex profi
 and direct standalone invocations remain canonical. Attaching a policy does not
 activate writers or change credentials, services, or host ownership.
 
+### Commits in other repositories
+
+A session captures commits in its own project automatically. For a commit in
+another repository, the agent that made it (or the main agent, after a subagent
+reports the repository root and full hash) sends it with `add-commit`:
+
+```sh
+<add-commit prefix> --home <profile> --session <hashed session> \
+  --repo <repository root> --commit <full hash> [--path <vault note.md>]
+```
+
+The integrating plugin supplies the prefix in `OBSIDIAN_CAPTURE_ADD_COMMIT`, a
+JSON list whose first two items are absolute paths. Hook guidance prints the
+command at session start and on each prompt only when that variable is present,
+for Claude profiles in Git mode. The command refuses without a lease file
+descriptor in `OBSIDIAN_CAPTURE_LEASE_FD`. That check stops accidental direct
+calls only: the client confirms that the descriptor is open, not which lock it
+holds. The wrapper owns excluded repositories and writer admission.
+
+The commit does not need to be `HEAD`. A commit that is not `HEAD` when you send
+it has an empty branch and ticket in its note. An explicit `--path` must be under
+`Projects/Development` or a fixed parent folder of a configured commit route, and
+never under the daily, profile, or CEO folders. The command returns
+`status: "pending"` with the `daily_append` arguments; add 3-8 context bullets,
+and save from the session's project root. An unsaved entry makes Stop continue
+once per turn until you save it or dismiss it with
+`skip --home <profile> --session <hashed session> --commit <commit id> --reason
+no_meaningful_work` (or `user_requested_no_capture`). An attempted write cannot
+be dismissed. Open entries block drain with `outside_commit_pending`.
+
+Not covered: nothing detects a commit in another repository for you. A single
+`git -C <other repository> commit` gets a reminder that names `add-commit`;
+chains, substitutions, and `cd` forms do not. Bash commit warnings never block
+the command. Claims are per workspace, so two workspaces can each capture the
+same commit, and the repository-and-hash idempotency key is what prevents a
+second note. Codex and directory profiles do not offer this command.
+
 ### Explicit directory session profiles
 
 `attach --project-mode git` remains the default. Descriptors without `projectMode`
