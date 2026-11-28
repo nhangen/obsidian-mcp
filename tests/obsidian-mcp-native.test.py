@@ -10439,9 +10439,40 @@ class OutsideCommitTest(NativeCaptureFixture):
         before = path.read_bytes()
         self.assertEqual(
             self.added(path, root, commit),
-            dict(status="already_pending", commit_id=first["commit_id"]),
+            dict(
+                status="already_pending",
+                commit_id=first["commit_id"],
+                entry_status="pending",
+            ),
+        )
+        self.assertEqual(
+            self.added(path, root, commit, "--path", "CEO/x.md")["commit_id"],
+            first["commit_id"],
         )
         self.assertEqual(path.read_bytes(), before)
+        state = json.loads(before)
+        state["outside_commits"][first["commit_id"]]["status"] = "committed"
+        path.write_text(json.dumps(state))
+        self.assertEqual(
+            self.added(path, root, commit)["entry_status"], "committed"
+        )
+
+    def test_add_commit_same_hash_in_another_repository_is_not_a_duplicate(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        entry = self.outside_entry(commit)
+        entry["metadata"]["org_repo"] = "fixture/else"
+        self.put_outside(path, entry)
+        self.assertEqual(self.added(path, root, commit)["status"], "pending")
+
+    def test_add_commit_refuses_malformed_outside_state(self):
+        path = self.start()
+        root, commit = self.other_repo()
+        self.put_outside(path, dict(status="pending"))
+        self.freeze(path)
+        self.assert_refused(
+            path, self.add(path, root, commit), "DRAIN_STATE_INVALID", commit
+        )
 
     def test_add_commit_of_a_watched_project_commit_is_already_pending(self):
         path = self.start()
@@ -10450,7 +10481,7 @@ class OutsideCommitTest(NativeCaptureFixture):
         ((key, _),) = json.loads(path.read_text())["commits"].items()
         self.assertEqual(
             self.added(path, self.project, commit),
-            dict(status="already_pending", commit_id=key),
+            dict(status="already_pending", commit_id=key, entry_status="pending"),
         )
         self.assertNotIn("outside_commits", json.loads(path.read_text()))
 
@@ -10478,7 +10509,11 @@ class OutsideCommitTest(NativeCaptureFixture):
         self.added(path, root, commit)
         before = second.read_bytes()
         self.assertEqual(
-            self.added(second, root, commit), dict(status="already_claimed")
+            self.added(second, root, commit),
+            dict(
+                status="already_claimed",
+                note="another session holds this commit; nothing to save here",
+            ),
         )
         self.assertEqual(second.read_bytes(), before)
 
@@ -10500,9 +10535,14 @@ class OutsideCommitTest(NativeCaptureFixture):
         root, commit = self.other_repo()
         (root / "nested").mkdir()
         self.freeze(path)
+        self.assert_refused(
+            path,
+            self.add(path, "other", commit),
+            "REPOSITORY_NOT_ABSOLUTE",
+            commit,
+        )
         for repo, value in (
             (root / "nested", commit),
-            ("other", commit),
             (root, commit[:12]),
             (self.directory / "missing", commit),
         ):
@@ -10533,7 +10573,7 @@ class OutsideCommitTest(NativeCaptureFixture):
         NativeCaptureFixture.configure(self)
         result = self.add(path, root, commit, home=self.home)
         self.assertEqual(result.returncode, 64)
-        self.assertIn("HOST_UNSUPPORTED", result.stderr)
+        self.assertIn("ADD_COMMIT_HOST_UNSUPPORTED", result.stderr)
 
     def test_add_commit_destination_rules(self):
         routes = self.directory / "routes.json"

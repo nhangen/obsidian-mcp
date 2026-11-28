@@ -3729,8 +3729,7 @@ def pending_target(pending, consumer, routes=None):
 DENIED_DESTINATION_ROOTS = ("daily", "profile", "ceo")
 
 
-def outside_destination(profile, metadata, routes, path):
-    consumer = runpy.run_path(str(BUNDLE / "bin/obsidian-mcp-capture-commit"))
+def outside_destination(profile, metadata, routes, path, consumer):
     try:
         target = (
             consumer["capture_target"](metadata, routes)
@@ -3768,17 +3767,15 @@ def require_lease():
 
 def add_commit(home, profile, args):
     if profile["host"] != "claude-plugin":
-        raise NativeError("HOST_UNSUPPORTED")
+        raise NativeError("ADD_COMMIT_HOST_UNSUPPORTED")
     require_lease()
     require_git_profile(profile)
     if not args.repo or not args.commit:
         raise NativeError("ARGUMENTS_INVALID")
-    repository = Path(args.repo)
+    if not Path(args.repo).is_absolute():
+        raise NativeError("REPOSITORY_NOT_ABSOLUTE")
     try:
-        if repository.is_absolute():
-            repository = repository.resolve(strict=True)
-        else:
-            repository = args.repo
+        repository = Path(args.repo).resolve(strict=True)
     except (OSError, RuntimeError):
         raise NativeError("COMMIT_EVENT_REJECTED") from None
     event = dict(
@@ -3795,7 +3792,6 @@ def add_commit(home, profile, args):
         metadata = consumer["run_producer"](BUNDLE, event, sys.executable)
     except consumer["CaptureError"]:
         raise NativeError("COMMIT_EVENT_REJECTED") from None
-    target = outside_destination(profile, metadata, routes, args.path)
     with state_lock(home, args.session) as (state, path):
         if state is None:
             raise NativeError("SESSION_UNAVAILABLE")
@@ -3805,16 +3801,24 @@ def add_commit(home, profile, args):
                 known["event"].get("commit") == args.commit
                 and known["metadata"].get("org_repo") == metadata["org_repo"]
             ):
-                return dict(status="already_pending", commit_id=key)
+                return dict(
+                    status="already_pending",
+                    commit_id=key,
+                    entry_status=known["status"],
+                )
         if event["repository"] == profile["project"]:
             raise NativeError(
                 "PROJECT_REPOSITORY_WATCHED; the project's own commits are captured"
                 " from its history"
             )
+        target = outside_destination(profile, metadata, routes, args.path, consumer)
         if sum(map(outside_open, outside_entries(state).values())) >= MAX_PENDING:
             raise NativeError("OUTSIDE_LIMIT; save or skip an open entry first")
         if not claim_commit(home, args.session, args.commit):
-            return dict(status="already_claimed")
+            return dict(
+                status="already_claimed",
+                note="another session holds this commit; nothing to save here",
+            )
         event_id = digest(encode(event))
         state.setdefault("outside_commits", {})[event_id] = dict(
             event=event, metadata=metadata, status="pending", capture_path=target
