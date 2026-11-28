@@ -3908,13 +3908,25 @@ def add_commit_command(home, session):
     )
 
 
+def invalid_add_commit_note():
+    """A broken wrapper variable must not read as an opt-out."""
+    if "OBSIDIAN_CAPTURE_ADD_COMMIT" not in os.environ or add_commit_prefix():
+        return None
+    return (
+        "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid, so commits from other"
+        " repositories cannot be sent. Update or reinstall the Obsidian plugin."
+    )
+
+
 def other_repository_note(home, session):
     command = add_commit_command(home, session)
     if command is None:
-        return (
+        note = (
             "This commit is in another repository. It runs unchanged and is not"
             " captured."
         )
+        invalid = invalid_add_commit_note()
+        return f"{note} {invalid}" if invalid else note
     return (
         "This commit is in another repository. It runs unchanged and is not"
         " captured automatically. After it succeeds, send it with: " + command
@@ -4084,11 +4096,9 @@ def capture_guidance(
             commands.append(outside_guidance(home, state, event_id, pending, routes))
     offered = offer_add_commit and host == "claude-plugin"
     offer = add_commit_command(home, key) if offered else None
-    if offered and offer is None and "OBSIDIAN_CAPTURE_ADD_COMMIT" in os.environ:
-        commands.append(
-            "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid, so commits from other"
-            " repositories cannot be sent. Update or reinstall the Obsidian plugin."
-        )
+    invalid = invalid_add_commit_note() if offered else None
+    if invalid:
+        commands.append(invalid)
     if offer is not None:
         commands.append(
             "To capture a commit made in another repository, run: "

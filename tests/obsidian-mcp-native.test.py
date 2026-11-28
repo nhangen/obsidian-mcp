@@ -10974,6 +10974,16 @@ class OutsideCommitTest(NativeCaptureFixture):
                 output = self.bash(f"git -C {shlex.quote(str(target))} commit -m x")
                 self.assertNotIn("another repository", json.dumps(output))
 
+    def test_other_repository_note_reports_an_invalid_wrapper_variable(self):
+        self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = "not json"
+        self.pending_project_commit()
+        root, _ = self.other_repo()
+        output = self.bash(f"git -C {shlex.quote(str(root))} commit -m x")
+        self.assert_runs_unchanged(output)
+        self.assertIn(
+            "OBSIDIAN_CAPTURE_ADD_COMMIT is set but invalid", self.additional(output)
+        )
+
     def test_stop_with_nothing_pending_is_not_blocked_by_the_offer(self):
         self.environment["OBSIDIAN_CAPTURE_ADD_COMMIT"] = json.dumps(self.ADD_COMMIT)
         path = self.start()
