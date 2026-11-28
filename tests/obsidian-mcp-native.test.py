@@ -10444,6 +10444,7 @@ class OutsideCommitTest(NativeCaptureFixture):
                 status="already_pending",
                 commit_id=first["commit_id"],
                 entry_status="pending",
+                capture_path="Projects/Development/fixture/other/2026-11-03.md",
             ),
         )
         self.assertEqual(
@@ -10479,10 +10480,15 @@ class OutsideCommitTest(NativeCaptureFixture):
         path = self.start()
         commit = self.commit_in(self.project)
         self.hook("Stop", stop_hook_active=False)
-        ((key, _),) = json.loads(path.read_text())["commits"].items()
+        ((key, watched),) = json.loads(path.read_text())["commits"].items()
         self.assertEqual(
             self.added(path, self.project, commit),
-            dict(status="already_pending", commit_id=key, entry_status="pending"),
+            dict(
+                status="already_pending",
+                commit_id=key,
+                entry_status="pending",
+                capture_path=watched["capture_path"],
+            ),
         )
         self.assertNotIn("outside_commits", json.loads(path.read_text()))
 

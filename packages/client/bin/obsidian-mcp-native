@@ -3802,6 +3802,7 @@ def add_commit(home, profile, args):
                     status="already_pending",
                     commit_id=key,
                     entry_status=known["status"],
+                    capture_path=known.get("capture_path"),
                 )
         if event["repository"] == profile["project"]:
             raise NativeError(
