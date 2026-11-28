@@ -3009,8 +3009,7 @@ def drain_reasons(state):
     ):
         raise NativeError("DRAIN_STATE_INVALID")
     if state["disposition"] == "skipped_by_policy" and (
-        state.get("skip_reason")
-        not in ("no_meaningful_work", "user_requested_no_capture")
+        state.get("skip_reason") not in SKIP_REASONS
         or state.get("session_request")
     ):
         raise NativeError("DRAIN_STATE_INVALID")
@@ -3991,11 +3990,14 @@ def outside_guidance(home, state, event_id, pending, routes):
     )
 
 
+SKIP_REASONS = ("no_meaningful_work", "user_requested_no_capture")
+
 # The literal command fails if the host does not run the capture hook.
 CLAUDE_SKIP_REQUEST = re.compile(
     r"false obsidian-capture-skip ([0-9a-f]{64}) "
-    r"(no_meaningful_work|user_requested_no_capture)"
+    r"(" + "|".join(map(re.escape, SKIP_REASONS)) + r")"
 )
+CLAUDE_SKIP_MENTION = re.compile(r"\bobsidian-capture-skip\b")
 
 
 def session_skip_receipt(state):
@@ -4022,12 +4024,20 @@ def session_skip_command(home, state, reason):
 
 def claude_skip_request(home, state, tool_input):
     command = tool_input.get("command")
-    match = CLAUDE_SKIP_REQUEST.fullmatch(command) if isinstance(command, str) else None
+    if not isinstance(command, str):
+        return None
+    match = CLAUDE_SKIP_REQUEST.fullmatch(command)
     if match is None:
+        if CLAUDE_SKIP_MENTION.search(command):
+            raise NativeError(
+                "SKIP_REQUEST_MALFORMED (run the guidance command alone, without backticks)"
+            )
         return None
     receipt, reason = match.groups()
     if receipt != session_skip_receipt(state):
-        raise NativeError("SKIP_RECEIPT_STALE")
+        raise NativeError(
+            "SKIP_RECEIPT_STALE (use the receipt in the current Obsidian guidance)"
+        )
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -5393,7 +5403,7 @@ def main():
         ),
     )
     parser.add_argument(
-        "--reason", choices=("no_meaningful_work", "user_requested_no_capture")
+        "--reason", choices=SKIP_REASONS
     )
     parser.add_argument("--repair-state", action="store_true")
     args, extra = parser.parse_known_args()

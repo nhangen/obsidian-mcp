@@ -3586,12 +3586,14 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         command = re.search(pattern, guidance[0]).group()
         self.assertEqual(re.search(pattern, guidance[1]).group(), command)
         self.assertNotEqual(subprocess.run(shlex.split(command)).returncode, 0)
-        for bad in (command + " && true", command.replace("no_meaningful_work", "other")):
+        for bad in (command + " && true", command.replace("no_meaningful_work", "other"),
+                    command + " ", "`" + command + "`", "cd /tmp && " + command):
             output = self.hook(
                 "PreToolUse", tool_name="Bash", tool_use_id="bad-skip",
                 tool_input={"command": bad},
-            )
-            self.assertNotIn("updatedInput", output.get("hookSpecificOutput", {}))
+            )["hookSpecificOutput"]
+            self.assertNotIn("updatedInput", output)
+            self.assertIn("SKIP_REQUEST_MALFORMED", output["additionalContext"])
         after = json.loads(path.read_text())
         for field in ("disposition", "session_save", "turn"):
             self.assertEqual(after[field], state[field])
@@ -3618,6 +3620,7 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         )["hookSpecificOutput"]
         self.assertNotIn("updatedInput", output)
         self.assertIn("SKIP_RECEIPT_STALE", output["additionalContext"])
+        self.assertIn("current Obsidian guidance", output["additionalContext"])
 
     def test_stop_is_bounded_and_orphan_hook_cannot_create_turn(self):
         self.assertEqual(self.configure().returncode, 0)
