@@ -3997,7 +3997,7 @@ CLAUDE_SKIP_REQUEST = re.compile(
     r"false obsidian-capture-skip ([0-9a-f]{64}) "
     r"(" + "|".join(map(re.escape, SKIP_REASONS)) + r")"
 )
-CLAUDE_SKIP_MENTION = re.compile(r"\bobsidian-capture-skip\b")
+CLAUDE_SKIP_ATTEMPT = re.compile(r"(?:^|[\s;&|`(])false\s+obsidian-capture-skip\b")
 
 
 def session_skip_receipt(state):
@@ -4022,13 +4022,20 @@ def session_skip_command(home, state, reason):
     )
 
 
+def commit_shaped(command):
+    try:
+        return analyze_shell_command(command)["kind"] is not None
+    except ShellParseError:
+        return True
+
+
 def claude_skip_request(home, state, tool_input):
     command = tool_input.get("command")
     if not isinstance(command, str):
         return None
     match = CLAUDE_SKIP_REQUEST.fullmatch(command)
     if match is None:
-        if CLAUDE_SKIP_MENTION.search(command):
+        if CLAUDE_SKIP_ATTEMPT.search(command) and not commit_shaped(command):
             raise NativeError(
                 "SKIP_REQUEST_MALFORMED (run the guidance command alone, without backticks)"
             )

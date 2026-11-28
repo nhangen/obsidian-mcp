@@ -3651,6 +3651,16 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(path.read_text())["skip_reason"], "user_requested_no_capture")
+        self.hook("UserPromptSubmit", prompt="Mention the token")
+        for mention in ("grep -rn obsidian-capture-skip README.md",
+                        "git commit -m 'Document false obsidian-capture-skip'"):
+            output = self.hook(
+                "PreToolUse", tool_name="Bash", tool_use_id="mention",
+                tool_input={"command": mention},
+            ).get("hookSpecificOutput", {})
+            self.assertNotIn("SKIP_REQUEST_MALFORMED", output.get("additionalContext", ""))
+        if self.initialize_git:
+            self.assertIn("execute-commit", output["updatedInput"]["command"])
 
     def test_stop_is_bounded_and_orphan_hook_cannot_create_turn(self):
         self.assertEqual(self.configure().returncode, 0)

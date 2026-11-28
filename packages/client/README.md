@@ -852,9 +852,10 @@ Routine Claude guidance offers a session skip as the literal Bash command
 current session and turn and the reason is `no_meaningful_work` or
 `user_requested_no_capture`. The PreToolUse hook rewrites an exact request into
 the native `skip` command, also without an `allow` decision. A receipt from an
-earlier turn reports `SKIP_RECEIPT_STALE`, any other request naming
-`obsidian-capture-skip` reports `SKIP_REQUEST_MALFORMED`, and in both cases, or
-when the hook is not installed, the literal `false` runs and fails.
+earlier turn reports `SKIP_RECEIPT_STALE`, and any other non-commit command
+containing `false obsidian-capture-skip` reports `SKIP_REQUEST_MALFORMED`. In
+both cases, or when the hook is not installed, the literal `false` runs and
+fails. Commands that only mention the token are not affected.
 For attached Claude, pending-commit guidance supplies canonical
 `obsidian_daily_append` arguments with three context placeholders. Replace those
 bullets with factual context and call MCP directly; no Bash `prepare` command or
