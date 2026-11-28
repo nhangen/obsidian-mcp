@@ -3991,6 +3991,53 @@ def outside_guidance(home, state, event_id, pending, routes):
     )
 
 
+# The literal command fails if the host does not run the capture hook.
+CLAUDE_SKIP_REQUEST = re.compile(
+    r"false obsidian-capture-skip ([0-9a-f]{64}) "
+    r"(no_meaningful_work|user_requested_no_capture)"
+)
+
+
+def session_skip_receipt(state):
+    return digest(encode([state["session"], state["turn"]]))
+
+
+def session_skip_command(home, state, reason):
+    return shlex.join(
+        [
+            state["python"],
+            str(BUNDLE / "bin/obsidian-mcp-native"),
+            "skip",
+            "--home",
+            str(home),
+            "--session",
+            state["session"],
+            "--turn",
+            state["turn"],
+            "--reason",
+            reason,
+        ]
+    )
+
+
+def claude_skip_request(home, state, tool_input):
+    command = tool_input.get("command")
+    match = CLAUDE_SKIP_REQUEST.fullmatch(command) if isinstance(command, str) else None
+    if match is None:
+        return None
+    receipt, reason = match.groups()
+    if receipt != session_skip_receipt(state):
+        raise NativeError("SKIP_RECEIPT_STALE")
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": dict(
+                tool_input, command=session_skip_command(home, state, reason)
+            ),
+        }
+    }
+
+
 def capture_guidance(
     home,
     state,
@@ -4068,29 +4115,28 @@ def capture_guidance(
                     )
                 }
             )
-            + ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
+            + (
+                ", resolved=true, and a factual Markdown body. Inspect failures; retry unchanged."
+                if host == "claude-plugin"
+                else ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
+            )
             + (
                 " The body may summarize work done since the retained turn began."
                 if retained
                 else ""
             )
         )
-        command = shlex.join(
-            [
-                state["python"],
-                str(BUNDLE / "bin/obsidian-mcp-native"),
-                "skip",
-                "--home",
-                str(home),
-                "--session",
-                key,
-                "--turn",
-                state["turn"],
-            ]
-        )
-        commands.append(
-            f"Only for no meaningful work or user-requested no capture, acknowledge explicitly with {command} --reason no_meaningful_work (or user_requested_no_capture). Planning/review can be meaningful without edits."
-        )
+        if host == "claude-plugin":
+            commands.append(
+                "If no meaningful work, run in Bash: "
+                f"`false obsidian-capture-skip {session_skip_receipt(state)} no_meaningful_work`. "
+                "If the user asked not to save, use user_requested_no_capture instead."
+            )
+        else:
+            command = session_skip_command(home, state, "no_meaningful_work")
+            commands.append(
+                f"Only for no meaningful work or user-requested no capture, acknowledge explicitly with {command} (or user_requested_no_capture). Planning/review can be meaningful without edits."
+            )
     for event_id, pending in outside_entries(state).items():
         if outside_open(pending):
             commands.append(outside_guidance(home, state, event_id, pending, routes))
@@ -4593,6 +4639,14 @@ def engine_hook(home, profile, event):
                 if "additionalContext" in output:
                     output["additionalContext"] += "\n" + note
                 return result
+        if (
+            profile["host"] == "claude-plugin"
+            and name == "PreToolUse"
+            and event.get("tool_name") == "Bash"
+        ):
+            skip = claude_skip_request(home, state, event["tool_input"])
+            if skip is not None:
+                return skip
         if mode == "directory":
             return {}
         if (
