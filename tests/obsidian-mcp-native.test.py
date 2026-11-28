@@ -568,6 +568,21 @@ except namespace['NativeError'] as error:
 
 
 class NativeCaptureTest(NativeCaptureFixture):
+    def test_codex_guidance_keeps_the_explicit_skip_command(self):
+        self.configure()
+        prompt = self.hook("UserPromptSubmit", prompt="work")
+        text = prompt["hookSpecificOutput"]["additionalContext"]
+        (path,) = self.state_paths()
+        state = json.loads(path.read_text())
+        self.assertNotIn("obsidian-capture-skip", text)
+        self.assertIn(
+            f"skip --home {shlex.quote(str(self.home))} --session {state['session']} "
+            f"--turn {state['turn']} --reason no_meaningful_work",
+            text,
+        )
+        self.assertIn("Planning/review can be meaningful without edits.", text)
+        self.assertIn("Preserve this payload on retry; inspect partial/recovery/conflict outcomes.", text)
+
     def test_codex_direct_append_still_requires_cli_preparation(self):
         self.configure()
         self.hook("UserPromptSubmit", prompt="work")
@@ -3561,6 +3576,92 @@ class ClaudePluginCaptureTest(NativeCaptureFixture):
         self.save(path, call="retry-write")
         self.assertTrue(json.loads(self.drain().stdout)["quiescent"])
 
+    def test_compact_skip_runs_through_the_claude_hook(self):
+        self.configure()
+        prompt = self.hook("UserPromptSubmit", prompt="Fixture no-op")
+        stop = self.hook("Stop", stop_hook_active=False)
+        (path,) = self.state_paths()
+        state = json.loads(path.read_text())
+        marker = "OBSIDIAN_MCP_CONTINUE:" + state["turn"] + "\n"
+        self.assertEqual(stop["decision"], "block")
+        self.assertTrue(stop["reason"].startswith(marker))
+        guidance = (prompt["hookSpecificOutput"]["additionalContext"],
+                    stop["reason"][len(marker):])
+        for text in guidance:
+            for field in (state["python"], str(self.bundle), str(self.home),
+                          state["session"], state["turn"], str(self.project),
+                          "obsidian-mcp-native", "--home", "--session"):
+                self.assertNotIn(field, text)
+            self.assertLess(len(text), 760)
+            self.assertIn("planning/review counts", text)
+            self.assertIn("partial or conflict", text)
+            self.assertIn("mcp__obsidian-write__obsidian_keeper_save", text)
+            for field in ("title", "folder", "date", "idempotency_key"):
+                self.assertIn(state["session_save"][field], text)
+        pattern = r"false obsidian-capture-skip [a-f0-9]{64} no_meaningful_work"
+        command = re.search(pattern, guidance[0]).group()
+        self.assertEqual(re.search(pattern, guidance[1]).group(), command)
+        literal = subprocess.run(shlex.split(command), capture_output=True, timeout=30)
+        self.assertNotEqual(literal.returncode, 0)
+        for bad in (command + " && true", command.replace("no_meaningful_work", "other"),
+                    command + " ", "`" + command + "`", "cd /tmp && " + command):
+            output = self.hook(
+                "PreToolUse", tool_name="Bash", tool_use_id="bad-skip",
+                tool_input={"command": bad},
+            )["hookSpecificOutput"]
+            self.assertNotIn("updatedInput", output)
+            self.assertIn("SKIP_REQUEST_MALFORMED", output["additionalContext"])
+        after = json.loads(path.read_text())
+        for field in ("disposition", "session_save", "turn"):
+            self.assertEqual(after[field], state[field])
+        before = path.read_bytes()
+        tool_input = {"command": command, "description": "Acknowledge no capture"}
+        output = self.hook(
+            "PreToolUse", tool_name="Bash", tool_use_id="skip",
+            tool_input=tool_input,
+        )["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", output)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(output["updatedInput"]["description"], tool_input["description"])
+        result = subprocess.run(
+            shlex.split(output["updatedInput"]["command"]), env=self.environment,
+            cwd=self.project, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"status": "skipped_by_policy"})
+        self.assertEqual(self.hook("Stop", stop_hook_active=True), {})
+        prompt = self.hook("UserPromptSubmit", prompt="New turn")
+        output = self.hook(
+            "PreToolUse", tool_name="Bash", tool_use_id="stale-skip",
+            tool_input=tool_input,
+        )["hookSpecificOutput"]
+        self.assertNotIn("updatedInput", output)
+        self.assertIn("SKIP_RECEIPT_STALE", output["additionalContext"])
+        self.assertIn("current Obsidian guidance", output["additionalContext"])
+        declined = re.search(
+            pattern, prompt["hookSpecificOutput"]["additionalContext"]
+        ).group().replace("no_meaningful_work", "user_requested_no_capture")
+        output = self.hook(
+            "PreToolUse", tool_name="Bash", tool_use_id="declined-skip",
+            tool_input={"command": declined},
+        )["hookSpecificOutput"]
+        result = subprocess.run(
+            shlex.split(output["updatedInput"]["command"]), env=self.environment,
+            cwd=self.project, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(path.read_text())["skip_reason"], "user_requested_no_capture")
+        self.hook("UserPromptSubmit", prompt="Mention the token")
+        for mention in ("grep -rn obsidian-capture-skip README.md",
+                        "git commit -m 'Document false obsidian-capture-skip'"):
+            output = self.hook(
+                "PreToolUse", tool_name="Bash", tool_use_id="mention",
+                tool_input={"command": mention},
+            ).get("hookSpecificOutput", {})
+            self.assertNotIn("SKIP_REQUEST_MALFORMED", output.get("additionalContext", ""))
+        if self.initialize_git:
+            self.assertIn("execute-commit", output["updatedInput"]["command"])
+
     def test_stop_is_bounded_and_orphan_hook_cannot_create_turn(self):
         self.assertEqual(self.configure().returncode, 0)
         orphan = self.hook(
@@ -4355,6 +4456,9 @@ class DirectoryCaptureTest(NativeCaptureFixture):
     test_generic_hook_errors_are_advisory_except_protected_mcp_writes = (
         ClaudePluginCaptureTest.test_generic_hook_errors_are_advisory_except_protected_mcp_writes
     )
+    test_compact_skip_runs_through_the_claude_hook = (
+        ClaudePluginCaptureTest.test_compact_skip_runs_through_the_claude_hook
+    )
 
     def setUp(self):
         super().setUp()
@@ -4745,6 +4849,9 @@ class UserCaptureTest(NativeCaptureFixture):
     )
     test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution = (
         NativeCaptureTest.test_post_git_persistence_failure_preserves_exit_and_refuses_reexecution
+    )
+    test_compact_skip_runs_through_the_claude_hook = (
+        ClaudePluginCaptureTest.test_compact_skip_runs_through_the_claude_hook
     )
     event = ClaudePluginCaptureTest.event
     session_arguments = ClaudePluginCaptureTest.session_arguments

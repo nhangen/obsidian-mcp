@@ -847,6 +847,16 @@ write retains its exact request/key and requires inspection plus the existing
 persisted. A failed host tool cannot establish a successful commit event.
 Claude commit rewrites omit an `allow` permission decision, so the rewritten
 command still goes through the host's configured permission flow.
+Routine Claude guidance offers a session skip as the literal Bash command
+`false obsidian-capture-skip <receipt> <reason>`, where the receipt binds the
+current session and turn and the reason is `no_meaningful_work` or
+`user_requested_no_capture`. The PreToolUse hook rewrites an exact request into
+the native `skip` command, also without an `allow` decision. A receipt from an
+earlier turn reports `SKIP_RECEIPT_STALE`, and any other non-commit command
+containing `false obsidian-capture-skip` reports `SKIP_REQUEST_MALFORMED`. In
+both cases, or when the hook is not installed, the literal `false` runs and
+fails. Commands that mention the token without `false` before it are not
+affected, and the advisory never rewrites or blocks a command.
 For attached Claude, pending-commit guidance supplies canonical
 `obsidian_daily_append` arguments with three context placeholders. Replace those
 bullets with factual context and call MCP directly; no Bash `prepare` command or

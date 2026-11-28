@@ -3009,8 +3009,7 @@ def drain_reasons(state):
     ):
         raise NativeError("DRAIN_STATE_INVALID")
     if state["disposition"] == "skipped_by_policy" and (
-        state.get("skip_reason")
-        not in ("no_meaningful_work", "user_requested_no_capture")
+        state.get("skip_reason") not in SKIP_REASONS
         or state.get("session_request")
     ):
         raise NativeError("DRAIN_STATE_INVALID")
@@ -3991,6 +3990,71 @@ def outside_guidance(home, state, event_id, pending, routes):
     )
 
 
+SKIP_REASONS = ("no_meaningful_work", "user_requested_no_capture")
+
+# The literal command fails if the host does not run the capture hook.
+CLAUDE_SKIP_REQUEST = re.compile(
+    r"false obsidian-capture-skip ([0-9a-f]{64}) "
+    r"(" + "|".join(map(re.escape, SKIP_REASONS)) + r")"
+)
+CLAUDE_SKIP_ATTEMPT = re.compile(r"(?:^|[\s;&|`(])false\s+obsidian-capture-skip\b")
+
+
+def session_skip_receipt(state):
+    return digest(encode([state["session"], state["turn"]]))
+
+
+def session_skip_command(home, state, reason):
+    return shlex.join(
+        [
+            state["python"],
+            str(BUNDLE / "bin/obsidian-mcp-native"),
+            "skip",
+            "--home",
+            str(home),
+            "--session",
+            state["session"],
+            "--turn",
+            state["turn"],
+            "--reason",
+            reason,
+        ]
+    )
+
+
+def commit_shaped(command):
+    try:
+        return analyze_shell_command(command)["kind"] is not None
+    except ShellParseError:
+        return True
+
+
+def claude_skip_request(home, state, tool_input):
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return None
+    match = CLAUDE_SKIP_REQUEST.fullmatch(command)
+    if match is None:
+        if CLAUDE_SKIP_ATTEMPT.search(command) and not commit_shaped(command):
+            raise NativeError(
+                "SKIP_REQUEST_MALFORMED (run the guidance command alone, without backticks)"
+            )
+        return None
+    receipt, reason = match.groups()
+    if receipt != session_skip_receipt(state):
+        raise NativeError(
+            "SKIP_RECEIPT_STALE (use the receipt in the current Obsidian guidance)"
+        )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": dict(
+                tool_input, command=session_skip_command(home, state, reason)
+            ),
+        }
+    }
+
+
 def capture_guidance(
     home,
     state,
@@ -4068,29 +4132,28 @@ def capture_guidance(
                     )
                 }
             )
-            + ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
+            + (
+                ", resolved=true, and a factual Markdown body. Inspect failed, partial or conflict results; retry unchanged."
+                if host == "claude-plugin"
+                else ", resolved=true, and a factual Markdown body. Preserve this payload on retry; inspect partial/recovery/conflict outcomes."
+            )
             + (
                 " The body may summarize work done since the retained turn began."
                 if retained
                 else ""
             )
         )
-        command = shlex.join(
-            [
-                state["python"],
-                str(BUNDLE / "bin/obsidian-mcp-native"),
-                "skip",
-                "--home",
-                str(home),
-                "--session",
-                key,
-                "--turn",
-                state["turn"],
-            ]
-        )
-        commands.append(
-            f"Only for no meaningful work or user-requested no capture, acknowledge explicitly with {command} --reason no_meaningful_work (or user_requested_no_capture). Planning/review can be meaningful without edits."
-        )
+        if host == "claude-plugin":
+            commands.append(
+                "If no meaningful work (planning/review counts), run in Bash: "
+                f"`false obsidian-capture-skip {session_skip_receipt(state)} no_meaningful_work`. "
+                "If the user declined capture, use user_requested_no_capture."
+            )
+        else:
+            command = session_skip_command(home, state, "no_meaningful_work")
+            commands.append(
+                f"Only for no meaningful work or user-requested no capture, acknowledge explicitly with {command} (or user_requested_no_capture). Planning/review can be meaningful without edits."
+            )
     for event_id, pending in outside_entries(state).items():
         if outside_open(pending):
             commands.append(outside_guidance(home, state, event_id, pending, routes))
@@ -4593,6 +4656,14 @@ def engine_hook(home, profile, event):
                 if "additionalContext" in output:
                     output["additionalContext"] += "\n" + note
                 return result
+        if (
+            profile["host"] == "claude-plugin"
+            and name == "PreToolUse"
+            and event.get("tool_name") == "Bash"
+        ):
+            skip = claude_skip_request(home, state, event["tool_input"])
+            if skip is not None:
+                return skip
         if mode == "directory":
             return {}
         if (
@@ -5339,7 +5410,7 @@ def main():
         ),
     )
     parser.add_argument(
-        "--reason", choices=("no_meaningful_work", "user_requested_no_capture")
+        "--reason", choices=SKIP_REASONS
     )
     parser.add_argument("--repair-state", action="store_true")
     args, extra = parser.parse_known_args()
