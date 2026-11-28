@@ -79,6 +79,7 @@ COMMIT_CONTEXT_TEMPLATE = (
     "<replace with verification and remaining work>",
 )
 ADVISORY_PREFIX = "Obsidian capture advisory: "
+CLAUDE_TOOL_PREFIX = "mcp__obsidian-write__"
 ACTIVE = "active.json"
 OWNED = ("config.toml", "hooks.json", "AGENTS.md")
 CLAUDE_TOOLS = {
@@ -3235,11 +3236,7 @@ def shell_commit(
         return None
     # Ahead of the punctuation checks: this command is never wrapped, and the
     # parser has already classified chains and substitutions as "detected".
-    if (
-        detect_other
-        and named
-        and not any(w in ("-c", "--config-env") for w in words)
-    ):
+    if detect_other and named:
         top = git(root, "rev-parse", "--show-toplevel", allow_failure=True).strip()
         if top and top != str(Path(project)):
             raise NativeError("OTHER_REPOSITORY")
@@ -3944,7 +3941,7 @@ def claude_commit_guidance(home, state, event_id, pending, routes):
                 + " "
             )
     return (
-        "Capture the pending commit through mcp__obsidian-write__obsidian_daily_append. Further Git work may continue without capture wrapping. "
+        f"Capture the pending commit through {CLAUDE_TOOL_PREFIX}obsidian_daily_append. Further Git work may continue without capture wrapping. "
         + instruction
         + "Call MCP directly; no shell preparation is needed. Inspect the result; do not claim capture on failure. "
         "An in-flight or recovery outcome requires inspection before retry.\n"
@@ -3995,7 +3992,7 @@ def capture_guidance(
     plan = state["session_save"]
     commands = []
     tool_prefix = (
-        "mcp__obsidian-write__" if host == "claude-plugin" else "mcp__obsidian_write__"
+        CLAUDE_TOOL_PREFIX if host == "claude-plugin" else "mcp__obsidian_write__"
     )
     for event_id, pending in state["commits"].items():
         if pending["status"] == "pending":
@@ -4696,7 +4693,6 @@ def engine_hook(home, profile, event):
                 return context(name, other_repository_note(home, session))
             if (
                 name == "PreToolUse"
-                and not other_repository
                 and (
                     state["snapshots"]
                     or any(

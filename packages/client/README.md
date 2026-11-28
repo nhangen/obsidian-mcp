@@ -542,7 +542,8 @@ descriptor in `OBSIDIAN_CAPTURE_LEASE_FD`. That check stops accidental direct
 calls only: the client confirms that the descriptor is open, not which lock it
 holds. The wrapper owns excluded repositories and writer admission.
 
-The commit does not need to be `HEAD`. An explicit `--path` must be under
+The commit does not need to be `HEAD`. A commit that is not `HEAD` when you send
+it has an empty branch and ticket in its note. An explicit `--path` must be under
 `Projects/Development` or a fixed parent folder of a configured commit route, and
 never under the daily, profile, or CEO folders. The command returns
 `status: "pending"` with the `daily_append` arguments; add 3-8 context bullets,
